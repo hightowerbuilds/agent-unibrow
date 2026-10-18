@@ -24,7 +24,10 @@ use crate::theme;
 
 actions!(
     text_input,
-    [Backspace, Delete, Left, Right, Up, Down, SelectLeft, SelectRight, SelectAll, Home, End, Paste, Cut, Copy, Enter]
+    [
+        Backspace, Delete, Left, Right, Up, Down, SelectLeft, SelectRight, SelectAll, Home, End, SelectHome,
+        SelectEnd, Paste, Cut, Copy, Enter
+    ]
 );
 
 const BULLET: &str = "•";
@@ -50,10 +53,15 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-a", SelectAll, Some("TextInput")),
         KeyBinding::new("ctrl-v", Paste, Some("TextInput")),
         KeyBinding::new("ctrl-shift-v", Paste, Some("TextInput")),
+        KeyBinding::new("shift-insert", Paste, Some("TextInput")),
         KeyBinding::new("ctrl-c", Copy, Some("TextInput")),
+        KeyBinding::new("ctrl-insert", Copy, Some("TextInput")),
         KeyBinding::new("ctrl-x", Cut, Some("TextInput")),
+        KeyBinding::new("shift-delete", Cut, Some("TextInput")),
         KeyBinding::new("home", Home, Some("TextInput")),
         KeyBinding::new("end", End, Some("TextInput")),
+        KeyBinding::new("shift-home", SelectHome, Some("TextInput")),
+        KeyBinding::new("shift-end", SelectEnd, Some("TextInput")),
         KeyBinding::new("enter", Enter, Some("TextInput")),
     ]);
 }
@@ -218,6 +226,14 @@ impl TextInput {
         self.select_to(self.content.len(), cx)
     }
 
+    fn select_home(&mut self, _: &SelectHome, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(0, cx);
+    }
+
+    fn select_end(&mut self, _: &SelectEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.content.len(), cx);
+    }
+
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
         self.move_to(0, cx);
     }
@@ -242,12 +258,54 @@ impl TextInput {
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle);
+        let at = self.index_for_mouse_position(event.position);
+        // Double-click selects a word, triple-click everything (masked
+        // text has no words to show).
+        if event.click_count >= 3 || (event.click_count == 2 && self.masked) {
+            self.is_selecting = false;
+            self.move_to(0, cx);
+            self.select_to(self.content.len(), cx);
+            return;
+        }
+        if event.click_count == 2 {
+            self.is_selecting = false;
+            let word = crate::chat_text::word_at(&self.content, at);
+            self.move_to(word.start, cx);
+            self.select_to(word.end, cx);
+            return;
+        }
         self.is_selecting = true;
         if event.modifiers.shift {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
+            self.select_to(at, cx);
         } else {
-            self.move_to(self.index_for_mouse_position(event.position), cx)
+            self.move_to(at, cx)
         }
+    }
+
+    /// Middle-click pastes the primary selection (Linux) where clicked.
+    fn on_middle_click(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_primary().and_then(|item| item.text()) else { return };
+        window.focus(&self.focus_handle);
+        let at = self.index_for_mouse_position(event.position);
+        self.move_to(at, cx);
+        self.replace_text_in_range(None, &single_line(&text), window, cx);
+    }
+
+    /// Inserts `text` at the cursor (replacing any selection), as if
+    /// typed or pasted.
+    pub fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.disabled {
+            return;
+        }
+        let text = single_line(text);
+        let range = self.marked_range.take().unwrap_or(self.selected_range.clone());
+        let range = clamp_range(&self.content, range);
+        self.content = (self.content[..range.start].to_owned() + &text + &self.content[range.end..]).into();
+        let at = range.start + text.len();
+        self.selected_range = at..at;
+        self.selection_reversed = false;
+        cx.emit(Changed);
+        cx.notify();
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
@@ -262,7 +320,7 @@ impl TextInput {
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace_text_in_range(None, &text.replace('\n', " "), window, cx);
+            self.replace_text_in_range(None, &single_line(&text), window, cx);
         }
     }
 
@@ -514,6 +572,17 @@ impl EntityInputHandler for TextInput {
         let display_index = last_layout.index_for_x(point.x - line_point.x)?;
         Some(self.offset_to_utf16(self.content_offset(display_index)))
     }
+}
+
+/// Pasted text as one line: the input draws a single paragraph, so line
+/// breaks (`\n`, `\r\n` or `\r`) become spaces.
+pub fn single_line(text: &str) -> String {
+    text.replace("\r\n", " ").replace(['\n', '\r'], " ")
+}
+
+fn clamp_range(text: &str, range: Range<usize>) -> Range<usize> {
+    let end = crate::chat_text::clamp(text, range.end);
+    crate::chat_text::clamp(text, range.start).min(end)..end
 }
 
 /// How many lines a wrapped layout takes.
@@ -799,11 +868,14 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
+            .on_action(cx.listener(Self::select_home))
+            .on_action(cx.listener(Self::select_end))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::enter))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_click))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -825,5 +897,24 @@ impl Render for TextInput {
 impl Focusable for TextInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pasted_line_breaks_become_spaces() {
+        assert_eq!(single_line("one\ntwo"), "one two");
+        assert_eq!(single_line("one\r\ntwo\rthree"), "one two three");
+        assert_eq!(single_line("no breaks"), "no breaks");
+    }
+
+    #[test]
+    fn insert_range_is_clamped_to_the_text() {
+        assert_eq!(clamp_range("héllo", 2..9), 1..6);
+        assert_eq!(clamp_range("abc", 1..2), 1..2);
+        assert_eq!(clamp_range("abc", 5..9), 3..3);
     }
 }

@@ -5,6 +5,7 @@
 //! its own thread; its events arrive here over a channel.
 
 mod browser_pane;
+mod chat_text;
 mod chat_tools;
 mod explained;
 mod home;
@@ -234,6 +235,9 @@ struct Shell {
     site_icons: site_icons::SiteIcons,
     needs_key: bool,
     conv_scroll: ScrollHandle,
+    /// Text selection in the conversation, and its focus (for Ctrl+C).
+    chat_select: chat_text::ChatSelect,
+    chat_focus: FocusHandle,
     trace_scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
     _events: Option<Task<()>>,
@@ -346,6 +350,8 @@ impl Shell {
             site_icons: Default::default(),
             needs_key: false,
             conv_scroll: ScrollHandle::new(),
+            chat_select: Default::default(),
+            chat_focus: cx.focus_handle(),
             trace_scroll: ScrollHandle::new(),
             _subscriptions: vec![subscription, browsing_sub, filter_sub, fullscreen_sub, control_sub],
             _events: None,
@@ -1414,7 +1420,11 @@ impl Shell {
     }
 
     fn render_chat(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // Refilled as this frame's message texts prepaint.
+        self.chat_select.registry.clear();
         let approvals: Vec<_> = self.approvals.iter().map(|a| self.render_approval(a, cx).into_any_element()).collect();
+        let items: Vec<_> =
+            self.items.iter().enumerate().map(|(i, item)| self.render_item(i, item, cx).into_any_element()).collect();
         div()
             .flex()
             .flex_col()
@@ -1434,6 +1444,14 @@ impl Shell {
                     .p_3()
                     .overflow_y_scroll()
                     .track_scroll(&self.conv_scroll)
+                    .track_focus(&self.chat_focus)
+                    .key_context(chat_text::CONTEXT)
+                    .on_action(cx.listener(Self::copy_chat_selection))
+                    .on_action(cx.listener(Self::select_all_chat))
+                    .on_action(cx.listener(Self::paste_into_chat_input))
+                    .on_key_down(cx.listener(Self::chat_key_down))
+                    .on_mouse_down(gpui::MouseButton::Left, cx.listener(Self::chat_mouse_down))
+                    .on_mouse_down(gpui::MouseButton::Right, cx.listener(Self::chat_right_click))
                     .when(self.items.iter().all(|i| i.kind == ItemKind::System), |d| {
                         d.child(
                             div()
@@ -1446,9 +1464,11 @@ impl Shell {
                                 .child("New here? See how to get the most out of the agent → Explained (Alt+5)"),
                         )
                     })
-                    .children(self.items.iter().map(Self::render_item))
-                    .children(approvals),
+                    .children(items)
+                    .children(approvals)
+                    .child(self.chat_drag_tracker(cx)),
             ))
+            .when_some(self.chat_select.menu, |d, (at, item)| d.child(self.render_chat_menu(at, item, cx)))
             .child(
                 div()
                     .flex()
@@ -2488,8 +2508,14 @@ impl Shell {
             .children(rows)
     }
 
-    fn render_item(item: &Item) -> impl IntoElement {
-        let base = div().text_sm().line_height(px(20.));
+    fn render_item(&self, ix: usize, item: &Item, cx: &mut Context<Self>) -> impl IntoElement {
+        let base = div().text_sm().line_height(px(20.)).cursor_text();
+        let text = chat_text::selectable(
+            ix,
+            item.text.clone(),
+            self.chat_select.range_for(ix, &item.text),
+            self.chat_select.registry.clone(),
+        );
         match item.kind {
             ItemKind::User => div().flex().justify_end().child(
                 base.max_w(px(360.))
@@ -2498,11 +2524,43 @@ impl Shell {
                     .rounded_md()
                     .bg(rgb(theme::RAISED))
                     .text_color(rgb(theme::FG))
-                    .child(item.text.clone()),
+                    .child(text),
             ),
-            ItemKind::Assistant => base.text_color(rgb(theme::FG)).child(item.text.clone()),
-            ItemKind::Note => base.text_xs().italic().text_color(rgb(theme::MUTED)).child(item.text.clone()),
-            ItemKind::Error => base.text_color(rgb(theme::ERROR)).child(item.text.clone()),
+            ItemKind::Assistant => {
+                let group = SharedString::from(format!("chat-item-{ix}"));
+                let copied = self.chat_select.copied == Some(ix);
+                // Reaches up into the gap above (same layout), so the
+                // button there stays inside the hovered area.
+                div()
+                    .relative()
+                    .mt(px(-12.))
+                    .pt(px(12.))
+                    .group(group.clone())
+                    .child(base.text_color(rgb(theme::FG)).child(text))
+                    .child(
+                        // Shown on hover: copies the whole reply.
+                        div()
+                            .id(SharedString::from(format!("copy-item-{ix}")))
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .px_2()
+                            .py(px(1.))
+                            .rounded_md()
+                            .text_xs()
+                            .border_1()
+                            .border_color(rgb(theme::RULE))
+                            .bg(rgb(theme::PANE))
+                            .text_color(rgb(if copied { theme::ACCENT } else { theme::MUTED }))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(theme::RAISED)).text_color(rgb(theme::FG)))
+                            .when(!copied, |d| d.invisible().group_hover(group, |s| s.visible()))
+                            .on_click(cx.listener(move |this, _, _, cx| this.copy_message(ix, cx)))
+                            .child(if copied { "Copied" } else { "Copy" }),
+                    )
+            }
+            ItemKind::Note => base.text_xs().italic().text_color(rgb(theme::MUTED)).child(text),
+            ItemKind::Error => base.text_color(rgb(theme::ERROR)).child(text),
             ItemKind::System => base
                 .px_3()
                 .py_2()
@@ -2510,7 +2568,7 @@ impl Shell {
                 .border_1()
                 .border_color(rgb(theme::RULE))
                 .text_color(rgb(theme::MUTED))
-                .child(item.text.clone()),
+                .child(text),
             ItemKind::Steer(state) => {
                 let (label, color) = match state {
                     SteerState::Queued => ("While it works · waiting for its next step", theme::WARN),
@@ -2526,7 +2584,7 @@ impl Shell {
                         .border_color(rgb(color))
                         .bg(rgb(theme::RAISED))
                         .text_color(rgb(theme::FG))
-                        .child(item.text.clone()),
+                        .child(text),
                 )
                 .child(div().text_xs().text_color(rgb(color)).child(label))
             }
@@ -2561,6 +2619,7 @@ impl Shell {
         self.chat_id = id;
         self.chats.mark_active(id);
         self.items = load_items(&self.chats, id);
+        self.chat_select.clear();
         self.task_plan = self.chats.plan(id);
         self.chat_list_open = false;
         self.confirm_delete = None;
@@ -3023,6 +3082,7 @@ fn main() -> std::process::ExitCode {
     }
     Application::new().run(move |cx: &mut App| {
         text_input::bind_keys(cx);
+        chat_text::bind_keys(cx);
         cx.bind_keys([
             gpui::KeyBinding::new("ctrl-b", ToggleSidebar, None),
             gpui::KeyBinding::new("escape", StopAgent, None),
