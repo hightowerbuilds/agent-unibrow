@@ -20,7 +20,6 @@ crates/
     rail-commerce/   ACP / UCP checkout
     rail-aggregator/ Zinc, Crossmint (Amazon)
     rail-browser/    Embedded engine (CEF), last resort
-    rail-files/      Files on the user's computer (read, write, edit, Trash)
 ```
 
 Dependencies point one way: shell → agent-core → router ← rails. The `Tool`
@@ -67,16 +66,6 @@ The CLI agents get the app's tools from a local MCP server
 tools (shell, file editing, browser) are switched off, so they can only act
 through the app. Every tool call, from any agent, goes through the same
 policy and approval cards, and shows in the trace.
-
-Files on the user's computer go through the app's own file tools
-(`crates/rails/rail-files`): reading, listing and searching run on their
-own; writing, editing, creating folders, moving and deleting each ask on
-an approval card with the path and a diff (new files in
-`~/Downloads/agent-unibrow` excepted). Deleting moves items to the
-desktop Trash. Hidden folders (`~/.ssh`, `~/.config`, …), the app's own
-data and settings, key and password files, and system folders outside
-home are refused, symlinks included. Test instances (`UNIBROW_DATA_DIR`)
-only see `$UNIBROW_DATA_DIR/files` and have their own Trash there.
 
 The app only runs the `claude` command; it never reads or reuses Claude's
 sign-in. OpenCode can't use a Claude subscription (Anthropic doesn't allow
