@@ -14,6 +14,7 @@
 //! The store is `Send + Sync`: the UI writes visits, agent tools read.
 
 pub mod favicons;
+pub mod home_pins;
 pub mod jev_sites;
 pub mod sitemap;
 mod tools;
@@ -239,6 +240,7 @@ impl Browsing {
         sitemap::init(&conn).map_err(|e| format!("can't set up site maps: {e}"))?;
         jev_sites::init(&conn).map_err(|e| format!("can't set up Jev sites: {e}"))?;
         favicons::init(&conn).map_err(|e| format!("can't set up site icons: {e}"))?;
+        home_pins::init(&conn).map_err(|e| format!("can't set up home pins: {e}"))?;
         Ok(Self { conn: Mutex::new(conn), favicon_version: Default::default() })
     }
 
@@ -342,7 +344,7 @@ impl Browsing {
             sql.push_str(" AND at >= ?");
             args.push((Local::now().timestamp() - i64::from(days) * 86_400).into());
         }
-        sql.push_str(" ORDER BY at DESC LIMIT ?");
+        sql.push_str(" ORDER BY at DESC, id DESC LIMIT ?");
         args.push((q.limit.clamp(1, 1000) as i64).into());
 
         let c = self.conn();

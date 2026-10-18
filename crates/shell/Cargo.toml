@@ -13,6 +13,7 @@ gpui.workspace = true
 trace.workspace = true
 router.workspace = true
 policy.workspace = true
+dirs.workspace = true
 agent-core.workspace = true
 rail-api.workspace = true
 browsing.workspace = true

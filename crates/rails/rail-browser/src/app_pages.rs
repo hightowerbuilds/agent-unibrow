@@ -56,12 +56,52 @@ impl Page {
     pub fn not_found() -> Self {
         Self { status: 404, mime: "text/plain", body: b"Not found".to_vec() }
     }
+
+    pub fn forbidden() -> Self {
+        Self { status: 403, mime: "text/plain", body: b"Only the app's own pages can ask for this".to_vec() }
+    }
+
+    pub fn json(v: &serde_json::Value) -> Self {
+        Self::ok("application/json", v.to_string())
+    }
+
+    pub fn bad_request(why: &str) -> Self {
+        Self { status: 400, mime: "application/json", body: serde_json::json!({"error": why}).to_string().into_bytes() }
+    }
 }
 
-/// What the app's pages serve. `host` is the page ("home"), `path` the file
-/// within it ("/", "/home.css"). Called on CEF's IO thread.
+/// A request for an app page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppRequest {
+    /// The page: "home".
+    pub host: String,
+    /// The file or API path within it: "/", "/home.css", "/api/state".
+    pub path: String,
+    /// Whether it comes from a main frame that's on an app page itself
+    /// (the page fetching its data), not a navigation from elsewhere.
+    /// Data and commands are only served to these.
+    pub from_app_page: bool,
+    /// "GET" or "POST".
+    pub method: String,
+    /// The `X-Unibrow-Token` header: the per-launch token the app's page
+    /// sends with commands.
+    pub token: String,
+    /// A POST's body, up to [`MAX_BODY`].
+    pub body: Vec<u8>,
+}
+
+/// The largest request body read.
+pub const MAX_BODY: usize = 64 * 1024;
+
+impl Default for AppRequest {
+    fn default() -> Self {
+        Self { host: String::new(), path: "/".into(), from_app_page: false, method: "GET".into(), token: String::new(), body: Vec::new() }
+    }
+}
+
+/// What the app's pages serve. Called on CEF's IO thread.
 pub trait AppPages: Send + Sync {
-    fn get(&self, host: &str, path: &str) -> Page;
+    fn get(&self, req: &AppRequest) -> Page;
 }
 
 /// Splits `unibrow://home/home.css?x` into ("home", "/home.css"). `None`
@@ -83,12 +123,36 @@ pub fn route(url: &str) -> Option<(String, String)> {
     Some((host.to_ascii_lowercase(), path.to_string()))
 }
 
-/// The response for `url`: what `pages` serves, or a 404.
-pub fn respond(pages: &dyn AppPages, url: &str) -> Page {
+/// The response for `url`, asked for by a frame on `from` (main frame or
+/// not): what `pages` serves, or a 404. `req` carries the method, token
+/// and body.
+pub fn respond(pages: &dyn AppPages, url: &str, from: &str, main_frame: bool, req: AppRequest) -> Page {
     match route(url) {
-        Some((host, path)) => pages.get(&host, &path),
+        Some((host, path)) => pages.get(&AppRequest { host, path, from_app_page: main_frame && is_app_page(from), ..req }),
         None => Page::not_found(),
     }
+}
+
+/// A request's method, token header and body (bytes only, capped).
+fn request_parts(r: &Request) -> AppRequest {
+    let method = CefString::from(&r.method()).to_string().to_ascii_uppercase();
+    let token = CefString::from(&r.header_by_name(Some(&"X-Unibrow-Token".into()))).to_string();
+    let mut body = Vec::new();
+    if let Some(post) = r.post_data() {
+        let mut elements: Vec<Option<PostDataElement>> = vec![None; post.element_count()];
+        post.elements(Some(&mut elements));
+        for e in elements.into_iter().flatten() {
+            let n = e.bytes_count().min(MAX_BODY.saturating_sub(body.len()));
+            if n == 0 {
+                continue;
+            }
+            let mut buf = vec![0u8; n];
+            let got = e.bytes(n, buf.as_mut_ptr());
+            buf.truncate(got);
+            body.extend(buf);
+        }
+    }
+    AppRequest { method, token, body, ..Default::default() }
 }
 
 /// Adds the scheme. Runs in every process (browser and renderers), from
@@ -125,12 +189,15 @@ wrap_scheme_handler_factory! {
         fn create(
             &self,
             _browser: Option<&mut Browser>,
-            _frame: Option<&mut Frame>,
+            frame: Option<&mut Frame>,
             _scheme_name: Option<&CefString>,
             request: Option<&mut Request>,
         ) -> Option<ResourceHandler> {
-            let url = request.map(|r| CefString::from(&r.url()).to_string()).unwrap_or_default();
-            let page = respond(self.pages.as_ref(), &url);
+            let (url, parts) = request
+                .map(|r| (CefString::from(&r.url()).to_string(), request_parts(r)))
+                .unwrap_or_default();
+            let (from, main) = frame.map(|f| (CefString::from(&f.url()).to_string(), f.is_main() == 1)).unwrap_or_default();
+            let page = respond(self.pages.as_ref(), &url, &from, main, parts);
             Some(Handler::new(Arc::new(Mutex::new(Body { page: Some(page), sent: 0 }))))
         }
     }
@@ -165,7 +232,14 @@ wrap_resource_handler! {
             let Some(page) = body.page.as_ref() else { return };
             if let Some(r) = response {
                 r.set_status(page.status);
-                r.set_status_text(Some(&(if page.status == 200 { "OK" } else { "Not Found" }).into()));
+                let text = match page.status {
+                    200 => "OK",
+                    202 => "Accepted",
+                    400 => "Bad Request",
+                    403 => "Forbidden",
+                    _ => "Not Found",
+                };
+                r.set_status_text(Some(&text.into()));
                 r.set_mime_type(Some(&page.mime.into()));
                 if page.mime.starts_with("text/") || page.mime.ends_with("javascript") || page.mime.ends_with("json") {
                     r.set_charset(Some(&"utf-8".into()));
@@ -217,9 +291,11 @@ mod tests {
 
     struct Fixed;
     impl AppPages for Fixed {
-        fn get(&self, host: &str, path: &str) -> Page {
-            match (host, path) {
+        fn get(&self, req: &AppRequest) -> Page {
+            match (req.host.as_str(), req.path.as_str()) {
                 ("home", "/") => Page::ok("text/html", "<h1>Home</h1>"),
+                ("home", "/api/state") if req.from_app_page => Page::ok("application/json", "{}"),
+                ("home", "/api/state") => Page::forbidden(),
                 _ => Page::not_found(),
             }
         }
@@ -239,9 +315,14 @@ mod tests {
 
     #[test]
     fn serves_from_the_shells_pages() {
-        assert_eq!(respond(&Fixed, "unibrow://home/").status, 200);
-        assert_eq!(respond(&Fixed, "unibrow://home/nope.js").status, 404);
-        assert_eq!(respond(&Fixed, "unibrow://home/../x").status, 404);
+        let from_web = |url| respond(&Fixed, url, "https://example.com/", true, AppRequest::default());
+        assert_eq!(from_web("unibrow://home/").status, 200);
+        assert_eq!(from_web("unibrow://home/nope.js").status, 404);
+        assert_eq!(from_web("unibrow://home/../x").status, 404);
+        // Data only for the app's own page, and only its main frame.
+        assert_eq!(from_web("unibrow://home/api/state").status, 403);
+        assert_eq!(respond(&Fixed, "unibrow://home/api/state", "unibrow://home/", true, AppRequest::default()).status, 200);
+        assert_eq!(respond(&Fixed, "unibrow://home/api/state", "unibrow://home/", false, AppRequest::default()).status, 403);
         assert!(is_app_page("unibrow://home/") && is_app_page("UNIBROW://x") && !is_app_page("https://unibrow.com"));
     }
 

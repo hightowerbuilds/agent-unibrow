@@ -1282,5 +1282,247 @@
         ]
       ]
     }
+  },
+  {
+    "name": "home-data",
+    "page": "hist-a.html",
+    "focus": "localhost",
+    "secs": 16,
+    "env": {
+      "UNIBROW_TEST_PANE": "wait;newtab;wait;wait;js:document.getElementById('recent').textContent;js:document.getElementById('focus').textContent;js:document.getElementById('status').textContent"
+    },
+    "expect": {
+      "log_contains": [
+        "History Alocalhost · just now",
+        "js => Focus sitesLlocalhostlocalhost · Not learned by Jev",
+        "Agent and keys"
+      ]
+    }
+  },
+  {
+    "name": "home-keys",
+    "page": "home",
+    "secs": 14,
+    "env": {
+      "JEV_API_KEY": "sk-test-home-123",
+      "UNIBROW_TEST_PANE": "wait;wait;js:[...document.querySelectorAll('#status dt, #status dd')].map(e => e.textContent).join('|');js:String(document.documentElement.outerHTML.includes('sk-test-home'))"
+    },
+    "expect": {
+      "log_contains": [
+        "|Jev|set|",
+        "js => false"
+      ],
+      "log_not_contains": [
+        "js => true"
+      ]
+    }
+  },
+  {
+    "name": "home-refresh",
+    "page": "home",
+    "secs": 20,
+    "env": {
+      "UNIBROW_TEST_PANE": "wait;newtab;wait;open:{base}/hist-b.html;wait;wait;tab:0;wait;js:document.getElementById('recent').textContent;log"
+    },
+    "expect": {
+      "log_contains": [
+        "History Blocalhost · just now"
+      ]
+    }
+  },
+  {
+    "name": "home-icons",
+    "page": "polish.html",
+    "secs": 18,
+    "env": {
+      "UNIBROW_TEST_PANE": "wait;wait;newtab;wait;wait;js:String(document.querySelectorAll('#recent .iconbox.has-icon').length)"
+    },
+    "expect": {
+      "log_contains": [
+        "js => 1"
+      ]
+    }
+  },
+  {
+    "name": "home-cmd-allowlist",
+    "page": "home",
+    "focus": "localhost",
+    "secs": 20,
+    "env": {
+      "UNIBROW_TEST_PANE": "wait;wait;js:fetch('/api/cmd',{method:'POST',headers:{'X-Unibrow-Token':document.querySelector('meta[name=unibrow-token]').content},body:JSON.stringify({cmd:'set_focus_only',on:false})}).then(r => document.title = 'allow ' + r.status);wait;js:document.title;js:fetch('/api/cmd',{method:'POST',body:JSON.stringify({cmd:'fill_chat',text:'x'})}).then(r => document.title = 'notoken ' + r.status);wait;js:document.title;clicksel:#focus .actions button:last-child;wait"
+    },
+    "expect": {
+      "log_contains": [
+        "js => allow 400",
+        "js => notoken 403",
+        "isn't something the home page can do"
+      ],
+      "trace_contains": [
+        "Home: refused",
+        "Home: showed site"
+      ]
+    }
+  },
+  {
+    "name": "home-ask",
+    "page": "home",
+    "secs": 60,
+    "env": {
+      "UNIBROW_TEST_PANE": "wait;wait;js:document.getElementById('asktext').value='What is 2 + 2? Reply with only the number.';clicksel:#askform button"
+    },
+    "expect": {
+      "trace_contains": [
+        "Home: asked the agent",
+        "Turn finished"
+      ],
+      "reply_contains": [
+        "4"
+      ]
+    }
+  },
+  {
+    "name": "home-model",
+    "page": "home",
+    "secs": 20,
+    "env": {
+      "UNIBROW_TEST_PANE": "wait;wait;js:document.getElementById('status').scrollIntoView({block:'center'});wait;js:document.getElementById('model').value='haiku';clicksel:#status .picker button;wait;wait;js:document.getElementById('status').textContent"
+    },
+    "expect": {
+      "trace_contains": [
+        "Home: set the agent to Claude Code · haiku"
+      ],
+      "log_contains": [
+        "Claude Code · Haiku 5.5"
+      ]
+    }
+  },
+  {
+    "name": "home-guide",
+    "page": "home",
+    "secs": 16,
+    "env": {
+      "UNIBROW_TEST_PANE": "wait;wait;js:String(document.querySelectorAll('#guide li').length);js:String(document.querySelector('.shortcuts').textContent.includes('Alt+5'));js:document.getElementById('guide').scrollIntoView({block:'center'});wait;clicksel:#guide li:nth-child(4) button;wait"
+    },
+    "expect": {
+      "log_contains": [
+        "js => 8",
+        "js => true"
+      ],
+      "trace_contains": [
+        "Home: showed explained"
+      ]
+    }
+  },
+  {
+    "name": "home-settings",
+    "page": "home",
+    "secs": 18,
+    "env": {
+      "UNIBROW_TEST_PANE": "wait;open:unibrow://home/settings;wait;wait;js:document.getElementById('where').textContent;js:document.title;clicksel:#where .buttons button:nth-child(2);wait"
+    },
+    "expect": {
+      "log_contains": [
+        "js => Settings",
+        "home-settings/traces",
+        "browsing.sqlite3"
+      ],
+      "trace_contains": [
+        "Home: opened the traces folder (test instance: not shown)"
+      ]
+    }
+  },
+  {
+    "name": "home-activity",
+    "page": "home",
+    "secs": 70,
+    "env": {
+      "UNIBROW_TEST_PANE": "wait;wait;js:document.getElementById('asktext').value='Reply with only the word ready.';clicksel:#askform button;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;js:document.getElementById('activity').textContent"
+    },
+    "expect": {
+      "log_contains": [
+        "Turn finished"
+      ],
+      "trace_contains": [
+        "Home: asked the agent"
+      ]
+    }
+  },
+  {
+    "name": "home-layout",
+    "page": "home",
+    "focus": "localhost",
+    "secs": 14,
+    "home_layout": {
+      "hidden": [
+        "watches",
+        "guide"
+      ],
+      "order": [
+        "focus"
+      ],
+      "density": "compact",
+      "accent": "#ff8800"
+    },
+    "env": {
+      "UNIBROW_TEST_PANE": "wait;wait;js:String(document.getElementById('watches').hidden) + ' ' + String(document.getElementById('guide').hidden);js:document.querySelector('main > section:not([hidden])').id;js:getComputedStyle(document.documentElement).getPropertyValue('--accent').trim()"
+    },
+    "expect": {
+      "log_contains": [
+        "js => true true",
+        "js => focus",
+        "js => #ff8800"
+      ]
+    }
+  },
+  {
+    "name": "home-pins",
+    "page": "hist-a.html",
+    "secs": 18,
+    "env": {
+      "UNIBROW_TEST_PANE": "wait;newtab;wait;wait;clicksel:#recent .actions button;wait;wait;js:document.getElementById('pins').textContent"
+    },
+    "expect": {
+      "log_contains": [
+        "js => PinnedLHistory A"
+      ],
+      "trace_contains": [
+        "Home: pinned"
+      ]
+    }
+  },
+  {
+    "name": "home-user-page",
+    "page": "home",
+    "secs": 16,
+    "home_files": {
+      "index.html": "<!doctype html><title>Mine</title><link rel=stylesheet href=/user/mine.css><h1>My own start page</h1>",
+      "mine.css": "h1 { color: rgb(1, 2, 3); }",
+      "user.css": "body { outline: 3px solid rgb(4, 5, 6); }"
+    },
+    "env": {
+      "UNIBROW_TEST_PANE": "wait;wait;js:document.title + ' ' + getComputedStyle(document.querySelector('h1')).color;open:unibrow://home/default;wait;wait;js:document.title + ' ' + getComputedStyle(document.body).outlineColor"
+    },
+    "expect": {
+      "log_contains": [
+        "js => Mine rgb(1, 2, 3)",
+        "js => Home rgb(4, 5, 6)"
+      ]
+    }
+  },
+  {
+    "name": "home-customize",
+    "page": "home",
+    "approve": "approve",
+    "task": "Hide the watches section on my home page.",
+    "expect": {
+      "tools": [
+        "home_customize"
+      ],
+      "trace_contains": [
+        "Approval needed: home_customize",
+        "Home page: hide watches",
+        "Home: the agent changed the page"
+      ]
+    }
   }
 ]

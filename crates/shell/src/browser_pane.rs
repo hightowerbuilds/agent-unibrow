@@ -952,6 +952,7 @@ impl BrowserPane {
         }
         if browsing_changed {
             cx.emit(BrowsingChanged);
+            self.refresh_home();
         }
         changed |= self.tick_tabs(cx);
         if !self.test_steps.is_empty() && Instant::now() >= self.test_next {
@@ -1432,6 +1433,20 @@ impl BrowserPane {
         if self.open_tab(HOME, true, cx).is_ok() {
             window.focus(&self.address.focus_handle(cx));
             self.address.update(cx, |a, cx| a.set_text("", cx));
+        }
+    }
+
+    /// Opens `url` in a new tab and shows it (the home page's links that
+    /// open in a new tab).
+    pub fn open_in_new_tab(&mut self, url: &str, cx: &mut Context<Self>) {
+        let _ = self.open_tab(url, true, cx);
+    }
+
+    /// Has open home pages fetch their data again (homepage H2.3): the app
+    /// pushes, the page doesn't poll.
+    pub fn refresh_home(&self) {
+        for t in self.tabs.iter().filter(|t| rail_browser::app_pages::is_app_page(&t.chrome.url)) {
+            drop(t.view.evaluate("window.home && window.home.refresh()"));
         }
     }
 

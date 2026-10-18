@@ -9,7 +9,7 @@ mod mime;
 use router::{Rail, Tool};
 use std::sync::Arc;
 
-pub use google_auth::{GoogleAuth, client_secret_path};
+pub use google_auth::{GoogleAuth, client_secret_path, signed_in as google_signed_in};
 
 pub struct ApiRail {
     gmail: Option<Arc<gmail::Gmail>>,

@@ -56,6 +56,20 @@ const BASICS: &[Section] = &[
         ],
     },
     Section {
+        title: "The home page",
+        blocks: &[Block::Bullets(&[
+            "New tabs open on Home: your pinned and recent sites, focus sites and their Jev status, watches, \
+             playbooks, recent chats, and which agent and keys are set up.",
+            "Ask the agent from its box, pick the agent and model, learn a site with Jev, or check a watch, \
+             right there. Settings and files, at the bottom, shows where everything is kept.",
+            "Customize this page hides, shows and reorders sections and sets the spacing and accent color. Or \
+             ask the agent (\"hide the watches on my home page\"); it asks before changing anything.",
+            "Your own CSS (user.css) or a whole page of your own (index.html) can go in the home folder next to \
+             your settings; unibrow://home/default always shows the built-in page. The agent's tools can't use \
+             the home page.",
+        ])],
+    },
+    Section {
         title: "Asking well",
         blocks: &[
             Block::Bullets(&[
@@ -261,6 +275,44 @@ const KEYS: &[Section] = &[
     },
 ];
 
+/// The guide as data for the home page (homepage H4.1), so its text stays
+/// here: each sub-tab with its sections and opening line, every example
+/// request, and the shortcuts.
+pub fn guide_json() -> serde_json::Value {
+    let lead = |p: &Page| {
+        p.sections.iter().flat_map(|s| s.blocks.iter()).find_map(|b| match b {
+            Block::Para(t) => Some(*t),
+            Block::Bullets(items) => items.first().copied(),
+            Block::Examples(items) => items.first().copied(),
+            Block::Keys(_) => Some("Every keyboard shortcut in the app."),
+        })
+    };
+    let first_sentence = |t: &str| {
+        let end = t.find(". ").map(|i| i + 1).unwrap_or(t.len());
+        t[..end].split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    let pages: Vec<serde_json::Value> = GUIDE
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            serde_json::json!({
+                "page": i,
+                "tab": p.tab,
+                "sections": p.sections.iter().map(|s| s.title).collect::<Vec<_>>(),
+                "lead": lead(p).map(first_sentence),
+            })
+        })
+        .collect();
+    let blocks = || GUIDE.iter().flat_map(|p| p.sections.iter()).flat_map(|s| s.blocks.iter());
+    let examples: Vec<&str> = blocks().filter_map(|b| if let Block::Examples(e) = b { Some(*e) } else { None }).flatten().copied().collect();
+    let keys: Vec<serde_json::Value> = blocks()
+        .filter_map(|b| if let Block::Keys(k) = b { Some(*k) } else { None })
+        .flatten()
+        .map(|(k, what)| serde_json::json!({"keys": k, "what": what}))
+        .collect();
+    serde_json::json!({"pages": pages, "examples": examples, "keys": keys})
+}
+
 /// Renders sub-tab `page` of the guide. `on_page` switches sub-tab;
 /// `on_example` puts a request in the chat box.
 pub fn render(
@@ -385,4 +437,16 @@ pub fn render(
         col = col.child(sec);
     }
     div().flex().flex_col().flex_1().min_h(px(0.)).child(tabs).child(col)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn guide_data_for_the_home_page() {
+        let g = super::guide_json();
+        assert_eq!(g["pages"].as_array().unwrap().len(), super::PAGES);
+        assert!(g["pages"].as_array().unwrap().iter().all(|p| p["lead"].is_string()));
+        assert!(g["examples"].as_array().unwrap().len() >= 4);
+        assert!(g["keys"].as_array().unwrap().iter().any(|k| k["keys"] == "Alt+5"));
+    }
 }

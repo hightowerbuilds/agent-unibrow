@@ -246,6 +246,12 @@ fn entry() -> Result<keyring::Entry, String> {
     keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(|e| format!("keyring unavailable: {e}"))
 }
 
+/// Whether the user has signed in to Google (a refresh token is saved).
+/// Says nothing about the token itself.
+pub fn signed_in() -> bool {
+    load_refresh_token().is_some()
+}
+
 fn load_refresh_token() -> Option<String> {
     entry().ok()?.get_password().ok()
 }

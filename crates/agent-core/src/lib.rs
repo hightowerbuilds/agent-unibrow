@@ -113,15 +113,23 @@ impl Settings {
         dirs::config_dir().map(|d| d.join("agent-unibrow").join("settings.json"))
     }
 
+    /// An isolated test instance's own copy (`$UNIBROW_DATA_DIR/settings.json`):
+    /// it starts from the user's settings but never changes them.
+    fn test_path() -> Option<PathBuf> {
+        std::env::var_os("UNIBROW_DATA_DIR").map(|d| PathBuf::from(d).join("settings.json"))
+    }
+
     pub fn load() -> Self {
-        Self::path()
+        Self::test_path()
+            .filter(|p| p.exists())
+            .or_else(Self::path)
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
     }
 
     pub fn save(&self) {
-        let Some(p) = Self::path() else { return };
+        let Some(p) = Self::test_path().or_else(Self::path) else { return };
         if let Some(d) = p.parent() {
             let _ = std::fs::create_dir_all(d);
         }

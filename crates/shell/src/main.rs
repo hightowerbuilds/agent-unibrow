@@ -218,6 +218,10 @@ struct Shell {
     settings: Settings,
     policy: Arc<Mutex<Policy>>,
     busy: bool,
+    /// Which keys are saved, for the home page (never the keys).
+    home_keys: home::Keys,
+    /// The home page asked for the chat box: focus it on the next render.
+    focus_chat_pending: bool,
     status: SharedString,
     sidebar_open: bool,
     /// The sidebar, as its own cached view (see [`SidebarView`]).
@@ -331,6 +335,8 @@ impl Shell {
             settings: Settings::load(),
             policy,
             busy: false,
+            home_keys: home::Keys::default(),
+            focus_chat_pending: false,
             status: "".into(),
             sidebar_open: true,
             sidebar_view: None,
@@ -349,14 +355,29 @@ impl Shell {
         if let Some(p) = shell.trace.path().cloned() {
             shell.trace.push(Kind::Info, "Trace file opened", Some(p.display().to_string()));
         }
+        // The home page (homepage H2) reads the stores and the shell's status.
+        home::attach(shell.store.clone(), shell.chats.clone());
+        shell.check_home_keys(cx);
+        let home_cmds = home::commands();
+        cx.spawn(async move |this, cx| {
+            while let Ok(cmd) = home_cmds.recv().await {
+                if this.update(cx, |s, cx| s.home_cmd(cmd, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         // Watches (9.4): changes arrive from the checker thread.
         let fired = watcher::spawn(shell.store.clone(), shell.bridge.clone());
         cx.spawn(async move |this, cx| {
             while let Ok(f) = fired.recv().await {
-                let ok = this.update(cx, |s, cx| match f {
-                    Some(f) => s.watch_fired(f, cx),
-                    None if matches!(s.tab, SidebarTab::Focus) => cx.notify(),
-                    None => {}
+                let ok = this.update(cx, |s, cx| {
+                    match f {
+                        Some(f) => s.watch_fired(f, cx),
+                        None if matches!(s.tab, SidebarTab::Focus) => cx.notify(),
+                        None => {}
+                    }
+                    s.publish_home(cx);
                 });
                 if ok.is_err() {
                     break;
@@ -612,6 +633,7 @@ impl Shell {
                 self.scroll_to_bottom();
             }
         }
+        self.publish_home(cx);
         cx.notify();
     }
 
@@ -659,6 +681,7 @@ impl Shell {
             registry.add_tool(tool);
         }
         registry.add_tool(chats::TaskProgress::new(self.chats.clone(), self.chat_id));
+        registry.add_tool(Arc::new(home::Customize));
         for n in &notes {
             self.trace.push(Kind::Info, n.clone(), None);
         }
@@ -691,6 +714,7 @@ impl Shell {
                 }
             }
         }));
+        self.publish_home(cx);
         cx.notify();
     }
 
@@ -707,6 +731,7 @@ impl Shell {
             };
             self.notice("API key set.".into());
             self.start_agent(Some(text), cx);
+            self.check_home_keys(cx);
             return;
         }
         if self.jev_pending.is_some() {
@@ -854,6 +879,209 @@ impl Shell {
         // The box stays open while the agent works: Enter steers it.
         self.input.update(cx, |i, cx| i.set_placeholder(if busy { BUSY_PLACEHOLDER } else { IDLE_PLACEHOLDER }, cx));
         self.browser.update(cx, |b, cx| b.set_agent_busy(busy, cx));
+        self.publish_home(cx);
+    }
+
+    /// Tells the home page what the shell knows (agent, model, keys, Jev
+    /// progress) and has open home tabs show it.
+    fn publish_home(&mut self, cx: &mut Context<Self>) {
+        let kind = self.settings.backend;
+        let choices = BackendKind::ALL
+            .into_iter()
+            .filter(|k| *k != BackendKind::AnthropicApi)
+            .map(|k| {
+                let models = match k {
+                    BackendKind::OpenCode => self.opencode_models.clone().unwrap_or_default(),
+                    _ => agent_core::models::known(k),
+                };
+                (backend_id(k), k.label().to_string(), models.into_iter().map(|m| (m.id, m.label)).collect())
+            })
+            .collect();
+        home::publish(home::Status {
+            agent: kind.label().to_string(),
+            model: self.model_label(kind),
+            busy: self.busy,
+            keys: self.home_keys,
+            jev_progress: self.jev_progress.clone(),
+            choices,
+            backend: backend_id(kind),
+            model_id: self.settings.model(kind).to_string(),
+            trace: self
+                .trace
+                .entries()
+                .iter()
+                .rev()
+                .take(10)
+                .rev()
+                .map(|e| {
+                    let kind = serde_json::to_value(e.kind).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+                    (kind, e.summary.clone(), e.at.timestamp())
+                })
+                .collect(),
+            settings: serde_json::to_value(&self.settings).unwrap_or_default(),
+        });
+        self.browser.update(cx, |b, _| b.refresh_home());
+    }
+
+    /// Does what the home page asked (homepage H3). The command was checked
+    /// by `home::parse_cmd`; here it's checked against the app's state too
+    /// (the site is a focus site, the model is one on offer).
+    fn home_cmd(&mut self, cmd: home::Cmd, cx: &mut Context<Self>) {
+        use home::Cmd;
+        let done: Result<String, String> = match cmd {
+            Cmd::Refused(why) => Err(why),
+            Cmd::NewTab { url } => {
+                self.browser.update(cx, |b, cx| b.open_in_new_tab(&url, cx));
+                Ok(format!("opened {url} in a new tab"))
+            }
+            Cmd::OpenFolder { which } => match home::folder(&which) {
+                // Test instances never open windows on the desktop.
+                Some(dir) if std::env::var_os("UNIBROW_DATA_DIR").is_some() => {
+                    Ok(format!("opened the {which} folder (test instance: not shown) {}", dir.display()))
+                }
+                Some(dir) => {
+                    let _ = std::fs::create_dir_all(&dir);
+                    match std::process::Command::new("xdg-open").arg(&dir).spawn() {
+                        Ok(_) => Ok(format!("opened the {which} folder")),
+                        Err(e) => Err(format!("couldn't open {}: {e}", dir.display())),
+                    }
+                }
+                None => Err(format!("no folder {which}")),
+            },
+            Cmd::Show { tab, site, page } => {
+                self.sidebar_open = true;
+                self.site_view = None;
+                match tab.as_str() {
+                    "chat" => {
+                        self.tab = SidebarTab::Chat;
+                        self.focus_chat_pending = true;
+                    }
+                    "history" | "bookmarks" | "trace" => {
+                        self.tab = SidebarTab::History;
+                        self.history_sub = match tab.as_str() {
+                            "bookmarks" => HistorySub::Bookmarks,
+                            "trace" => HistorySub::Trace,
+                            _ => HistorySub::Visits,
+                        };
+                    }
+                    "explained" => {
+                        self.tab = SidebarTab::Explained;
+                        if let Some(p) = page {
+                            self.explained_page = p;
+                        }
+                    }
+                    _ => {
+                        self.tab = SidebarTab::Focus;
+                        if let Some(site) = site.filter(|s| self.store.is_focused(s)) {
+                            self.site_view = Some(site);
+                        }
+                    }
+                }
+                Ok(format!("showed {tab}"))
+            }
+            Cmd::FillChat { text } => {
+                self.tab = SidebarTab::Chat;
+                self.sidebar_open = true;
+                self.input.update(cx, |i, cx| i.set_text(&text, cx));
+                self.focus_chat_pending = true;
+                Ok("filled the chat box".into())
+            }
+            Cmd::Ask { text } => {
+                self.tab = SidebarTab::Chat;
+                self.sidebar_open = true;
+                self.submit(text, cx);
+                Ok("asked the agent".into())
+            }
+            Cmd::SetAgent { backend, model } => {
+                match serde_json::from_value::<BackendKind>(serde_json::json!(backend)) {
+                    Ok(kind) if kind != BackendKind::AnthropicApi => {
+                        let offered = match kind {
+                            BackendKind::OpenCode => self.opencode_models.clone().unwrap_or_default(),
+                            _ => agent_core::models::known(kind),
+                        };
+                        if model.is_empty() {
+                            self.model_menu_open = false;
+                            self.switch_backend(kind, cx);
+                            Ok(format!("set the agent to {}", kind.label()))
+                        } else if offered.iter().any(|m| m.id == model) {
+                            self.select_model(kind, model.clone(), cx);
+                            Ok(format!("set the agent to {} · {model}", kind.label()))
+                        } else {
+                            Err(format!("{model} isn't a {} model on offer", kind.label()))
+                        }
+                    }
+                    _ => Err(format!("unknown agent {backend}")),
+                }
+            }
+            Cmd::LearnJev { site } if self.store.is_focused(&site) || self.store.is_focused(&format!("www.{site}")) => {
+                let key = site.trim_start_matches("www.").to_string();
+                self.learn_with_jev(key.clone(), cx);
+                Ok(format!("learn_jev {key}"))
+            }
+            Cmd::ToggleJev { site } => {
+                let key = site.trim_start_matches("www.").to_string();
+                match self.store.jev_site(&key).filter(|j| j.status == "ready") {
+                    Some(j) => {
+                        self.store.set_jev_enabled(&key, !j.enabled);
+                        Ok(format!("turned Jev {} for {key}", if j.enabled { "off" } else { "on" }))
+                    }
+                    None => Err(format!("Jev hasn't learned {key}")),
+                }
+            }
+            Cmd::LearnJev { site } => Err(format!("{site} isn't a focus site")),
+            Cmd::CheckWatch { id } => {
+                self.store.check_watch_soon(id);
+                Ok(format!("check_watch #{id}"))
+            }
+            Cmd::RemoveWatch { id } => {
+                self.store.remove_watch(id);
+                Ok(format!("removed watch #{id}"))
+            }
+            Cmd::RemoveBookmark { url } => {
+                self.store.remove_bookmark(&url);
+                Ok(format!("removed the bookmark {url}"))
+            }
+            Cmd::SaveLayout { layout } => match layout.save() {
+                Ok(()) => Ok("saved the layout".into()),
+                Err(e) => Err(format!("couldn't save the layout: {e}")),
+            },
+            Cmd::Pin { url, title } => {
+                if self.store.pin(&url, &title) {
+                    Ok(format!("pinned {url}"))
+                } else {
+                    Err(format!("{url} is already pinned, or there are {} pins", browsing::home_pins::MAX_PINS))
+                }
+            }
+            Cmd::Unpin { url } => {
+                self.store.unpin(&url);
+                Ok(format!("unpinned {url}"))
+            }
+            Cmd::MovePin { url, by } => {
+                self.store.move_pin(&url, by);
+                Ok(format!("moved the pin {url}"))
+            }
+            Cmd::Customized(what) => Ok(format!("the agent changed the page: {what}")),
+        };
+        match done {
+            Ok(what) => self.trace.push(Kind::Info, format!("Home: {what}"), None),
+            Err(why) => self.trace.push(Kind::Info, format!("Home: refused: {why}"), None),
+        };
+        self.publish_home(cx);
+        cx.notify();
+    }
+
+    /// Looks up which keys are saved (off the UI thread: it reads the
+    /// keyring), then updates the home page.
+    fn check_home_keys(&mut self, cx: &mut Context<Self>) {
+        let task = cx.background_spawn(async { home::Keys::check(load_api_key().is_some()) });
+        cx.spawn(async move |this, cx| {
+            let keys = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.home_keys = keys;
+                this.publish_home(cx);
+            });
+        })
+        .detach();
     }
 
     /// Stops the agent's current turn (Stop button, Esc, or the user taking
@@ -1028,6 +1256,7 @@ impl Shell {
                 self.set_busy(false, "", cx);
                 if e.contains("API 401") && self.settings.backend.needs_api_key() {
                     let _ = delete_api_key();
+                    self.check_home_keys(cx);
                     self.agent = None;
                     self._events = None;
                     self.ask_for_key("That API key was rejected. Paste a valid key and press Enter.", cx);
@@ -1553,15 +1782,7 @@ impl Shell {
             let key = f.site.trim_start_matches("www.").to_ascii_lowercase();
             let learned = jev.get(&key).cloned();
             let progress = self.jev_progress.get(&key).cloned();
-            let jev_line: Option<String> = match (&progress, &learned) {
-                (Some(p), _) => Some(format!("Jev learning: {p}")),
-                (None, Some(j)) if j.status == "ready" && j.enabled => {
-                    Some(format!("Jev ready: {}", j.skills.abilities().join(" · ")))
-                }
-                (None, Some(j)) if j.status == "ready" => Some("Jev off for this site".into()),
-                (None, Some(j)) if j.status == "failed" => Some("Jev couldn't learn this site".into()),
-                _ => None,
-            };
+            let jev_line = home::jev_line(progress.as_deref(), learned.as_ref());
             let (jev_label, jev_on) = match (&progress, &learned) {
                 (Some(_), _) => ("Learning…", true),
                 (None, Some(j)) if j.status == "ready" && j.enabled => ("Jev ✓", true),
@@ -2618,6 +2839,9 @@ impl Focusable for Shell {
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.site_icons.release(window);
+        if std::mem::take(&mut self.focus_chat_pending) {
+            window.focus(&self.input.focus_handle(cx));
+        }
         if self.sidebar_view.is_none() {
             let shell = cx.entity();
             self.sidebar_view = Some(cx.new(|cx| SidebarView {
@@ -2673,6 +2897,11 @@ impl Render for Shell {
             .when(!fullscreen, |d| d.child(self.render_bumper(cx)))
             .child(self.browser.clone())
     }
+}
+
+/// A backend's settings name ("claude_code"), as the home page sends it.
+fn backend_id(kind: BackendKind) -> String {
+    serde_json::to_value(kind).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
 }
 
 fn load_api_key() -> Option<String> {

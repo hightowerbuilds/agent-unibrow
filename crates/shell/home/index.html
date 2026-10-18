@@ -4,8 +4,11 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Home</title>
+  <meta name="unibrow-token" content="{{TOKEN}}">
   <link rel="icon" href="/favicon.svg">
   <link rel="stylesheet" href="/home.css">
+  <link rel="stylesheet" href="/theme.css">
+  <link rel="stylesheet" href="/user.css">
 </head>
 <body>
   <main>
@@ -21,26 +24,43 @@
       <button type="submit">Search</button>
     </form>
 
+    <section id="pins" hidden></section>
+    <section id="recent" class="half" hidden></section>
+    <section id="focus" class="half" hidden></section>
+    <section id="bookmarks" class="half" hidden></section>
+    <section id="watches" class="half" hidden></section>
+    <section id="playbooks" class="half" hidden></section>
+    <section id="chats" class="half" hidden></section>
+
     <section id="ask">
       <h2>Ask the agent</h2>
-      <p class="hint">Type in the chat on the right (Alt+1). Some things to try:</p>
-      <ul class="starters">
-        <li>“Find a bone jazz bass nut under $15 and show me the best rated one.”</li>
-        <li>“Watch this page and tell me when the price drops.”</li>
-        <li>“Summarize the article I have open in three bullets.”</li>
-        <li>“What did I look at on sweetwater last week?”</li>
-      </ul>
+      <form id="askform" autocomplete="off">
+        <label for="asktext" class="visually-hidden">Ask the agent</label>
+        <input id="asktext" type="text" placeholder="Ask the agent to do something" maxlength="4000">
+        <button type="submit">Ask</button>
+      </form>
+      <p class="hint">Or try one of these:</p>
+      <div class="starters">
+        <button type="button" data-text="Find a bone jazz bass nut under $15 and show me the best rated one.">Find a bone jazz bass nut under $15</button>
+        <button type="button" data-text="Watch this page and tell me when the price drops.">Watch a page for a price drop</button>
+        <button type="button" data-text="Summarize the article I have open in three bullets.">Summarize the article I have open</button>
+        <button type="button" data-text="What did I look at on sweetwater last week?">What did I look at last week?</button>
+      </div>
     </section>
 
     <section id="tinker">
       <h2>Make it yours</h2>
       <ul class="cards">
-        <li><b>Model</b><span>Pick the agent and model with the Model button at the bottom of the sidebar.</span></li>
-        <li><b>Focus sites</b><span>◎ Focus in the toolbar marks a site. Focus (Alt+3) lists them, and Learn with Jev answers questions about them without Claude.</span></li>
-        <li><b>History and Trace</b><span>Alt+2 shows what you visited, your bookmarks, and every step the agent took.</span></li>
-        <li><b>Explained</b><span>Alt+5 is the guide to everything in the app.</span></li>
+        <li><button type="button" data-show="chat"><b>Model</b><span>Pick the agent and model below, or with the Model button at the bottom of the sidebar.</span></button></li>
+        <li><button type="button" data-show="focus"><b>Focus sites</b><span>◎ Focus in the toolbar marks a site. Learn with Jev answers questions about it without Claude.</span></button></li>
+        <li><button type="button" data-show="history"><b>History</b><span>What you visited, your bookmarks, and every step the agent took (Trace).</span></button></li>
+        <li><button type="button" data-show="explained"><b>Explained</b><span>The guide to everything in the app.</span></button></li>
       </ul>
     </section>
+
+    <section id="guide" hidden></section>
+
+    <section id="activity" hidden></section>
 
     <section id="keys">
       <h2>Shortcuts</h2>
@@ -53,6 +73,12 @@
         <dt>Esc</dt><dd>Stop the agent</dd>
       </dl>
     </section>
+
+    <section id="status" hidden></section>
+    <section id="customizer" hidden></section>
+    <p class="more" id="footer"><button type="button" id="customize" class="small">Customize this page</button>
+      <a href="/settings">Settings and files →</a></p>
   </main>
+  <script src="/home.js"></script>
 </body>
 </html>

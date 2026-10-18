@@ -39,7 +39,8 @@ many seconds in; `log_contains` checks the instance's stderr log (and
 is the fixture server under 127.0.0.1 (another site), `{tls}` the same
 fixtures over HTTPS with a self-signed certificate, and `/auth/<page>`
 answers 401 (HTTP Basic, user `ada`, password `lovelace`) until signed in.
-A `page` of `home` starts on the app's home page, as a real launch does.
+A `page` of `home` starts on the app's home page, as a real launch does;
+`home_layout` seeds its home.json and `home_files` its home/ folder.
 A case without a `task` runs no agent turn (no quota used): the instance
 runs its `UNIBROW_TEST_PANE` steps for `secs` seconds and only the log is
 checked (`log_contains`, `log_not_contains`); the media cases work this way.
@@ -225,6 +226,15 @@ def run_case(case, port, workdir: Path, site: Path, tls_port=None):
     if "policy" in case:
         data.mkdir(parents=True, exist_ok=True)
         (data / "policy.json").write_text(json.dumps(case["policy"]))
+    if "home_layout" in case:
+        # The home page's layout (home.json in the instance's config folder).
+        data.mkdir(parents=True, exist_ok=True)
+        (data / "home.json").write_text(json.dumps(case["home_layout"]))
+    if "home_files" in case:
+        # The user's own files for the home page (user.css, index.html).
+        (data / "home").mkdir(parents=True, exist_ok=True)
+        for name, text in case["home_files"].items():
+            (data / "home" / name).write_text(text)
     if "focus" in case:
         env["UNIBROW_TEST_FOCUS"] = case["focus"]
     if "autostop_secs" in case:
@@ -271,7 +281,8 @@ def run_case(case, port, workdir: Path, site: Path, tls_port=None):
     trace = []
     try:
         if not case.get("task"):
-            # Pane-only case: let the test steps run, then stop.
+            # Pane-only case: let the test steps run, then stop. Steps can
+            # still start a turn (the home page's Ask box), so read the trace.
             deadline = time.time() + case.get("secs", 30)
             while time.time() < deadline and proc.poll() is None:
                 time.sleep(1)
@@ -288,7 +299,7 @@ def run_case(case, port, workdir: Path, site: Path, tls_port=None):
             while want and time.time() < deadline:
                 time.sleep(2)
                 trace = read_trace(data, start)
-                if any(want.lower() in json.dumps(e).lower() for e in trace):
+                if any(want.lower() in json.dumps(e, ensure_ascii=False).lower() for e in trace):
                     break
     finally:
         proc.terminate()
@@ -296,6 +307,10 @@ def run_case(case, port, workdir: Path, site: Path, tls_port=None):
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+    if not case.get("task"):
+        # Steps can still start a turn or act (the home page's Ask box and
+        # buttons): read the trace, once the instance has written it out.
+        trace = read_trace(data, start)
     if after.get("wait_trace"):
         case.setdefault("expect", {}).setdefault("trace_contains", []).append(after["wait_trace"])
     log.close()
@@ -318,7 +333,7 @@ def check(case, trace, data: Path, seconds, log_path=None):
     reply = (finished[-1].get("detail") or "").split("\n\nmodel:")[0] if finished else ""
     summaries = "\n".join(e.get("summary", "") for e in trace)
     calls = [e["summary"].split(" ")[0] for e in trace if e.get("kind") == "tool_call"]
-    raw = "\n".join(json.dumps(e) for e in trace)
+    raw = "\n".join(json.dumps(e, ensure_ascii=False) for e in trace)
 
     for s in exp.get("reply_contains", []):
         if s.lower() not in reply.lower():

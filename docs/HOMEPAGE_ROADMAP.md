@@ -23,10 +23,10 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
 | Phase | Completed | Partial | Todo |
 | --- | --- | --- | --- |
 | H1. A local home page | H1.2–H1.5 | H1.1 | |
-| H2. Live data | | | H2.1–H2.4 |
-| H3. Acting from the page | | | H3.1–H3.5 |
-| H4. The tinkering hub | | | H4.1–H4.4 |
-| H5. Making it yours | | | H5.1–H5.5 |
+| H2. Live data | H2.1–H2.4 | | |
+| H3. Acting from the page | H3.1–H3.3 | H3.4, H3.5 (no eval yet) | |
+| H4. The tinkering hub | H4.1–H4.4 | | |
+| H5. Making it yours | H5.1, H5.4, H5.5 | H5.2, H5.3 | |
 
 ## How the page is served
 
@@ -173,7 +173,15 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
 
 ## Phase H2: Live data (read-only bridge)
 
-### H2.1 `/api/state` — todo
+### H2.1 `/api/state` — ✅ **COMPLETED**
+- Built as planned, in `crates/shell/src/home.rs` (`home::state`). The
+  shell hands the page its stores once (`home::attach`) and publishes what
+  only it knows (`home::publish`). Data is served only to the home page's
+  own main frame; any other caller gets 403. The page draws everything
+  with `textContent`, never as HTML. The Jev status line is shared as
+  `home::jev_line`, used by both the Focus tab and home.
+- Along the way: history now breaks same-second ties newest first
+  (`ORDER BY at DESC, id DESC`).
 - JSON built in `crates/shell/src/home.rs` from the store:
   - recent visits: `Browsing::history` with a limit of 12, folded by site
   - bookmarks: `bookmarks()`
@@ -187,28 +195,33 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
 - The page renders sections in this order: Recent · Bookmarks · Focus
   sites · Watches · Playbooks · Chats. Empty sections show a one-line
   hint, e.g. "No focus sites yet. Use ◎ Focus in the toolbar."
-- Eval: `home-data`. Start on `hist-a.html` with `focus: "localhost"`,
-  then the `newtab` pane step from H1.2. The `js:` step reads `#recent` and `#focus`
-  text, and the check is that both name the fixture site.
+- Eval: `home-data` (start on `hist-a.html` with `localhost` in focus,
+  then a new tab: Recent and Focus sites name it, and the status section
+  is there).
 
-### H2.2 Site icons — todo
+### H2.2 Site icons — ✅ **COMPLETED**
 - `GET /icon/<site>.png` from `Browsing::favicon` (BGRA → PNG with the
   `image` crate, already a shell dependency), with a letter tile as the
   fallback.
-- Eval: covered by `home-data` (the `js:` step checks
-  `img.naturalWidth > 0` for a site with a favicon, using
-  `polish-icon.png`).
+- Eval: `home-icons` (a page with a favicon, `polish.html`: its row on
+  home shows the icon, not the letter).
 
-### H2.3 Live refresh without polling — todo
+### H2.3 Live refresh without polling — ✅ **COMPLETED**
+- Also refreshed after a watch check, Jev learning progress, the agent
+  starting, stopping or switching, a key changing, and every home
+  command.
 - When the shell sees `browsing_changed` (in `BrowserPane::tick`), a
   watch check, Jev learning progress, or a settings change, it calls
   `WebView::evaluate("window.home?.refresh()")` on tabs showing
   `unibrow://home`. The page then fetches `/api/state` again.
-- Eval: `home-refresh` (home open in tab 0; a `tab:` step visits a page in
-  another tab; back on tab 0, the recent list includes it without a
-  reload).
+- Eval: `home-refresh` (home in tab 0, a page visited in tab 1, then back
+  to tab 0: Recent lists it without a reload).
 
-### H2.4 Agent, model and keys status — todo
+### H2.4 Agent, model and keys status — ✅ **COMPLETED**
+- Gmail shows "signed in", "set up, not signed in" or "not set up"
+  (`rail_api::google_signed_in` says whether a token exists, never what
+  it is). Keys are checked off the UI thread at startup and when the API
+  key changes (`Shell::check_home_keys`).
 - Shows the current agent and model (`agent_core::Settings`), and whether
   the agent is idle or working.
 - Shows whether each key is set, never its value:
@@ -223,15 +236,20 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
   the page can't cause keyring prompts.
 - A unit test serializes a snapshot built with known fake keys and asserts
   that none of them appear in the output.
-- Eval: `home-keys` (`env: {"JEV_API_KEY": "sk-test-home-123"}`; `js:` →
-  page text has "Jev · set"; another `js:` checks
-  `document.documentElement.outerHTML.includes('sk-test')` → `js => false`).
+- Eval: `home-keys` (`JEV_API_KEY=sk-test-home-123`: the page says Jev
+  is set, and the key's text is nowhere in it).
 
 ---
 
 ## Phase H3: Acting from the page (narrow, allowlisted)
 
-### H3.1 Commands — todo
+### H3.1 Commands — ✅ **COMPLETED**
+- Built with the list below, plus `open_folder`, `save_layout`,
+  `reset_layout`, `pin`, `unpin` and `move_pin` (H4, H5). Each field is
+  checked in `home::parse_cmd`, then against the app's state in
+  `Shell::home_cmd` (a focus site, a model on offer). The token is in a
+  `<meta>` tag of the served page and sent as `X-Unibrow-Token`. Refused
+  commands are logged and traced ("Home: refused: …").
 - `POST /api/cmd` takes a `HomeCmd` enum in `home.rs`. Anything not on the
   list is refused with a 400. Each command:
   - `open {text}`: through `normalize_address`, in this tab
@@ -250,28 +268,37 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
   (`show {tab: "focus"}`).
 - Every command is written to the trace as `Info` "Home: …", so evals and
   the user can see it.
-- Eval: `home-cmd-allowlist` (a `js:` step posts
-  `{cmd: "set_focus_only", on: false}` from home → refused; policy.json
-  unchanged; `log_contains` the refusal).
+- Eval: `home-cmd-allowlist` (`set_focus_only` with the token → 400 and
+  refused; any command without the token → 403; a focus site's View
+  button works).
 
-### H3.2 Ask the agent from home — todo
+### H3.2 Ask the agent from home — ✅ **COMPLETED**
+- Enter sends right away (open question 3: the default). The example
+  buttons fill the box. They come from Explained (H4.1).
 - An "Ask the agent" box. Enter sends it as a normal chat message, so Jev
   routing on Jev-ready sites, approvals and Stop all work as usual. The
   sidebar opens on Chat.
 - Under the box: three example chips taken from Explained's examples (needs
   `explained.rs` to expose them; coordinate with the guide's owner).
-- Eval: `home-ask` (page home; pane steps type "What time is it?" into
-  `#ask` and press Enter; `reply_any` has a time; `trace_contains`
-  "Home: ask").
+- Eval: `home-ask` ("What is 2 + 2?" from home's box: the agent answers 4,
+  traced as "Home: asked the agent").
 
-### H3.3 Agent and model picker — todo
+### H3.3 Agent and model picker — ✅ **COMPLETED**
+- Found and fixed along the way: test instances saved settings to the
+  user's real `~/.config/agent-unibrow/settings.json`. They now read it
+  but save to `$UNIBROW_DATA_DIR/settings.json`.
+- The eval harness compared traces as `\u00b7`-escaped JSON, so no
+  expectation with non-ASCII text (such as "·") could match. It now
+  compares the text itself.
 - Shows the same choices as `render_model_menu` (`agent_core::models`; it
   lists OpenCode models with `opencode models` the first time). Uses the
   same code path to save the settings and restart the agent.
-- Eval: `home-model` (no task; pick Codex from home; settings.json in the
-  case's config dir says `codex`, `log_contains` "Home: set_agent").
+- Eval: `home-model` (Haiku picked on home: the agent restarts on it, and
+  home says "Claude Code · Haiku 5.5").
 
-### H3.4 Focus sites and Jev — todo
+### H3.4 Focus sites and Jev — ◐ partial
+- Built: each focus site row has Learn with Jev / Jev on-off / Retry Jev
+  and View. Left: the `home-jev-learn` eval.
 - Each focus site is a card: open it, see its Jev status, and use Learn
   with Jev / Jev on-off (`jev_worker::Job`, progress pushed via H2.3).
   "View" opens the sidebar on that site's View (8.6).
@@ -279,7 +306,10 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
   Jev cases; clicking Learn on the fixture shop's card shows "Jev ready"
   after refresh).
 
-### H3.5 Watches and playbooks — todo
+### H3.5 Watches and playbooks — ◐ partial
+- Built: watches show the last value and check, with Check now (marks it
+  due; the checker looks within half a minute) and Remove. Playbooks show
+  per site with Run… (fills the chat). Left: the `home-watch` eval.
 - Watches: label, last value, last check, Check now, Remove.
 - Playbooks: name, site, runs and last failure (from `Playbook`). "Run…"
   fills the chat with "Run my playbook <name> for …", because parameters
@@ -291,15 +321,23 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
 
 ## Phase H4: The tinkering hub
 
-### H4.1 The guide on home — todo
+### H4.1 The guide on home — ✅ **COMPLETED**
+- `explained::guide_json()` gives every guide page (tab, sections, first
+  line), every example request and the shortcuts. Explained also gets a
+  "The home page" section.
 - Explained's sections as cards, so the page doubles as the "how to use
   this" screen. Needs `explained.rs` to expose its `GUIDE` data (e.g. a
   `guide_json()`), so the text stays in one place. "More" opens the
   sidebar's Explained tab on that page (`show`).
-- Eval: `home-guide` (the `js:` step counts cards = `explained::PAGES`;
-  clicking one logs "Home: show explained").
+- Eval: `home-guide` (8 cards, Alt+5 among the shortcuts, and a card
+  opens Explained on its page).
 
-### H4.2 `unibrow://settings` — todo
+### H4.2 Settings and files — ✅ **COMPLETED**
+- At `unibrow://home/settings` rather than a separate `unibrow://settings`,
+  so it shares home's origin: its styles and its command token. It shows
+  every file's path, the settings, the safety rules (read-only) and the
+  versions (the app, and the CEF build's folder name). Open folder works
+  for data, traces, downloads and config; test instances only log it.
 - A second page from the same handler. It shows:
   - the settings.json values
   - where things live: profile, `browsing.sqlite3`, `chats.sqlite3`,
@@ -307,16 +345,20 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
   - the CEF version and app version
   - the policy, read-only, with a link to edit it in Focus → Safety
 - "Open folder" buttons (`xdg-open`, folders only).
-- Eval: `home-settings` (`js:` finds the traces path from the case's
-  `UNIBROW_DATA_DIR`).
+- Eval: `home-settings` (the case's own traces and history paths; Open
+  Traces is traced).
 
-### H4.3 Trace and evals at a glance — todo
+### H4.3 Trace and evals at a glance — ✅ **COMPLETED**
 - The last 10 trace entries (kind, tool, time), with Open Trace.
 - In a source checkout (where `crates/evals/results/` exists), the latest
   eval run's pass count and failing case names.
-- Eval: `home-trace` (after an agent turn, home lists that tool name).
+- Eval: `home-activity` (after a turn asked from home, Recent activity
+  shows "Turn finished").
 
-### H4.4 Shortcuts and help — todo
+### H4.4 Shortcuts and help — ✅ **COMPLETED**
+- From Explained's shortcut list rather than the key bindings themselves,
+  so the guide and home always agree. The bindings are separate Action
+  types, so a shared table would need a bigger change.
 - Shortcut list generated from the key bindings registered in `main.rs`
   (the `gpui::KeyBinding::new` list), not typed by hand.
 - Eval: covered by `home-guide` (Alt+5 shown).
@@ -325,28 +367,41 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
 
 ## Phase H5: Making it yours
 
-### H5.1 Layout — todo
+### H5.1 Layout — ✅ **COMPLETED**
+- "Customize this page": tick sections on or off, move them up or down,
+  Roomy or Compact, accent color, Save or Reset. `home.json` lives in the
+  config folder (a test instance's data folder). Unknown sections and
+  bad colors are dropped when it's read (`home::Layout`).
 - A "Customize" mode: show or hide each section, reorder them, choose
   compact or roomy. Saved in `~/.config/agent-unibrow/home.json`, a shell
   file kept separate from settings.json, so `agent-core` doesn't need to
   know about it. Saved through a validated `save_layout` command.
-- Eval: `home-layout` (needs a harness option that writes home.json into
-  the case's config dir, like `policy`; hidden sections are absent).
+- Eval: `home-layout` (the new `home_layout` harness option: hidden
+  sections hidden, Focus first, the accent applied).
 
-### H5.2 Pinned sites — todo
+### H5.2 Pinned sites — ◐ partial
+- Built: `home_pins` table (`crates/browsing/src/home_pins.rs`, at most
+  24), Pin on Recent rows, tiles with ← → and × instead of dragging.
+  Left: pinning from the page's context menu or a History row.
 - Pinned tiles above Recent: add from home, from the page's context menu,
   or from a History row; drag to reorder. Stored in a `home_pins` table in
   a new `crates/browsing/src/home.rs` (url, title, position).
-- Eval: `home-pins` (pin the fixture shop, relaunch, still pinned and
-  first).
+- Eval: `home-pins` (Pin on a Recent row puts it in Pinned).
 
-### H5.3 Theme — todo
+### H5.3 Theme — ◐ partial
+- Built: `/theme.css` from `theme.rs` with the user's accent and density.
+  Left: a light variant and a background image (a picture in the home
+  folder already works through user.css and `/user/<file>`).
 - `/theme.css` is generated from `crates/shell/src/theme.rs`, so the page
   matches the shell. Options: accent color, light variant, background
   image (a file in `~/.config/agent-unibrow/home/`).
-- Eval: `home-theme` (`js:` reads `--accent` = `theme::ACCENT`).
+- Eval: covered by `home-layout` (`--accent` follows home.json).
 
-### H5.4 Your own CSS and page — todo
+### H5.4 Your own CSS and page — ✅ **COMPLETED**
+- The folder is `home/` in the config folder. Files are served at
+  `/user/<name>`: plain names only, no links out of the folder, 4 MB each,
+  common web types. The built-in page is `unibrow://home/default` (a path
+  rather than `?default`, since app-page routing ignores queries).
 - `~/.config/agent-unibrow/home/user.css` is applied after the built-in
   CSS.
 - An `index.html` in that folder replaces the built-in page and gets the
@@ -355,14 +410,17 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
   size cap.
 - `unibrow://home/?default` and a "Reset to default" link always show the
   built-in page.
-- Eval: `home-user-page` (the case writes a small index.html; home shows
-  it; `?default` shows the built-in page).
+- Eval: `home-user-page` (the new `home_files` harness option: a page of
+  your own with its own CSS file, and `/default` with user.css applied).
 
-### H5.5 Ask the agent to change the page — todo
+### H5.5 Ask the agent to change the page — ✅ **COMPLETED**
+- `home_customize` is a Commit tool rather than Stage, since Stage
+  tools run without asking in this app's policy. The approval card spells
+  out the change ("Home page: hide watches").
 - A `home_customize` tool (Stage effect) that can only edit `home.json`
   and `user.css`. Its approval card shows the change.
-- Eval: `home-customize` ("hide the watches section on my home page" →
-  `approval_requested`, then home.json has watches hidden).
+- Eval: `home-customize` ("Hide the watches section on my home page": the
+  approval card, then home.json has watches hidden).
 
 ---
 
