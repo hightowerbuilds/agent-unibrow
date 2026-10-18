@@ -22,11 +22,11 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
 
 | Phase | Completed | Partial | Todo |
 | --- | --- | --- | --- |
-| H1. A local home page | H1.2–H1.5 | H1.1 | |
+| H1. A local home page | H1.1–H1.5 | | |
 | H2. Live data | H2.1–H2.4 | | |
-| H3. Acting from the page | H3.1–H3.3 | H3.4, H3.5 (no eval yet) | |
+| H3. Acting from the page | H3.1–H3.5 | | |
 | H4. The tinkering hub | H4.1–H4.4 | | |
-| H5. Making it yours | H5.1, H5.4, H5.5 | H5.2, H5.3 | |
+| H5. Making it yours | H5.1, H5.3–H5.5 | H5.2 | |
 
 ## How the page is served
 
@@ -97,7 +97,7 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
 
 ## Phase H1: A local home page (opens on launch and in new tabs)
 
-### H1.1 The `unibrow://` scheme — ◐ partial
+### H1.1 The `unibrow://` scheme — ✅ **COMPLETED**
 - Done: `rail_browser::app_pages` registers the scheme (standard, secure,
   display-isolated, fetch-enabled; not CORS-enabled) in every process
   through `App::on_register_custom_schemes`, and `app_pages::serve` adds the
@@ -109,10 +109,12 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
 - Unit tests: `app_pages` (routing, traversal, the CSP, which navigations
   may open the app's pages) and `home` (files served, nothing loaded from
   the web, no scripts).
-- Left: a dark background for home tabs. A browser's background color is
-  fixed when it's created, and the tab goes on to websites that expect
-  white behind them, so this needs a per-navigation approach. The page
-  loads from memory, so the white flash is very short.
+- No white flash: a browser's background color is fixed when it's
+  created, and tabs go on to websites that expect white, so the pane covers
+  it instead. While an app page loads, and until its first frame after
+  loading, the pane draws the app's background rather than Chromium's
+  white first paint (`BrowserPane::painted_since_load`). `home-launch`
+  and `home-newtab` check that the cover lifts.
 
 ### H1.2 Home on launch, new tab and last-tab-closed — ✅ **COMPLETED**
 - `HOME` in `browser_pane.rs` becomes `unibrow://home/`.
@@ -296,26 +298,26 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
 - Eval: `home-model` (Haiku picked on home: the agent restarts on it, and
   home says "Claude Code · Haiku 5.5").
 
-### H3.4 Focus sites and Jev — ◐ partial
-- Built: each focus site row has Learn with Jev / Jev on-off / Retry Jev
-  and View. Left: the `home-jev-learn` eval.
+### H3.4 Focus sites and Jev — ✅ **COMPLETED**
+- Each focus site row has Learn with Jev / Jev on-off / Retry Jev and
+  View.
 - Each focus site is a card: open it, see its Jev status, and use Learn
   with Jev / Jev on-off (`jev_worker::Job`, progress pushed via H2.3).
   "View" opens the sidebar on that site's View (8.6).
-- Eval: `home-jev-learn` (with `UNIBROW_TEST_JEV_LEARN`, like the existing
-  Jev cases; clicking Learn on the fixture shop's card shows "Jev ready"
-  after refresh).
+- Eval: `home-jev-learn` (Learn with Jev on home, starting from the test
+  shop through the `UNIBROW_TEST_JEV_START` hook: the row turns "Jev
+  ready: find…" with no reload).
 
-### H3.5 Watches and playbooks — ◐ partial
-- Built: watches show the last value and check, with Check now (marks it
-  due; the checker looks within half a minute) and Remove. Playbooks show
-  per site with Run… (fills the chat). Left: the `home-watch` eval.
+### H3.5 Watches and playbooks — ✅ **COMPLETED**
+- Watches show the last value and check, with Check now (marks it due;
+  the checker looks within half a minute) and Remove. Playbooks are listed
+  per site with Run… (fills the chat).
 - Watches: label, last value, last check, Check now, Remove.
 - Playbooks: name, site, runs and last failure (from `Playbook`). "Run…"
   fills the chat with "Run my playbook <name> for …", because parameters
   need the user's words and replays are an agent tool.
-- Eval: `home-watch` (seed a watch on `watch.html` with an agent turn
-  first; on home, Check now → `wait_trace` for the check).
+- Eval: `home-watch` (a watch seeded through `UNIBROW_TEST_WATCH`: its
+  value shows, Check now makes it due, and Remove removes it).
 
 ---
 
@@ -388,14 +390,19 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
   a new `crates/browsing/src/home.rs` (url, title, position).
 - Eval: `home-pins` (Pin on a Recent row puts it in Pinned).
 
-### H5.3 Theme — ◐ partial
-- Built: `/theme.css` from `theme.rs` with the user's accent and density.
-  Left: a light variant and a background image (a picture in the home
-  folder already works through user.css and `/user/<file>`).
+### H5.3 Theme — ✅ **COMPLETED**
+- `/theme.css` comes from `theme.rs` (or a light palette), with the
+  user's accent and density. Theme: Match the app (dark), Light, or
+  Follow the desktop (`prefers-color-scheme`). The background picture is
+  any .jpg/.png/.webp in the home folder, under a veil of the page color
+  so text stays readable. Customize has an Open home folder button for
+  adding one.
 - `/theme.css` is generated from `crates/shell/src/theme.rs`, so the page
   matches the shell. Options: accent color, light variant, background
   image (a file in `~/.config/agent-unibrow/home/`).
-- Eval: covered by `home-layout` (`--accent` follows home.json).
+- Eval: `home-theme` (light theme and a background picture from
+  home_files; the picture is served as image/png). `home-layout` covers
+  the accent color.
 
 ### H5.4 Your own CSS and page — ✅ **COMPLETED**
 - The folder is `home/` in the config folder. Files are served at

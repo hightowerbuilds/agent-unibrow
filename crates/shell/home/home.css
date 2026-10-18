@@ -61,7 +61,7 @@ button.small[disabled] { opacity: 0.6; cursor: default; }
 a.rowmain:hover { background: var(--pane); }
 .rows .main { grid-column: 2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .rows .meta { grid-column: 2; color: var(--muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.rows .meta.warn { color: #e0a65a; }
+.rows .meta.warn { color: var(--warn, #e0a65a); }
 .iconbox { grid-row: 1 / span 2; width: 24px; height: 24px; position: relative; }
 .iconbox .icon { width: 20px; height: 20px; margin: 2px; display: none; }
 .iconbox .letter {

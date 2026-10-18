@@ -173,6 +173,41 @@ pub struct Layout {
     pub compact: bool,
     /// `#rrggbb`.
     pub accent: Option<String>,
+    /// `dark` (the app's own colors, the default), `light`, or `auto`
+    /// (follow the desktop's light or dark setting).
+    pub theme: String,
+    /// A picture in the user's home folder, shown behind the page.
+    pub background: Option<String>,
+}
+
+/// The themes a layout can ask for.
+pub const THEMES: &[&str] = &["dark", "light", "auto"];
+
+/// Whether `name` could be a picture in the user's folder: a plain file
+/// name with an image extension.
+fn image_name(name: &str) -> bool {
+    let plain = !name.is_empty()
+        && !name.starts_with('.')
+        && name.len() <= 100
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    plain && matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp")
+}
+
+/// The pictures in the user's folder, for the background choice.
+pub fn user_images() -> Vec<String> {
+    let Some(dir) = user_folder() else { return Vec::new() };
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| image_name(n))
+        .collect();
+    names.sort();
+    names.truncate(50);
+    names
 }
 
 impl Layout {
@@ -189,13 +224,16 @@ impl Layout {
         let accent = v["accent"].as_str().map(str::to_ascii_lowercase).filter(|a| {
             a.len() == 7 && a.starts_with('#') && a[1..].chars().all(|c| c.is_ascii_hexdigit())
         });
-        Layout { hidden: ids("hidden"), order: ids("order"), compact: v["density"] == "compact", accent }
+        let theme = v["theme"].as_str().filter(|t| THEMES.contains(t)).unwrap_or("dark").to_string();
+        let background = v["background"].as_str().filter(|b| image_name(b)).map(str::to_string);
+        Layout { hidden: ids("hidden"), order: ids("order"), compact: v["density"] == "compact", accent, theme, background }
     }
 
     pub fn to_value(&self) -> Value {
         json!({
             "hidden": self.hidden, "order": self.order,
             "density": if self.compact { "compact" } else { "roomy" }, "accent": self.accent,
+            "theme": if self.theme.is_empty() { "dark" } else { &self.theme }, "background": self.background,
         })
     }
 
@@ -255,18 +293,59 @@ fn user_file(name: &str) -> Option<(Vec<u8>, &'static str)> {
     Some((std::fs::read(path).ok()?, mime))
 }
 
+/// The light palette (the app itself is dark only).
+const LIGHT: [(&str, u32); 9] = [
+    ("bg", 0xf4f6f8),
+    ("pane", 0xffffff),
+    ("raised", 0xe9eef2),
+    ("rule", 0xd3dbe2),
+    ("fg", 0x1b2733),
+    ("muted", 0x5a6a77),
+    ("ok", 0x2e7d32),
+    ("warn", 0xa15c00),
+    ("error", 0xc0392b),
+];
+/// The accent on light pages: the app's teal, darker so it reads on white.
+const LIGHT_ACCENT: u32 = 0x1f8a82;
+
 /// `/theme.css`: the shell's palette (`theme.rs`), so the page matches the
-/// app, with the user's accent color and density.
+/// app, or the light one; with the user's accent color, density and
+/// background picture.
 fn theme_css(layout: &Layout) -> String {
     use crate::theme::*;
     let hex = |c: u32| format!("#{c:06x}");
-    let accent = layout.accent.clone().unwrap_or_else(|| hex(ACCENT));
-    let mut css = format!(
-        ":root {{ --bg: {}; --pane: {}; --raised: {}; --rule: {}; --fg: {}; --muted: {}; --accent: {accent}; --ok: {}; --warn: {}; --error: {}; }}\n",
-        hex(BG), hex(PANE), hex(RAISED), hex(RULE), hex(FG), hex(MUTED), hex(OK), hex(WARN), hex(ERROR)
-    );
+    let vars = |pairs: &[(&str, u32)], accent: String, scheme: &str, veil: &str| {
+        let mut out: String = pairs.iter().map(|(k, c)| format!("--{k}: {}; ", hex(*c))).collect();
+        out.push_str(&format!("--accent: {accent}; --veil: {veil}; color-scheme: {scheme};"));
+        out
+    };
+    let dark: [(&str, u32); 9] = [
+        ("bg", BG),
+        ("pane", PANE),
+        ("raised", RAISED),
+        ("rule", RULE),
+        ("fg", FG),
+        ("muted", MUTED),
+        ("ok", OK),
+        ("warn", WARN),
+        ("error", ERROR),
+    ];
+    let dark_vars = vars(&dark, layout.accent.clone().unwrap_or_else(|| hex(ACCENT)), "dark", "rgba(17, 26, 33, 0.78)");
+    let light_vars = vars(&LIGHT, layout.accent.clone().unwrap_or_else(|| hex(LIGHT_ACCENT)), "light", "rgba(244, 246, 248, 0.82)");
+    let mut css = match layout.theme.as_str() {
+        "light" => format!(":root {{ {light_vars} }}\n"),
+        "auto" => format!(":root {{ {dark_vars} }}\n@media (prefers-color-scheme: light) {{ :root {{ {light_vars} }} }}\n"),
+        _ => format!(":root {{ {dark_vars} }}\n"),
+    };
     if layout.compact {
         css.push_str("body { font-size: 14px; } main { padding-top: 28px; } section { margin-top: 20px; } .rows .rowmain { padding: 3px 8px; }\n");
+    }
+    if let Some(bg) = layout.background.as_deref().filter(|b| image_name(b)) {
+        // A veil of the page color over the picture keeps the text readable.
+        css.push_str(&format!(
+            "body {{ background-color: var(--bg); background-image: linear-gradient(var(--veil), var(--veil)), url(\"/user/{bg}\"); \
+             background-size: cover; background-position: center; background-attachment: fixed; }}\n"
+        ));
     }
     css
 }
@@ -282,6 +361,7 @@ pub fn folder(which: &str) -> Option<std::path::PathBuf> {
         "downloads" => rail_browser::downloads_dir(),
         "config" if test => data,
         "config" => dirs::config_dir()?.join("agent-unibrow"),
+        "home" => folder("config")?.join("home"),
         _ => return None,
     })
 }
@@ -307,8 +387,9 @@ pub fn settings_state(status: &Status) -> Value {
             {"what": "Browser profile (cookies, logins, site data)", "path": path(rail_browser::profile_dir())},
             {"what": "Traces", "path": folder("traces").map(path)},
             {"what": "Downloads", "path": path(rail_browser::downloads_dir())},
+            {"what": "Your home page files (user.css, index.html, pictures)", "path": user_folder().map(path)},
         ],
-        "folders": ["data", "traces", "downloads", "config"],
+        "folders": ["data", "traces", "downloads", "config", "home"],
         "versions": {"app": env!("CARGO_PKG_VERSION"), "chromium": cef},
         "policy": policy,
     })
@@ -485,6 +566,7 @@ pub fn state(store: &Browsing, chats: Option<&chats::Chats>, status: &Status) ->
     let pins: Vec<Value> = store.pins().into_iter().map(|p| json!({"url": p.url, "title": p.title, "site": p.site})).collect();
     json!({
         "layout": Layout::load().to_value(),
+        "user_images": user_images(),
         "sections": SECTIONS,
         "pins": pins,
         "guide": crate::explained::guide_json(),
@@ -638,6 +720,15 @@ mod tests {
         assert!(l.compact);
         assert_eq!(l.accent.as_deref(), Some("#ff8800"));
         assert_eq!(Layout::from_value(&json!({"accent": "red; }"})).accent, None);
+        assert_eq!(l.theme, "dark");
+        let light = Layout::from_value(&json!({"theme": "light", "background": "bg.jpg"}));
+        assert!(theme_css(&light).contains("--bg: #f4f6f8") && theme_css(&light).contains("url(\"/user/bg.jpg\")"));
+        let auto = theme_css(&Layout::from_value(&json!({"theme": "auto"})));
+        assert!(auto.contains("prefers-color-scheme: light") && auto.contains("--bg: #111a21"));
+        assert_eq!(Layout::from_value(&json!({"theme": "neon"})).theme, "dark");
+        for bad in ["../x.jpg", "x.svg", "a\")}body{x.png", ".bg.png"] {
+            assert_eq!(Layout::from_value(&json!({"background": bad})).background, None, "{bad}");
+        }
         assert_eq!(Layout::from_value(&l.to_value()), l);
         let css = theme_css(&l);
         assert!(css.contains("--accent: #ff8800") && css.contains("--bg: #111a21"));
@@ -766,6 +857,12 @@ impl Customize {
         if let Some(a) = input["accent"].as_str() {
             parts.push(format!("accent color {a}"));
         }
+        if let Some(t) = input["theme"].as_str() {
+            parts.push(format!("{t} theme"));
+        }
+        if let Some(b) = input["background"].as_str() {
+            parts.push(if b.is_empty() { "no background picture".into() } else { format!("background picture {b}") });
+        }
         if let Some(css) = input["css"].as_str() {
             parts.push(if css.trim().is_empty() {
                 "remove your user.css".into()
@@ -799,6 +896,18 @@ impl Customize {
         if let Some(a) = input["accent"].as_str() {
             layout.accent = Some(Layout::from_value(&json!({"accent": a})).accent.ok_or("accent must be a color like #ff8800")?);
         }
+        if let Some(t) = input["theme"].as_str() {
+            if !THEMES.contains(&t) {
+                return Err(format!("theme must be dark, light or auto, not {t}"));
+            }
+            layout.theme = t.to_string();
+        }
+        match input["background"].as_str() {
+            Some("") => layout.background = None,
+            Some(b) if user_images().iter().any(|i| i == b) => layout.background = Some(b.to_string()),
+            Some(b) => return Err(format!("{b} isn't a picture in the home folder (there: {})", user_images().join(", "))),
+            None => {}
+        }
         layout.save()?;
         if let Some(css) = input["css"].as_str() {
             if css.len() > MAX_CSS {
@@ -818,7 +927,8 @@ impl router::Tool for Customize {
     }
     fn description(&self) -> &'static str {
         "Change the app's home page (unibrow://home/) when the user asks: hide or show sections, put sections \
-         first, compact or roomy spacing, the accent color, or the user's own CSS (replaces their user.css; \
+         first, compact or roomy spacing, the accent color, a dark, light or automatic theme, a background \
+         picture from the home folder, or the user's own CSS (replaces their user.css; \
          an empty string removes it). Sections: pins, recent, focus, bookmarks, watches, playbooks, chats, ask, \
          tinker, guide, activity, keys, status. The user approves each change."
     }
@@ -831,6 +941,8 @@ impl router::Tool for Customize {
                 "order": {"type": "array", "items": {"type": "string", "enum": SECTIONS}, "description": "Sections to put first, in this order."},
                 "density": {"type": "string", "enum": ["compact", "roomy"]},
                 "accent": {"type": "string", "description": "A color like #ff8800."},
+                "theme": {"type": "string", "enum": THEMES, "description": "dark (the app's colors), light, or auto (follow the desktop)."},
+                "background": {"type": "string", "description": "A picture's file name in the home folder (empty: none)."},
                 "css": {"type": "string", "description": "The whole new user.css."},
                 "reset": {"type": "boolean", "description": "Start from the default layout."}
             },

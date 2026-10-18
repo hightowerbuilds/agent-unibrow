@@ -205,11 +205,17 @@ function openCustomizer() {
   drawList();
   const density = el('select', { id: 'density' }, el('option', { value: 'roomy' }, 'Roomy'), el('option', { value: 'compact' }, 'Compact'));
   density.value = layout.density || 'roomy';
+  const theme = el('select', { id: 'theme' },
+    el('option', { value: 'dark' }, 'Match the app'), el('option', { value: 'light' }, 'Light'), el('option', { value: 'auto' }, 'Follow the desktop'));
+  theme.value = layout.theme || 'dark';
+  const background = el('select', { id: 'background' }, el('option', { value: '' }, 'None'),
+    ...(last.user_images || []).map((n) => el('option', { value: n }, n)));
+  background.value = layout.background || '';
   const accent = el('input', { type: 'color', id: 'accent' });
   accent.value = layout.accent || getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#5fc8c0';
   const close = () => { box.hidden = true; box.replaceChildren(); };
   const save = async () => {
-    await cmd({ cmd: 'save_layout', layout: { hidden: [...hidden], order, density: density.value, accent: accent.value } });
+    await cmd({ cmd: 'save_layout', layout: { hidden: [...hidden], order, density: density.value, accent: accent.value, theme: theme.value, background: background.value || null } });
     close();
     location.reload();
   };
@@ -220,8 +226,13 @@ function openCustomizer() {
     el('p', { class: 'hint' }, 'Tick what to show, and move sections up or down. Your own CSS or a whole page of your own go in the home folder: see Settings and files.'),
     list,
     el('div', { class: 'layout-opts' },
+      el('label', {}, 'Theme ', theme),
       el('label', {}, 'Spacing ', density),
       el('label', {}, 'Accent color ', accent)),
+    el('div', { class: 'layout-opts' },
+      el('label', {}, 'Background picture ', background),
+      el('button', { type: 'button', class: 'small', onclick: () => cmd({ cmd: 'open_folder', which: 'home' }) }, 'Open home folder'),
+      el('span', { class: 'hint' }, 'Put a .jpg, .png or .webp there, then pick it here.')),
     el('p', { class: 'buttons' },
       el('button', { type: 'button', class: 'small', id: 'layout-save', onclick: save }, 'Save'),
       el('button', { type: 'button', class: 'small', onclick: close }, 'Cancel'),

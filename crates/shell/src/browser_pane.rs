@@ -415,6 +415,10 @@ pub struct BrowserPane {
     /// Why Chromium couldn't start, if it couldn't.
     unavailable: Option<String>,
     image: Option<Arc<RenderImage>>,
+    /// The active tab has painted since it last finished loading. Until it
+    /// has, the app's own pages show the app's background instead of the
+    /// frame: Chromium paints a white page first (H1.1).
+    painted_since_load: bool,
     /// An open dropdown list: where it goes (CSS px) and its pixels.
     popup: Option<(f32, f32, Arc<RenderImage>)>,
     /// Old frames waiting to be released from the GPU atlas.
@@ -545,6 +549,7 @@ impl BrowserPane {
             size: None,
             unavailable: cef.err(),
             image: None,
+            painted_since_load: false,
             popup: None,
             retired: Vec::new(),
             last_seq: 0,
@@ -868,9 +873,20 @@ impl BrowserPane {
             }
         }
         let Some(view) = self.tabs.get(self.active).map(|t| &t.view) else { return };
-        let seq = view.state().frame_seq;
+        let (seq, loading) = {
+            let st = view.state();
+            (st.frame_seq, st.loading)
+        };
+        if loading && self.painted_since_load {
+            self.painted_since_load = false;
+            changed = true;
+        }
         if seq != self.last_seq {
             self.last_seq = seq;
+            if !loading && !self.painted_since_load {
+                self.painted_since_load = true;
+                changed = true;
+            }
             if let Some(frame) = view.take_frame() {
                 if let Some(name) = self.test_shot.take() {
                     save_ppm(&rail_browser::data_dir().join(format!("{name}.ppm")), &frame);
@@ -2384,7 +2400,10 @@ impl BrowserPane {
             let _ = window.drop_image(old);
         }
         let geometry = self.geometry.clone();
-        let image = self.image.clone();
+        // The app's own pages: the app's background until a real frame of
+        // the loaded page arrives, never Chromium's first white one.
+        let cover = rail_browser::app_pages::is_app_page(&self.chrome.url) && !self.painted_since_load;
+        let image = if cover { None } else { self.image.clone() };
         let popup = self.popup.clone();
         let cursor = match self.chrome.cursor {
             Cursor::Arrow => CursorStyle::Arrow,
@@ -2529,7 +2548,7 @@ impl BrowserPane {
             .flex_1()
             .min_h(px(0.))
             .w_full()
-            .bg(rgb(0xffffff))
+            .bg(rgb(if cover { theme::BG } else { 0xffffff }))
             .track_focus(&self.page_focus)
             .key_context("WebPage")
             .cursor(cursor)
@@ -3149,6 +3168,7 @@ impl BrowserPane {
                         t.chrome.reader_of,
                     );
                 }
+                eprintln!("pane test: painted_since_load={}", self.painted_since_load);
                 let menu = self.menu.as_ref().map(|m| (m.x, m.y, m.info.clone()));
                 eprintln!("pane test: menu={menu:?} notice={:?}", self.notice.as_ref().map(|n| &n.0));
             }

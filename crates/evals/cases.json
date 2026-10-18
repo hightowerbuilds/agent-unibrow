@@ -1191,7 +1191,8 @@
         "title=\"Home\"",
         "js => Home",
         "js => rgb(17, 26, 33)",
-        "js => Search the web"
+        "js => Search the web",
+        "painted_since_load=true"
       ],
       "log_not_contains": [
         "duckduckgo.com"
@@ -1209,7 +1210,8 @@
       "log_contains": [
         "new tab, address bar \"\"",
         "tab 1 id=",
-        "url=unibrow://home/"
+        "url=unibrow://home/",
+        "painted_since_load=true"
       ]
     }
   },
@@ -1416,9 +1418,9 @@
   {
     "name": "home-settings",
     "page": "home",
-    "secs": 18,
+    "secs": 21,
     "env": {
-      "UNIBROW_TEST_PANE": "wait;open:unibrow://home/settings;wait;wait;js:document.getElementById('where').textContent;js:document.title;clicksel:#where .buttons button:nth-child(2);wait"
+      "UNIBROW_TEST_PANE": "wait;open:unibrow://home/settings;wait;wait;wait;wait;js:document.getElementById('where').textContent;js:document.title;clicksel:#where .buttons button:nth-child(2);wait"
     },
     "expect": {
       "log_contains": [
@@ -1638,6 +1640,68 @@
       ],
       "never_seen": [
         "UNIBROW-SECRET-HOST-7731"
+      ]
+    }
+  },
+  {
+    "name": "home-theme",
+    "page": "home",
+    "secs": 14,
+    "home_layout": {
+      "theme": "light",
+      "background": "bg.png"
+    },
+    "home_files": {
+      "bg.png": "base64:iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGM4oaEBRwzEcQDRQxGBSNLB6wAAAABJRU5ErkJggg=="
+    },
+    "env": {
+      "UNIBROW_TEST_PANE": "wait;wait;js:getComputedStyle(document.body).backgroundColor;js:getComputedStyle(document.body).backgroundImage.includes('/user/bg.png');js:fetch('/user/bg.png').then(r => document.title = 'bg ' + r.status + ' ' + r.headers.get('content-type'));wait;js:document.title"
+    },
+    "expect": {
+      "log_contains": [
+        "js => rgb(244, 246, 248)",
+        "js => true",
+        "js => bg 200 image/png"
+      ]
+    }
+  },
+  {
+    "name": "home-jev-learn",
+    "page": "home",
+    "focus": "localhost",
+    "secs": 45,
+    "env": {
+      "UNIBROW_ALLOW_JEV": "1",
+      "UNIBROW_TEST_JEV_START": "{base}/shop.html",
+      "UNIBROW_TEST_PANE": "wait;wait;js:document.getElementById('focus').scrollIntoView({block:'center'});wait;clicksel:#focus .actions button:first-child;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;wait;js:document.getElementById('focus').textContent"
+    },
+    "expect": {
+      "trace_contains": [
+        "Home: learn_jev localhost",
+        "Jev learned localhost"
+      ],
+      "log_contains": [
+        "Jev ready: find"
+      ]
+    }
+  },
+  {
+    "name": "home-watch",
+    "page": "home",
+    "secs": 28,
+    "env": {
+      "UNIBROW_TEST_WATCH": "{base}/watch.html|Bass nut price|$13.98",
+      "UNIBROW_TEST_PANE": "wait;wait;js:document.getElementById('watches').textContent;js:document.getElementById('watches').scrollIntoView({block:'center'});wait;clicksel:#watches .actions button:first-child;wait;wait;js:document.getElementById('watches').textContent;clicksel:#watches .actions button:last-child;wait;wait;js:document.getElementById('watches').textContent"
+    },
+    "expect": {
+      "log_contains": [
+        "js => WatchesBass nut price$13.98 · checked just now",
+        "js => WatchesBass nut price$13.98 · not checked yet",
+        "Ask the agent to watch a page"
+      ],
+      "trace_contains": [
+        "Home: check_watch #1",
+        "Home: removed watch #1"
       ]
     }
   }

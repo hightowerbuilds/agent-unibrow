@@ -586,6 +586,11 @@ impl Shell {
     }
 
     fn learn_with_jev_from(&mut self, site: String, start: Option<String>, cx: &mut Context<Self>) {
+        // Test hook (isolated test instances only): where learning starts
+        // when nothing else says, since test sites aren't at https://site/.
+        let start = start.or_else(|| {
+            std::env::var_os("UNIBROW_DATA_DIR").and(std::env::var("UNIBROW_TEST_JEV_START").ok())
+        });
         self.jev_progress.insert(site.clone(), "Starting…".into());
         self.trace.push(Kind::Info, format!("Jev is learning {site}"), None);
         let _ = self.jev_jobs.try_send(jev_worker::Job::Learn { site, start });
@@ -3062,6 +3067,26 @@ fn main() -> std::process::ExitCode {
         if let Ok(sites) = std::env::var("UNIBROW_TEST_FOCUS") {
             for site in sites.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                 store.add_focus(site, site);
+            }
+        }
+        // A watch that has been checked once: "url|label|value".
+        if let Ok(spec) = std::env::var("UNIBROW_TEST_WATCH") {
+            let parts: Vec<&str> = spec.splitn(3, '|').collect();
+            if let [url, label, value] = parts[..] {
+                let w = browsing::NewWatch {
+                    url: url.into(),
+                    label: label.into(),
+                    kind: "text".into(),
+                    when: "changes".into(),
+                    every_min: 60,
+                    ..Default::default()
+                };
+                match store.add_watch(&w) {
+                    Ok(id) => {
+                        store.record_watch_check(id, Ok(value.to_string()));
+                    }
+                    Err(e) => eprintln!("agent-unibrow: test watch not added: {e}"),
+                }
             }
         }
         if let Ok(spec) = std::env::var("UNIBROW_TEST_LOGIN") {

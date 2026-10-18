@@ -238,7 +238,10 @@ def run_case(case, port, workdir: Path, site: Path, tls_port=None):
         # The user's own files for the home page (user.css, index.html).
         (data / "home").mkdir(parents=True, exist_ok=True)
         for name, text in case["home_files"].items():
-            (data / "home" / name).write_text(text)
+            if text.startswith("base64:"):
+                (data / "home" / name).write_bytes(base64.b64decode(text[len("base64:"):]))
+            else:
+                (data / "home" / name).write_text(text)
     if "sandbox_files" in case:
         # The user's own files, as the file tools see them (the sandbox
         # home, $UNIBROW_DATA_DIR/files).
