@@ -18,6 +18,7 @@ mod backends;
 mod client;
 mod host;
 mod mcp;
+pub mod models;
 mod prompt;
 mod sse;
 
@@ -71,6 +72,8 @@ pub struct Settings {
     pub codex_model: String,
     /// OpenCode model as `provider/model`. Required for OpenCode.
     pub opencode_model: String,
+    /// Anthropic API model id.
+    pub api_model: String,
 }
 
 impl Default for Settings {
@@ -81,11 +84,31 @@ impl Default for Settings {
             claude_effort: "high".into(),
             codex_model: String::new(),
             opencode_model: String::new(),
+            api_model: ModelConfig::default().model,
         }
     }
 }
 
 impl Settings {
+    /// The model chosen for a backend.
+    pub fn model(&self, kind: BackendKind) -> &str {
+        match kind {
+            BackendKind::ClaudeCode => &self.claude_model,
+            BackendKind::Codex => &self.codex_model,
+            BackendKind::OpenCode => &self.opencode_model,
+            BackendKind::AnthropicApi => &self.api_model,
+        }
+    }
+
+    pub fn set_model(&mut self, kind: BackendKind, id: String) {
+        match kind {
+            BackendKind::ClaudeCode => self.claude_model = id,
+            BackendKind::Codex => self.codex_model = id,
+            BackendKind::OpenCode => self.opencode_model = id,
+            BackendKind::AnthropicApi => self.api_model = id,
+        }
+    }
+
     fn path() -> Option<PathBuf> {
         dirs::config_dir().map(|d| d.join("agent-unibrow").join("settings.json"))
     }

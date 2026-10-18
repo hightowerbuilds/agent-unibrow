@@ -1,5 +1,6 @@
 //! The "Explained" sidebar tab: a short guide to getting the most out of
-//! the agent. Example requests are clickable and drop into the chat box.
+//! the agent, one sub-tab per part of the app. Example requests are
+//! clickable and drop into the chat box.
 
 use crate::theme;
 use gpui::{AnyElement, ClickEvent, IntoElement, ParentElement, SharedString, Styled, Window, div, prelude::*, px, rgb};
@@ -18,7 +19,27 @@ struct Section {
     blocks: &'static [Block],
 }
 
-const GUIDE: &[Section] = &[
+/// One sub-tab of the guide.
+struct Page {
+    tab: &'static str,
+    sections: &'static [Section],
+}
+
+const GUIDE: &[Page] = &[
+    Page { tab: "Basics", sections: BASICS },
+    Page { tab: "Chat", sections: CHAT },
+    Page { tab: "Safety", sections: SAFETY },
+    Page { tab: "Focus", sections: FOCUS },
+    Page { tab: "History", sections: HISTORY },
+    Page { tab: "Research", sections: RESEARCH },
+    Page { tab: "Files", sections: FILES },
+    Page { tab: "Keys", sections: KEYS },
+];
+
+/// The number of sub-tabs.
+pub const PAGES: usize = GUIDE.len();
+
+const BASICS: &[Section] = &[
     Section {
         title: "What the agent is",
         blocks: &[
@@ -28,8 +49,9 @@ const GUIDE: &[Section] = &[
                  anything that buys, sends, posts or deletes waits for your OK.",
             ),
             Block::Para(
-                "Pick which agent runs it at the top of Chat. Claude Code and Codex use your own subscriptions; \
-                 API key bills an Anthropic API key; OpenCode uses whatever provider you've signed it into.",
+                "Choose which agent and model do the work with the Model button at the bottom of the sidebar. \
+                 Claude Code and Codex use your own subscriptions; OpenCode uses whatever provider you've signed \
+                 it into.",
             ),
         ],
     },
@@ -56,6 +78,9 @@ const GUIDE: &[Section] = &[
             ]),
         ],
     },
+];
+
+const SAFETY: &[Section] = &[
     Section {
         title: "Staying in control",
         blocks: &[
@@ -70,7 +95,7 @@ const GUIDE: &[Section] = &[
                  back and you can say \"continue\".",
                 "Stop it any time: the Stop button on the page, Esc, or just click or type on the page yourself.",
                 "The highlight box shows what it's about to click or type into.",
-                "Trace lists every step it took, with a screenshot for each browser action. Click a row for details.",
+                "History → Trace lists every step it took, with a screenshot for each browser action. Click a row for details.",
             ]),
         ],
     },
@@ -99,6 +124,17 @@ const GUIDE: &[Section] = &[
             ),
         ],
     },
+];
+
+const FOCUS: &[Section] = &[
+    Section {
+        title: "Focus sites",
+        blocks: &[Block::Bullets(&[
+            "◎ Focus in the toolbar marks a site as one you care about. The agent sees your focus sites with every \
+             message and prefers them.",
+            "The Focus tab lists them, along with Safety settings, saved logins and watches.",
+        ])],
+    },
     Section {
         title: "Playbooks: your focus sites, learned",
         blocks: &[Block::Bullets(&[
@@ -111,6 +147,9 @@ const GUIDE: &[Section] = &[
             "Focus → View shows one site's playbooks, pages, the agent's recent actions there, and your history.",
         ])],
     },
+];
+
+const CHAT: &[Section] = &[
     Section {
         title: "Chats",
         blocks: &[Block::Bullets(&[
@@ -131,16 +170,37 @@ const GUIDE: &[Section] = &[
         ])],
     },
     Section {
-        title: "History, bookmarks and focus",
-        blocks: &[
-            Block::Bullets(&[
-                "History keeps every page you open here, and the agent can search it (\"that bass part I looked at yesterday\").",
-                "☆ in the toolbar bookmarks a page; open them from the Bookmarks dropdown in History.",
-                "◎ Focus marks a site as one you care about. The agent sees your focus sites with every message and \
-                 prefers them.",
-            ]),
-        ],
+        title: "Choosing a model",
+        blocks: &[Block::Bullets(&[
+            "Click Model at the bottom of the sidebar, then an agent to see its models: Claude Code has Fable, Opus, \
+             Sonnet and Haiku; Codex lists the models your ChatGPT plan offers; OpenCode lists your providers' models.",
+            "Switching models keeps the chat. A different agent gets a recap of the conversation with your next message.",
+        ])],
     },
+];
+
+const HISTORY: &[Section] = &[
+    Section {
+        title: "History",
+        blocks: &[Block::Bullets(&[
+            "History keeps every page you open here, and the agent can search it (\"that bass part I looked at yesterday\").",
+            "Search it with the box at the top; Clear empties it.",
+        ])],
+    },
+    Section {
+        title: "Bookmarks",
+        blocks: &[Block::Bullets(&["☆ in the toolbar bookmarks a page; open them from History → Bookmarks. ✕ removes one."])],
+    },
+    Section {
+        title: "Trace",
+        blocks: &[Block::Bullets(&[
+            "History → Trace lists every step the agent took, with a screenshot for each browser action. Click a row \
+             for details.",
+        ])],
+    },
+];
+
+const FILES: &[Section] = &[
     Section {
         title: "Files",
         blocks: &[
@@ -151,6 +211,9 @@ const GUIDE: &[Section] = &[
             ]),
         ],
     },
+];
+
+const RESEARCH: &[Section] = &[
     Section {
         title: "Research, comparing and watching",
         blocks: &[Block::Bullets(&[
@@ -162,11 +225,16 @@ const GUIDE: &[Section] = &[
              Watches are listed in Focus, where you can remove them.",
         ])],
     },
+];
+
+const KEYS: &[Section] = &[
     Section {
         title: "Shortcuts",
         blocks: &[Block::Keys(&[
             ("Ctrl+B", "Show or hide the sidebar"),
-            ("Alt+1 … Alt+5", "Chat, History, Focus, Trace, Explained"),
+            ("Alt+1 … Alt+3", "Chat, History, Focus"),
+            ("Alt+4", "History → Trace"),
+            ("Alt+5", "Explained"),
             ("Esc", "Stop the agent"),
             ("Ctrl+T / Ctrl+W", "New tab / close tab"),
             ("Ctrl+Tab", "Next tab (Shift for previous)"),
@@ -176,19 +244,50 @@ const GUIDE: &[Section] = &[
     },
 ];
 
-/// Renders the guide. `on_example` puts a request in the chat box.
-pub fn render(on_example: impl Fn(&'static str, &mut Window, &mut gpui::App) + Clone + 'static) -> impl IntoElement {
-    let mut col = div().id("explained").flex().flex_col().flex_1().min_h(px(0.)).overflow_y_scroll().px_4().py_3().gap_4();
-    col = col.child(
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(div().text_base().text_color(rgb(theme::FG)).child("Unibrow, explained"))
-            .child(div().text_xs().text_color(rgb(theme::MUTED)).child("How to get the most out of the agent.")),
-    );
+/// Renders sub-tab `page` of the guide. `on_page` switches sub-tab;
+/// `on_example` puts a request in the chat box.
+pub fn render(
+    page: usize,
+    on_page: impl Fn(usize, &mut Window, &mut gpui::App) + Clone + 'static,
+    on_example: impl Fn(&'static str, &mut Window, &mut gpui::App) + Clone + 'static,
+) -> impl IntoElement {
+    let page = page.min(PAGES - 1);
+    let tabs = div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_1()
+        .px_2()
+        .py_1()
+        .border_b_1()
+        .border_color(rgb(theme::RULE))
+        .children(GUIDE.iter().enumerate().map(|(i, p)| {
+            let selected = i == page;
+            let on_page = on_page.clone();
+            div()
+                .id(("explained-tab", i))
+                .px_3()
+                .py(px(3.))
+                .rounded_md()
+                .text_xs()
+                .text_color(rgb(if selected { theme::FG } else { theme::MUTED }))
+                .when(selected, |d| d.bg(rgb(theme::RAISED)))
+                .when(!selected, |d| d.cursor_pointer().hover(|s| s.text_color(rgb(theme::FG))))
+                .on_click(move |_: &ClickEvent, window, cx| on_page(i, window, cx))
+                .child(p.tab)
+        }));
+    let mut col = div()
+        .id(("explained", page))
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h(px(0.))
+        .overflow_y_scroll()
+        .px_4()
+        .py_3()
+        .gap_4();
     let mut example_ix = 0usize;
-    for section in GUIDE {
+    for section in GUIDE[page].sections {
         let mut sec = div().flex().flex_col().gap_2().child(
             div().text_xs().text_color(rgb(theme::ACCENT)).child(section.title.to_uppercase()),
         );
@@ -268,5 +367,5 @@ pub fn render(on_example: impl Fn(&'static str, &mut Window, &mut gpui::App) + C
         }
         col = col.child(sec);
     }
-    col
+    div().flex().flex_col().flex_1().min_h(px(0.)).child(tabs).child(col)
 }

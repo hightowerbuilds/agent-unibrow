@@ -21,8 +21,17 @@ pub struct ApiBackend {
 
 impl ApiBackend {
     /// `messages` continues a saved conversation (from [`AgentEvent::Resume`]).
-    pub fn new(api_key: String, host: ToolHost, events: async_channel::Sender<AgentEvent>, messages: Vec<Value>) -> Self {
-        let config = ModelConfig::default();
+    pub fn new(
+        api_key: String,
+        model: &str,
+        host: ToolHost,
+        events: async_channel::Sender<AgentEvent>,
+        messages: Vec<Value>,
+    ) -> Self {
+        let mut config = ModelConfig::default();
+        if !model.trim().is_empty() {
+            config.model = model.trim().to_string();
+        }
         let _ = events.try_send(AgentEvent::Info(format!(
             "Anthropic API: {} at {} effort (API key billing)",
             config.model, config.effort

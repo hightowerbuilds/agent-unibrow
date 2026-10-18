@@ -22,6 +22,7 @@ use gpui::{
 };
 use policy::Policy;
 use router::Registry;
+use agent_core::models::ModelChoice;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -120,10 +121,18 @@ const RECAP_CHARS: usize = 12_000;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SidebarTab {
     Chat,
+    /// History, Bookmarks and Trace, as sub-tabs ([`HistorySub`]).
     History,
     Focus,
-    Trace,
     Explained,
+}
+
+/// The sub-tabs of the History tab.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HistorySub {
+    Visits,
+    Bookmarks,
+    Trace,
 }
 
 /// Width of the open sidebar and of the bumper strip that toggles it.
@@ -163,6 +172,16 @@ struct Shell {
     chat_id: chats::ChatId,
     /// The All chats list is showing instead of the conversation.
     chat_list_open: bool,
+    /// The model menu above the Model button.
+    model_menu_open: bool,
+    /// The agent whose models the menu is showing; None lists agents only.
+    model_menu_agent: Option<BackendKind>,
+    /// OpenCode's models, listed by `opencode models` when the menu first
+    /// opens; None until then.
+    opencode_models: Option<Vec<ModelChoice>>,
+    /// Start the next agent without resuming the saved conversation (the
+    /// API model changed, and a conversation can't move between models).
+    skip_resume: bool,
     /// A chat whose Delete was clicked once and awaits the confirm click.
     confirm_delete: Option<chats::ChatId>,
     /// Rename, search and export (chat_tools.rs).
@@ -193,7 +212,9 @@ struct Shell {
     /// The sidebar, as its own cached view (see [`SidebarView`]).
     sidebar_view: Option<Entity<SidebarView>>,
     tab: SidebarTab,
-    bookmarks_open: bool,
+    history_sub: HistorySub,
+    /// The Explained tab's sub-tab.
+    explained_page: usize,
     /// Favicons for History and Bookmarks rows.
     site_icons: site_icons::SiteIcons,
     needs_key: bool,
@@ -217,7 +238,11 @@ impl Shell {
         chats.mark_active(chat_id);
         let items = load_items(&chats, chat_id);
         let task_plan = chats.plan(chat_id);
-        let input = cx.new(|cx| TextInput::new(IDLE_PLACEHOLDER, cx));
+        let input = cx.new(|cx| {
+            let mut t = TextInput::new(IDLE_PLACEHOLDER, cx);
+            t.set_wrap(true, cx);
+            t
+        });
         let (bridge, requests) = rail_browser::bridge::channel();
         let browser = cx.new(|cx| BrowserPane::new(cef, store.clone(), requests, window, cx));
         let control_sub = cx.subscribe(&browser, |this: &mut Self, _, ev: &AgentControl, cx| match ev {
@@ -269,6 +294,10 @@ impl Shell {
             chats,
             chat_id,
             chat_list_open: false,
+            model_menu_open: false,
+            model_menu_agent: None,
+            opencode_models: None,
+            skip_resume: false,
             confirm_delete: None,
             chat_tools,
             items,
@@ -289,7 +318,8 @@ impl Shell {
             sidebar_open: true,
             sidebar_view: None,
             tab: SidebarTab::Chat,
-            bookmarks_open: false,
+            history_sub: HistorySub::Visits,
+            explained_page: 0,
             site_icons: Default::default(),
             needs_key: false,
             conv_scroll: ScrollHandle::new(),
@@ -394,6 +424,74 @@ impl Shell {
         if kind == self.settings.backend && self.agent.is_some() {
             return;
         }
+        self.end_agent(cx);
+        self.settings.backend = kind;
+        self.settings.save();
+        // The chat stays; the new backend gets a recap with the next message.
+        self.pending_recap = self.chats.recap(self.chat_id, RECAP_CHARS);
+        let model = self.model_label(kind);
+        self.push(
+            ItemKind::System,
+            format!("Switched to {} · {model}. It gets a recap of this chat with your next message.", kind.label()),
+        );
+        self.trace.push(Kind::Info, format!("Switched agent to {} · {model}", kind.label()), None);
+        self.start_backend(cx);
+        cx.notify();
+    }
+
+    /// Picks a backend and model from the model menu.
+    fn select_model(&mut self, kind: BackendKind, id: String, cx: &mut Context<Self>) {
+        self.model_menu_open = false;
+        if kind != self.settings.backend {
+            self.settings.set_model(kind, id);
+            self.switch_backend(kind, cx);
+            return;
+        }
+        if self.settings.model(kind) == id && self.agent.is_some() {
+            cx.notify();
+            return;
+        }
+        self.end_agent(cx);
+        self.settings.set_model(kind, id);
+        self.settings.save();
+        let model = self.model_label(kind);
+        if kind == BackendKind::AnthropicApi {
+            // The API conversation is tied to the model that wrote it.
+            self.skip_resume = true;
+            self.pending_recap = self.chats.recap(self.chat_id, RECAP_CHARS);
+            self.push(ItemKind::System, format!("Switched to {model}. It gets a recap of this chat with your next message."));
+        } else {
+            self.push(ItemKind::System, format!("Switched to {model}. It carries on with this chat."));
+        }
+        self.trace.push(Kind::Info, format!("Switched model to {} · {model}", kind.label()), None);
+        self.start_backend(cx);
+        cx.notify();
+    }
+
+    fn model_label(&self, kind: BackendKind) -> String {
+        agent_core::models::label(kind, self.settings.model(kind), self.opencode_models.as_deref().unwrap_or(&[]))
+    }
+
+    fn toggle_model_menu(&mut self, cx: &mut Context<Self>) {
+        self.model_menu_open = !self.model_menu_open;
+        self.model_menu_agent = None;
+        if self.model_menu_open && self.opencode_models.is_none() {
+            self.opencode_models = Some(vec![]);
+            let task = cx.background_spawn(async { agent_core::models::opencode_models() });
+            cx.spawn(async move |this, cx| {
+                let models = task.await;
+                let _ = this.update(cx, |this, cx| {
+                    this.opencode_models = Some(models);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    /// Ends the running agent before another starts.
+    fn end_agent(&mut self, cx: &mut Context<Self>) {
         // Dropping the handle ends the old agent; dropping pending approval
         // senders answers them with Deny.
         self.agent = None;
@@ -408,14 +506,6 @@ impl Shell {
                 i.set_placeholder(IDLE_PLACEHOLDER, cx);
             });
         }
-        self.settings.backend = kind;
-        self.settings.save();
-        // The chat stays; the new backend gets a recap with the next message.
-        self.pending_recap = self.chats.recap(self.chat_id, RECAP_CHARS);
-        self.push(ItemKind::System, format!("Switched to {}. It gets a recap of this chat with your next message.", kind.label()));
-        self.trace.push(Kind::Info, format!("Switched agent to {}", kind.label()), None);
-        self.start_backend(cx);
-        cx.notify();
     }
 
     fn start_agent(&mut self, api_key: Option<String>, cx: &mut Context<Self>) {
@@ -458,7 +548,11 @@ impl Shell {
         // backend that has never seen it.
         let backend_key = backend_key(self.settings.backend);
         let chat = self.chats.get(self.chat_id);
-        let resume = chat.as_ref().filter(|c| c.backend.as_deref() == Some(backend_key.as_str())).and_then(|c| c.resume.clone());
+        let fresh = std::mem::take(&mut self.skip_resume);
+        let resume = chat
+            .as_ref()
+            .filter(|c| !fresh && c.backend.as_deref() == Some(backend_key.as_str()))
+            .and_then(|c| c.resume.clone());
         if resume.is_none() && self.pending_recap.is_none() {
             self.pending_recap = self.chats.recap(self.chat_id, RECAP_CHARS);
         }
@@ -831,14 +925,16 @@ impl Shell {
         self.tab = tab;
         match tab {
             SidebarTab::Chat => window.focus(&self.input.focus_handle(cx)),
-            SidebarTab::History => window.focus(&self.history_filter.focus_handle(cx)),
+            SidebarTab::History if self.history_sub == HistorySub::Visits => {
+                window.focus(&self.history_filter.focus_handle(cx))
+            }
             _ => {}
         }
         self.scroll_to_bottom();
         cx.notify();
     }
 
-    /// Chat / Trace tabs, with the agent's status on the right.
+    /// The sidebar tabs (Chat, History, Focus, Explained).
     fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let tab = |id: &'static str, label: String, selected: bool, badge: Option<String>| {
             div()
@@ -892,15 +988,6 @@ impl Shell {
                         )
                         .on_click(cx.listener(|this, _, window, cx| this.select_tab(SidebarTab::Focus, window, cx))),
                     )
-                    .child(
-                        tab(
-                            "tab-trace",
-                            format!("Trace · {}", self.trace.entries().len()),
-                            self.tab == SidebarTab::Trace,
-                            None,
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| this.select_tab(SidebarTab::Trace, window, cx))),
-                    )
                     .child(tab("tab-explained", "Explained".into(), self.tab == SidebarTab::Explained, None).on_click(
                         cx.listener(|this, _, window, cx| this.select_tab(SidebarTab::Explained, window, cx)),
                     )),
@@ -944,7 +1031,6 @@ impl Shell {
             .flex_1()
             .min_h(px(0.))
             .child(self.render_chat_strip(cx))
-            .child(self.render_backend_bar(cx))
             .when(self.chat_list_open, |d| d.child(self.render_chat_list(cx)))
             .when_some(self.task_plan.as_ref().filter(|_| !self.chat_list_open), |d, p| d.child(task_plan::render(p)))
             .when(!self.chat_list_open, |d| d.child(
@@ -1048,94 +1134,117 @@ impl Shell {
             .child(label)
     }
 
-    /// The "Bookmarks" dropdown at the top of the History tab.
+    /// The Bookmarks sub-tab.
     fn render_bookmarks(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let marks = self.store.bookmarks();
-        let open = self.bookmarks_open;
-        let header = div()
-            .id("bookmarks-toggle")
+        let empty = marks.is_empty();
+        div()
+            .id("bookmarks-list")
             .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .py_2()
-            .cursor_pointer()
-            .hover(|s| s.bg(rgb(theme::RAISED)))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.bookmarks_open = !this.bookmarks_open;
-                cx.notify();
-            }))
-            .child(div().text_color(rgb(theme::WARN)).child("★"))
-            .child(div().flex_1().text_sm().text_color(rgb(theme::FG)).child(match marks.len() {
-                0 => "Bookmarks".to_string(),
-                n => format!("Bookmarks · {n}"),
-            }))
-            .child(div().text_xs().text_color(rgb(theme::MUTED)).child(if open { "▴" } else { "▾" }));
-
-        let list = open.then(|| {
-            let empty = marks.is_empty();
-            div()
-                .id("bookmarks-list")
-                .flex()
-                .flex_col()
-                .max_h(px(280.))
-                .overflow_y_scroll()
-                .pb_1()
-                .when(empty, |d| {
-                    d.child(
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .py_1()
+            .when(empty, |d| {
+                d.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_xs()
+                        .text_color(rgb(theme::MUTED))
+                        .child("No bookmarks yet. Use ☆ in the browser toolbar to bookmark the page you're on."),
+                )
+            })
+            .children(marks.into_iter().enumerate().map(|(i, m)| {
+                let url = m.url.clone();
+                let remove = m.url.clone();
+                let title = if m.title.is_empty() { m.url.clone() } else { m.title.clone() };
+                div()
+                    .id(("bookmark", i))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .pl(px(10.))
+                    .pr_3()
+                    .py_1()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(theme::RAISED)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_url(url.clone(), cx)))
+                    .child(self.site_icons.view(&self.store, &m.site))
+                    .child(
                         div()
-                            .px_3()
-                            .py_2()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(div().text_sm().text_color(rgb(theme::FG)).truncate().child(title))
+                            .child(div().text_xs().text_color(rgb(theme::MUTED)).truncate().child(m.site)),
+                    )
+                    .child(
+                        div()
+                            .id(("bookmark-remove", i))
+                            .px_1()
+                            .rounded_sm()
                             .text_xs()
                             .text_color(rgb(theme::MUTED))
-                            .child("No bookmarks yet. Use ☆ in the browser toolbar to bookmark the page you're on."),
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(rgb(theme::ERROR)).bg(rgb(theme::PANE)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.store.remove_bookmark(&remove);
+                                cx.notify();
+                            }))
+                            .child("✕"),
                     )
-                })
-                .children(marks.into_iter().enumerate().map(|(i, m)| {
-                    let url = m.url.clone();
-                    let remove = m.url.clone();
-                    let title = if m.title.is_empty() { m.url.clone() } else { m.title.clone() };
-                    div()
-                        .id(("bookmark", i))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .pl(px(10.))
-                        .pr_3()
-                        .py_1()
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(theme::RAISED)))
-                        .on_click(cx.listener(move |this, _, _, cx| this.open_url(url.clone(), cx)))
-                        .child(self.site_icons.view(&self.store, &m.site))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .child(div().text_sm().text_color(rgb(theme::FG)).truncate().child(title))
-                                .child(div().text_xs().text_color(rgb(theme::MUTED)).truncate().child(m.site)),
-                        )
-                        .child(
-                            div()
-                                .id(("bookmark-remove", i))
-                                .px_1()
-                                .rounded_sm()
-                                .text_xs()
-                                .text_color(rgb(theme::MUTED))
-                                .cursor_pointer()
-                                .hover(|s| s.text_color(rgb(theme::ERROR)).bg(rgb(theme::PANE)))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.store.remove_bookmark(&remove);
-                                    cx.notify();
-                                }))
-                                .child("✕"),
-                        )
-                }))
-        });
+            }))
+    }
 
-        div().flex().flex_col().border_b_1().border_color(rgb(theme::RULE)).child(header).children(list)
+    /// The History tab: History, Bookmarks and Trace sub-tabs.
+    fn render_history_tab(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let sub = self.history_sub;
+        let marks = self.store.bookmarks().len();
+        let pill = |key: HistorySub, id: &'static str, label: String| {
+            let selected = sub == key;
+            div()
+                .id(id)
+                .px_3()
+                .py(px(3.))
+                .rounded_md()
+                .text_xs()
+                .text_color(rgb(if selected { theme::FG } else { theme::MUTED }))
+                .when(selected, |d| d.bg(rgb(theme::RAISED)))
+                .when(!selected, |d| d.cursor_pointer().hover(|s| s.text_color(rgb(theme::FG))))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.history_sub = key;
+                    if key == HistorySub::Visits {
+                        window.focus(&this.history_filter.focus_handle(cx));
+                    }
+                    if key == HistorySub::Trace {
+                        this.trace_scroll.scroll_to_bottom();
+                    }
+                    cx.notify();
+                }))
+                .child(label)
+        };
+        let count = |n: usize, label: &str| if n == 0 { label.to_string() } else { format!("{label} · {n}") };
+        let bar = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(rgb(theme::RULE))
+            .child(pill(HistorySub::Visits, "history-sub-visits", "History".into()))
+            .child(pill(HistorySub::Bookmarks, "history-sub-bookmarks", count(marks, "Bookmarks")))
+            .child(pill(HistorySub::Trace, "history-sub-trace", count(self.trace.entries().len(), "Trace")));
+        let body = match sub {
+            HistorySub::Visits => self.render_history(cx).into_any_element(),
+            HistorySub::Bookmarks => self.render_bookmarks(cx).into_any_element(),
+            HistorySub::Trace => self.render_trace(cx).into_any_element(),
+        };
+        div().flex().flex_col().flex_1().min_h(px(0.)).child(bar).child(body).into_any_element()
     }
 
     fn render_history(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1227,7 +1336,6 @@ impl Shell {
             .flex_col()
             .flex_1()
             .min_h(px(0.))
-            .child(self.render_bookmarks(cx))
             .child(
                 div()
                     .flex()
@@ -1688,14 +1796,23 @@ impl Shell {
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match self.tab {
             SidebarTab::Chat => self.render_chat(cx).into_any_element(),
-            SidebarTab::History => self.render_history(cx).into_any_element(),
+            SidebarTab::History => self.render_history_tab(cx),
             SidebarTab::Focus => self.render_focus(cx).into_any_element(),
-            SidebarTab::Trace => self.render_trace(cx).into_any_element(),
             SidebarTab::Explained => {
                 let me = cx.entity().downgrade();
-                explained::render(move |text, window, cx| {
-                    let _ = me.update(cx, |this, cx| this.use_example(text, window, cx));
-                })
+                let me2 = me.clone();
+                explained::render(
+                    self.explained_page,
+                    move |page, _, cx| {
+                        let _ = me2.update(cx, |this, cx| {
+                            this.explained_page = page;
+                            cx.notify();
+                        });
+                    },
+                    move |text, window, cx| {
+                        let _ = me.update(cx, |this, cx| this.use_example(text, window, cx));
+                    },
+                )
                 .into_any_element()
             }
         };
@@ -1706,8 +1823,29 @@ impl Shell {
             .h_full()
             .flex_none()
             .bg(rgb(theme::PANE))
+            .relative()
             .child(self.render_tabs(cx))
-            .child(body)
+            .child(div().flex().flex_col().flex_1().min_h(px(0.)).child(body))
+            .child(self.render_model_bar(cx))
+            .when(self.model_menu_open, |d| {
+                d.child(
+                    // Clicking anywhere else closes the menu.
+                    div()
+                        .id("model-menu-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.model_menu_open = false;
+                            cx.notify();
+                        }))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.model_menu_open = false;
+                            cx.notify();
+                        })),
+                )
+                .child(self.render_model_menu(cx))
+            })
     }
 
     fn render_trace(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1730,36 +1868,145 @@ impl Shell {
             .children(rows)
     }
 
-    fn render_backend_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let current = self.settings.backend;
+    /// The Model button: which agent and model, opening the model menu.
+    fn render_model_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let kind = self.settings.backend;
         let status: Option<SharedString> = (!self.status.is_empty()).then(|| self.status.clone());
+        let open = self.model_menu_open;
         div()
             .flex()
-            .flex_wrap()
             .items_center()
-            .gap_1()
+            .gap_2()
             .px_3()
             .py_2()
-            .border_b_1()
+            .flex_none()
+            .border_t_1()
             .border_color(rgb(theme::RULE))
-            .children(BackendKind::ALL.into_iter().map(|kind| {
-                let selected = kind == current;
+            .child(
                 div()
-                    .id(SharedString::from(format!("backend-{}", kind.label())))
+                    .id("model-button")
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .px_2()
-                    .py(px(2.))
+                    .py(px(3.))
                     .rounded_md()
                     .text_xs()
                     .border_1()
-                    .border_color(rgb(if selected { theme::ACCENT } else { theme::RULE }))
-                    .bg(rgb(if selected { theme::RAISED } else { theme::PANE }))
-                    .text_color(rgb(if selected { theme::ACCENT } else { theme::MUTED }))
-                    .when(!selected, |d| d.cursor_pointer().hover(|s| s.text_color(rgb(theme::FG))))
-                    .on_click(cx.listener(move |this, _, _, cx| this.switch_backend(kind, cx)))
-                    .child(kind.label())
-            }))
+                    .border_color(rgb(if open { theme::ACCENT } else { theme::RULE }))
+                    .bg(rgb(theme::RAISED))
+                    .cursor_pointer()
+                    .hover(|s| s.border_color(rgb(theme::ACCENT)))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_model_menu(cx)))
+                    .child(div().text_color(rgb(theme::MUTED)).child("Model"))
+                    .child(
+                        div()
+                            .text_color(rgb(theme::FG))
+                            .child(format!("{} · {}", kind.label(), self.model_label(kind))),
+                    )
+                    .child(div().text_color(rgb(theme::MUTED)).child(if open { "▾" } else { "▴" })),
+            )
             .child(div().flex_1())
             .children(status.map(|s| div().text_xs().text_color(rgb(theme::MUTED)).child(s)))
+    }
+
+    /// The agents; clicking one shows its models, and picking a model
+    /// switches to it.
+    fn render_model_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = (self.settings.backend, self.settings.model(self.settings.backend).to_string());
+        let mut rows: Vec<gpui::AnyElement> = vec![];
+        // The API-key backend is left out of the menu for now.
+        for kind in BackendKind::ALL.into_iter().filter(|k| *k != BackendKind::AnthropicApi) {
+            let expanded = self.model_menu_agent == Some(kind);
+            let in_use = current.0 == kind;
+            let plan = match kind {
+                BackendKind::ClaudeCode => "Your Claude plan",
+                BackendKind::Codex => "Your ChatGPT plan",
+                BackendKind::OpenCode => "Your providers",
+                BackendKind::AnthropicApi => "Billed to your API key",
+            };
+            let summary = if in_use { format!("In use · {}", self.model_label(kind)) } else { plan.to_string() };
+            rows.push(
+                div()
+                    .id(SharedString::from(format!("model-agent-{}", kind.label())))
+                    .mx_1()
+                    .px_2()
+                    .py(px(6.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(expanded, |d| d.bg(rgb(theme::RAISED)))
+                    .hover(|s| s.bg(rgb(theme::RAISED)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.model_menu_agent = if this.model_menu_agent == Some(kind) { None } else { Some(kind) };
+                        cx.notify();
+                    }))
+                    .child(div().w(px(12.)).text_xs().text_color(rgb(theme::MUTED)).child(if expanded { "▾" } else { "▸" }))
+                    .child(div().text_sm().text_color(rgb(if in_use { theme::ACCENT } else { theme::FG })).child(kind.label()))
+                    .child(div().flex_1())
+                    .child(div().text_xs().text_color(rgb(theme::MUTED)).child(summary))
+                    .into_any_element(),
+            );
+            if !expanded {
+                continue;
+            }
+            let models = match kind {
+                BackendKind::OpenCode => self.opencode_models.clone().unwrap_or_default(),
+                _ => agent_core::models::known(kind),
+            };
+            if models.is_empty() {
+                let note = if kind == BackendKind::OpenCode {
+                    "Loading… (or none yet: sign in with `opencode auth login`)"
+                } else {
+                    "No models found"
+                };
+                rows.push(div().pl(px(36.)).pr_3().py_1().text_xs().italic().text_color(rgb(theme::MUTED)).child(note).into_any_element());
+            }
+            for m in models {
+                let selected = in_use && current.1 == m.id;
+                let id = m.id.clone();
+                rows.push(
+                    div()
+                        .id(SharedString::from(format!("model-{}-{}", kind.label(), m.id)))
+                        .mx_1()
+                        .pl(px(28.))
+                        .pr_2()
+                        .py(px(4.))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .rounded_sm()
+                        .text_sm()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(theme::RAISED)))
+                        .on_click(cx.listener(move |this, _, _, cx| this.select_model(kind, id.clone(), cx)))
+                        .child(div().w(px(12.)).text_color(rgb(theme::ACCENT)).child(if selected { "✓" } else { "" }))
+                        .child(div().text_color(rgb(if selected { theme::ACCENT } else { theme::FG })).child(m.label))
+                        .child(div().flex_1())
+                        .child(div().text_xs().text_color(rgb(theme::MUTED)).child(m.note))
+                        .into_any_element(),
+                );
+            }
+        }
+        div()
+            .id("model-menu")
+            .absolute()
+            .left(px(8.))
+            .right(px(8.))
+            .bottom(px(48.))
+            .max_h(px(520.))
+            .overflow_y_scroll()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(theme::PANE))
+            .border_1()
+            .border_color(rgb(theme::RULE))
+            .shadow_lg()
+            .occlude()
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .children(rows)
     }
 
     fn render_item(item: &Item) -> impl IntoElement {
@@ -2154,7 +2401,10 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &ShowChat, window, cx| this.show_tab(SidebarTab::Chat, window, cx)))
             .on_action(cx.listener(|this, _: &ShowHistory, window, cx| this.show_tab(SidebarTab::History, window, cx)))
             .on_action(cx.listener(|this, _: &ShowFocus, window, cx| this.show_tab(SidebarTab::Focus, window, cx)))
-            .on_action(cx.listener(|this, _: &ShowTrace, window, cx| this.show_tab(SidebarTab::Trace, window, cx)))
+            .on_action(cx.listener(|this, _: &ShowTrace, window, cx| {
+                this.history_sub = HistorySub::Trace;
+                this.show_tab(SidebarTab::History, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &ShowExplained, window, cx| this.show_tab(SidebarTab::Explained, window, cx)))
             .flex()
             .flex_row()

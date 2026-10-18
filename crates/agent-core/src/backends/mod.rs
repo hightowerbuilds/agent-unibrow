@@ -30,7 +30,7 @@ impl Backend {
         if settings.backend == BackendKind::AnthropicApi {
             let key = api_key.ok_or("No Anthropic API key set.")?;
             let messages = resume.as_ref().and_then(|r| r["api_messages"].as_array().cloned()).unwrap_or_default();
-            return Ok(Backend::Api(api::ApiBackend::new(key, host, events, messages)));
+            return Ok(Backend::Api(api::ApiBackend::new(key, &settings.api_model, host, events, messages)));
         }
         let server = mcp::start(host)
             .await
