@@ -108,3 +108,8 @@ notes between tool calls (`thinking.display: "updates"`). See
 `crates/agent-core/src/client.rs`.
 
 GPUI is pinned to an exact version (`=0.2.2`); upgrade deliberately.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
