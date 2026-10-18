@@ -1,5 +1,6 @@
-//! Runs Jev work (roadmap Phase 11) on its own thread: learning focus sites,
-//! and handling requests about learned sites without Claude.
+//! Runs Jev work (roadmap Phase 12) on its own thread: learning focus sites,
+//! and handling requests about learned sites without Claude. Decisions too
+//! long for Jev (whole pages) go to SubQ.
 //!
 //! Like the watch checker, it has its own Tokio runtime, so it works
 //! whether or not an agent is running.
@@ -23,14 +24,14 @@ pub enum Event {
     Progress { site: String, line: String },
     /// Learning finished: what the site can do now, or why it failed.
     Learned { site: String, result: Result<Vec<&'static str>, String> },
-    /// A request handled by Jev.
-    Answer { id: u64, text: String, calls: u64, secs: f32 },
+    /// A request handled by Jev; `subq_calls` of the `calls` went to SubQ.
+    Answer { id: u64, text: String, calls: u64, subq_calls: u64, secs: f32 },
     /// A request Jev couldn't handle; it goes to Claude.
     Fallback { id: u64, reason: String },
 }
 
-const NO_KEY: &str = "No Jev key saved. Save one with: secret-tool store --label=\"agent-unibrow Jev key\" \
-                      service agent-unibrow-models account jev";
+const NO_KEY: &str = "No Jev or SubQ key saved. Save one with: secret-tool store --label=\"agent-unibrow Jev key\" \
+                      service agent-unibrow-models account jev (or account subq for SubQ)";
 
 pub fn spawn(store: Arc<Browsing>, bridge: BrowserBridge) -> (async_channel::Sender<Job>, async_channel::Receiver<Event>) {
     let (job_tx, jobs) = async_channel::unbounded::<Job>();
@@ -54,10 +55,16 @@ pub fn spawn(store: Arc<Browsing>, bridge: BrowserBridge) -> (async_channel::Sen
                             Job::Handle { id, site, text } => {
                                 let started = Instant::now();
                                 let ev = match Jev::from_saved_key() {
-                                    None => Event::Fallback { id, reason: "no Jev key is saved".into() },
+                                    None => Event::Fallback { id, reason: "no Jev or SubQ key is saved".into() },
                                     Some(jev) => match jev_handle(&bridge, &jev, &site, &text).await {
                                         Ok(Handled::Answer { text }) => {
-                                            Event::Answer { id, text, calls: jev.calls(), secs: started.elapsed().as_secs_f32() }
+                                            Event::Answer {
+                                                id,
+                                                text,
+                                                calls: jev.calls(),
+                                                subq_calls: jev.subq_calls(),
+                                                secs: started.elapsed().as_secs_f32(),
+                                            }
                                         }
                                         Ok(Handled::NotForJev(reason)) => Event::Fallback { id, reason },
                                         Err(e) => Event::Fallback { id, reason: format!("Jev ran into a problem ({e})") },

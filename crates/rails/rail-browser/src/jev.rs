@@ -3,9 +3,15 @@
 //! matches?") get a typed answer with a probability in a fraction of a
 //! second, instead of a word match.
 //!
-//! The key comes from `JEV_API_KEY` or the keyring (service
-//! `agent-unibrow-models`, account `jev`). Without one, or if Jev can't be
-//! reached, decisions fall back to [`WordMatch`].
+//! SubQ Snap (Subquadratic's decision model, roadmap 8.4) takes the same
+//! kind of questions over far longer states: up to 384K tokens, against
+//! Jev's few tens of thousands. Each question goes to Jev when it fits and
+//! to SubQ when it doesn't (a whole page, a long history), so callers just
+//! ask.
+//!
+//! The keys come from `JEV_API_KEY` / `SUBQ_API_KEY` or the keyring
+//! (service `agent-unibrow-models`, accounts `jev` and `subq`). Without
+//! one, or if neither can be reached, decisions fall back to [`WordMatch`].
 
 use crate::tools::{Decider, Decision, WordMatch};
 use futures::future::BoxFuture;
@@ -14,8 +20,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-const ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
-const MODEL: &str = "jev-latest";
 pub const KEYRING_SERVICE: &str = "agent-unibrow-models";
 pub const KEYRING_ACCOUNT: &str = "jev";
 /// Jev allows 255 options; one is kept for "none of these".
@@ -24,27 +28,104 @@ const MAX_OPTIONS: usize = 254;
 const MIN_CONFIDENCE: f32 = 0.5;
 const NONE: &str = "none";
 
-/// The Jev key, if one is set.
-pub fn api_key() -> Option<String> {
-    if let Ok(k) = std::env::var("JEV_API_KEY") {
+/// The decision models the app can ask. Both take `/v1/systemone`
+/// requests: a state and named choice / noul / score questions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Model {
+    Jev,
+    SubQ,
+}
+
+impl Model {
+    pub fn name(self) -> &'static str {
+        match self {
+            Model::Jev => "Jev",
+            Model::SubQ => "SubQ",
+        }
+    }
+
+    fn endpoint(self) -> &'static str {
+        match self {
+            Model::Jev => "https://api.typesafe.ai/v1/systemone",
+            Model::SubQ => "https://api.subq.ai/v1/systemone",
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Model::Jev => "jev-latest",
+            Model::SubQ => "subq-snap-preview",
+        }
+    }
+
+    fn account(self) -> &'static str {
+        match self {
+            Model::Jev => KEYRING_ACCOUNT,
+            Model::SubQ => "subq",
+        }
+    }
+
+    fn env_var(self) -> &'static str {
+        match self {
+            Model::Jev => "JEV_API_KEY",
+            Model::SubQ => "SUBQ_API_KEY",
+        }
+    }
+
+    /// The largest request sent to it, in estimated tokens. Jev took 18.6K
+    /// tokens and refused 55K; SubQ's window is 393,216.
+    fn max_tokens(self) -> usize {
+        match self {
+            Model::Jev => 24_000,
+            Model::SubQ => 370_000,
+        }
+    }
+
+    fn timeout(self) -> Duration {
+        match self {
+            Model::Jev => Duration::from_secs(8),
+            // A full window takes SubQ a few seconds.
+            Model::SubQ => Duration::from_secs(30),
+        }
+    }
+}
+
+/// A rough token count for a request: about four characters a token, which
+/// overcounts English text a little.
+fn estimate_tokens(state: &Value, questions: &Value) -> usize {
+    let len = |v: &Value| match v {
+        Value::String(s) => s.len(),
+        v => v.to_string().len(),
+    };
+    (len(state) + len(questions)) / 4 + 50
+}
+
+/// The key saved for `model`, if any.
+pub fn key_for(model: Model) -> Option<String> {
+    if let Ok(k) = std::env::var(model.env_var()) {
         if !k.trim().is_empty() {
             return Some(k.trim().to_string());
         }
     }
-    if let Some(k) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).ok().and_then(|e| e.get_password().ok()) {
+    if let Some(k) = keyring::Entry::new(KEYRING_SERVICE, model.account()).ok().and_then(|e| e.get_password().ok()) {
         return Some(k);
     }
     // Stored with `secret-tool store … service agent-unibrow-models account jev`.
     let out = std::process::Command::new("secret-tool")
-        .args(["lookup", "service", KEYRING_SERVICE, "account", KEYRING_ACCOUNT])
+        .args(["lookup", "service", KEYRING_SERVICE, "account", model.account()])
         .output()
         .ok()?;
     let k = String::from_utf8(out.stdout).ok()?.trim().to_string();
     (!k.is_empty()).then_some(k)
 }
 
-/// Jev when a key is set (and this isn't an isolated test instance),
-/// otherwise the word match.
+/// The Jev key, if one is set.
+pub fn api_key() -> Option<String> {
+    key_for(Model::Jev)
+}
+
+/// Jev (and SubQ) when a key is set and this isn't an isolated test
+/// instance, otherwise the word match.
 pub fn decider() -> Box<dyn Decider> {
     match Jev::from_saved_key() {
         Some(jev) => Box::new(jev),
@@ -52,10 +133,12 @@ pub fn decider() -> Box<dyn Decider> {
     }
 }
 
-/// A connection to Jev. Clones share the usage counts.
+/// A connection to the decision models: Jev, SubQ, or both. Clones share
+/// the usage counts.
 #[derive(Clone)]
 pub struct Jev {
-    key: String,
+    jev: Option<String>,
+    subq: Option<String>,
     http: reqwest::Client,
     usage: Arc<Usage>,
 }
@@ -64,53 +147,118 @@ pub struct Jev {
 #[derive(Default)]
 pub struct Usage {
     pub calls: AtomicU64,
+    pub subq_calls: AtomicU64,
     pub input_tokens: AtomicU64,
 }
 
 impl Jev {
+    /// Jev alone.
     pub fn new(key: String) -> Self {
-        let http = reqwest::Client::builder().timeout(Duration::from_secs(8)).build().expect("http client");
-        Self { key, http, usage: Arc::new(Usage::default()) }
+        Self::with_keys(Some(key), None)
     }
 
-    /// Jev with the saved key, if there is one. Isolated test instances
-    /// only use it when `UNIBROW_ALLOW_JEV=1`.
+    pub fn with_keys(jev: Option<String>, subq: Option<String>) -> Self {
+        let http = reqwest::Client::builder().build().expect("http client");
+        Self { jev, subq, http, usage: Arc::new(Usage::default()) }
+    }
+
+    /// The models with saved keys, if there are any. Isolated test
+    /// instances only use them when `UNIBROW_ALLOW_JEV=1`.
     pub fn from_saved_key() -> Option<Self> {
         let test_instance =
             std::env::var_os("UNIBROW_DATA_DIR").is_some() && std::env::var("UNIBROW_ALLOW_JEV").as_deref() != Ok("1");
         if test_instance {
             return None;
         }
-        api_key().map(Self::new)
+        let (jev, subq) = (key_for(Model::Jev), key_for(Model::SubQ));
+        (jev.is_some() || subq.is_some()).then(|| Self::with_keys(jev, subq))
     }
 
+    pub fn has(&self, model: Model) -> bool {
+        match model {
+            Model::Jev => self.jev.is_some(),
+            Model::SubQ => self.subq.is_some(),
+        }
+    }
+
+    /// Decisions made, by either model.
     pub fn calls(&self) -> u64 {
         self.usage.calls.load(Ordering::Relaxed)
+    }
+
+    /// Decisions that went to SubQ.
+    pub fn subq_calls(&self) -> u64 {
+        self.usage.subq_calls.load(Ordering::Relaxed)
     }
 
     pub fn input_tokens(&self) -> u64 {
         self.usage.input_tokens.load(Ordering::Relaxed)
     }
 
+    /// The model for a request of about `tokens`: Jev when it fits (it's
+    /// quicker), otherwise SubQ.
+    fn route(&self, tokens: usize) -> Result<Model, String> {
+        let jev_fits = tokens <= Model::Jev.max_tokens();
+        match (self.jev.is_some(), self.subq.is_some()) {
+            (true, _) if jev_fits => Ok(Model::Jev),
+            (_, true) if tokens <= Model::SubQ.max_tokens() => Ok(Model::SubQ),
+            (_, true) => Err(format!("too long to decide on (about {tokens} tokens, over SubQ's window)")),
+            (true, false) => Err(format!("too long for Jev (about {tokens} tokens) and no SubQ key is saved")),
+            (false, false) => Err("no Jev or SubQ key is saved".into()),
+        }
+    }
+
     /// Asks `questions` (name → question) about `state`; returns the answers
     /// by name.
     pub async fn ask(&self, state: Value, questions: Value) -> Result<Value, String> {
-        let body = json!({"model": MODEL, "state": state, "questions": questions});
+        self.ask_with(state, questions).await.map(|(answers, _)| answers)
+    }
+
+    /// Like [`Self::ask`], and says which model answered.
+    pub async fn ask_with(&self, state: Value, questions: Value) -> Result<(Value, Model), String> {
+        let model = self.route(estimate_tokens(&state, &questions))?;
+        match self.send(model, &state, &questions).await {
+            // Longer than the estimate: SubQ takes it.
+            Err(e) if model == Model::Jev && self.subq.is_some() && e.contains("max_tokens_exceeded") => {
+                Ok((self.send(Model::SubQ, &state, &questions).await?, Model::SubQ))
+            }
+            r => r.map(|a| (a, model)),
+        }
+    }
+
+    async fn send(&self, model: Model, state: &Value, questions: &Value) -> Result<Value, String> {
+        let key = match model {
+            Model::Jev => self.jev.as_deref(),
+            Model::SubQ => self.subq.as_deref(),
+        }
+        .ok_or_else(|| format!("no {} key is saved", model.name()))?;
+        let body = json!({"model": model.id(), "state": state, "questions": questions});
         let mut tries = 0;
         loop {
             tries += 1;
-            let resp = self.http.post(ENDPOINT).bearer_auth(&self.key).json(&body).send().await.map_err(|e| e.to_string())?;
+            let resp = self
+                .http
+                .post(model.endpoint())
+                .bearer_auth(key)
+                .timeout(model.timeout())
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("{}: {e}", model.name()))?;
             let status = resp.status();
             // Busy: back off and try again.
-            if (status.as_u16() == 429 || status.as_u16() == 529) && tries < 3 {
+            if (status.as_u16() == 429 || status.as_u16() == 529 || status.as_u16() == 503) && tries < 3 {
                 tokio::time::sleep(Duration::from_millis(400 * tries)).await;
                 continue;
             }
-            let v: Value = resp.json().await.map_err(|e| e.to_string())?;
+            let v: Value = resp.json().await.map_err(|e| format!("{}: {e}", model.name()))?;
             if !status.is_success() {
-                return Err(format!("Jev: HTTP {status}: {v}"));
+                return Err(format!("{}: HTTP {status}: {v}", model.name()));
             }
             self.usage.calls.fetch_add(1, Ordering::Relaxed);
+            if model == Model::SubQ {
+                self.usage.subq_calls.fetch_add(1, Ordering::Relaxed);
+            }
             self.usage.input_tokens.fetch_add(v["usage"]["input_tokens"].as_u64().unwrap_or(0), Ordering::Relaxed);
             return Ok(v["answers"].clone());
         }
@@ -186,7 +334,6 @@ fn request(question: &str, wanted: &str, options: &[String]) -> Value {
     }
     criteria.insert(NONE.into(), Value::String("None of these is a good match".into()));
     json!({
-        "model": MODEL,
         "state": format!("On a web page, looking for: {wanted}"),
         "questions": {
             "pick": {
@@ -217,8 +364,9 @@ fn answer_above(resp: &Value, options: usize, floor: f32) -> Result<Option<Decis
     if index >= options {
         return Err(format!("option {index} out of range"));
     }
-    let model = resp["model"].as_str().unwrap_or(MODEL);
-    Ok(Some(Decision { index, confidence, by: format!("Jev ({model})") }))
+    let model = resp["model"].as_str().unwrap_or("jev-latest");
+    let name = if model.starts_with("subq") { "SubQ" } else { "Jev" };
+    Ok(Some(Decision { index, confidence, by: format!("{name} ({model})") }))
 }
 
 impl Decider for Jev {
@@ -231,15 +379,13 @@ impl Decider for Jev {
         let (jev, n) = (self.clone(), options.len().min(MAX_OPTIONS));
         Box::pin(async move {
             let asked = async {
-                let answers = jev.ask(body["state"].clone(), body["questions"].clone()).await?;
-                let mut v = json!({"answers": answers});
-                v["model"] = json!(MODEL);
-                answer(&v, n)
+                let (answers, model) = jev.ask_with(body["state"].clone(), body["questions"].clone()).await?;
+                answer(&json!({"answers": answers, "model": model.id()}), n)
             };
             match asked.await {
                 Ok(d) => d,
-                // Jev unreachable: the word match decides instead.
-                Err(e) => fallback.await.map(|d| Decision { by: format!("{} (Jev unavailable: {e})", d.by), ..d }),
+                // Unreachable: the word match decides instead.
+                Err(e) => fallback.await.map(|d| Decision { by: format!("{} (decision model unavailable: {e})", d.by), ..d }),
             }
         })
     }
@@ -269,6 +415,44 @@ mod tests {
         let unsure = json!({"answers": {"pick": {"choice": "0", "confidence": 0.3}}});
         assert!(answer(&unsure, 2).unwrap().is_none());
         assert!(answer(&json!({"answers": {"pick": {"choice": "7", "confidence": 1.0}}}), 2).is_err());
+    }
+
+    #[test]
+    fn long_requests_go_to_subq() {
+        let both = Jev::with_keys(Some("j".into()), Some("s".into()));
+        assert_eq!(both.route(500).unwrap(), Model::Jev);
+        assert_eq!(both.route(100_000).unwrap(), Model::SubQ);
+        assert!(both.route(1_000_000).is_err());
+        let jev_only = Jev::new("j".into());
+        assert!(jev_only.route(100_000).unwrap_err().contains("no SubQ key"));
+        let subq_only = Jev::with_keys(None, Some("s".into()));
+        assert_eq!(subq_only.route(500).unwrap(), Model::SubQ);
+        let long = json!("word ".repeat(40_000));
+        assert!(estimate_tokens(&long, &json!({})) > Model::Jev.max_tokens());
+    }
+
+    #[test]
+    fn names_the_model_that_decided() {
+        let v = json!({"model": "subq-snap-preview", "answers": {"pick": {"choice": "0", "probabilities": {"0": 0.9}}}});
+        assert_eq!(answer(&v, 1).unwrap().unwrap().by, "SubQ (subq-snap-preview)");
+    }
+
+    /// Calls the real SubQ with a page too long for Jev; run with
+    /// `cargo test -p rail-browser subq_live -- --ignored`.
+    #[test]
+    #[ignore]
+    fn subq_live() {
+        let key = key_for(Model::SubQ).expect("a SubQ key in the keyring");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let both = Jev::with_keys(api_key(), Some(key));
+        let page = format!(
+            "{}\nQ: Does it come with glue? A: Yes, a small tube of nut glue is in the box.\n{}",
+            "Q: Is it 38 mm wide? A: Yes, it fits a Jazz Bass.\n".repeat(3000),
+            "Review: great tone, easy install.\n".repeat(3000)
+        );
+        let p = rt.block_on(both.yes(&page, "Does the product come with glue?")).unwrap();
+        assert!(p > 0.7, "{p}");
+        assert_eq!(both.subq_calls(), 1);
     }
 
     /// Calls the real Jev; run with `cargo test -p rail-browser jev_live -- --ignored`.

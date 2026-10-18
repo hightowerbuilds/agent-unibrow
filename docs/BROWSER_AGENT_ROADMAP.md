@@ -31,11 +31,11 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
 | 5. Accounts and handoff | 5.1, 5.2, 5.3, 5.4 | 5.5 | |
 | 6. Safety and policy | ✅ all | | |
 | 7. Reliability | ✅ all | | |
-| 8. Focus sites | 8.1, 8.2, 8.3, 8.5, 8.6 | | 8.4 (SubQ) |
+| 8. Focus sites | 8.1, 8.2, 8.3, 8.4 (decisions), 8.5, 8.6 | | 8.4 SubQ chat |
 | 9. Extracting | ✅ 9.1, 9.2, 9.3, 9.4 | | |
 | 10. Polish | zoom, reader, context menu, favicons, audio, video codecs, fullscreen, region shots, shortcuts | | translate; spellcheck, PiP and DevTools blocked by CEF |
 | 11. Under the hood | throttling, crash recovery, memory caps | | GPU frame path, separate profiles |
-| 12. Jev sites | 12.1, 12.2, 12.3 | | 12.4, 12.5 |
+| 12. Jev sites | 12.1, 12.2, 12.3, 12.6 | | 12.4, 12.5 |
 
 ## How the agent will see and drive pages
 
@@ -349,11 +349,17 @@ set path instead of starting from scratch each time.
   `JEV_API_KEY`); `WordMatch` stands in without one or if Jev can't be
   reached. Test instances use Jev only with `UNIBROW_ALLOW_JEV=1`.
 
-### 8.4 Long context (SubQ) — todo
-- Whole history, site maps and long pages in one context when a task
-  needs the big picture. The SubQ key saved so far (keyring account `subq`)
-  only allows `subq-snap-preview`, a decision model like Jev; the
-  long-context model (`subq-preview`) needs a key with access to it.
+### 8.4 Long context (SubQ) — ✅ **COMPLETED** (decisions); chat todo
+- SubQ Snap (`subq-snap-preview`, keyring account `subq`) takes the same
+  typed questions as Jev over up to 384K tokens, for $0.05 per million
+  input tokens. Every decision goes to Jev when it fits (it's quicker) and
+  to SubQ when it doesn't: whole pages, long lists. Jev measured: 18.6K
+  tokens fine, 55K refused; SubQ read 275K in 4 s. A Jev "too long" error
+  is retried on SubQ. Either key alone works.
+- Used by 12.4 (product questions answered from the whole page).
+- Todo: SubQ's long-context chat model (`subq-preview`, early access) for
+  whole history and site maps in one context. The saved key isn't allowed
+  to use it yet (`403 model_not_allowed`).
 
 ### 8.5 Falling off the map — ✅ **COMPLETED**
 - Before each step: is this the kind of page the recording was on? After
@@ -476,6 +482,20 @@ kinds, and each step of those is a closed question.
 
 ### 12.3 Decisions in playbooks — ✅ **COMPLETED**
 - See 8.3: replays use Jev for "which result is it?".
+
+### 12.6 Product questions from the page — ✅ **COMPLETED**
+- "Does it come with glue?", "is it pre-slotted?": a new request kind. The
+  product page (the open one, or the one the request names) is split into
+  passages; one decision over the whole page picks the passage that
+  answers it, and whether the answer is yes or no. The reply quotes it:
+  "Yes. The … page says: “Pre-slotted for your convenience …”". Long pages
+  go to SubQ (8.4). If no passage clearly answers, Claude takes it.
+- A model number in the request ("PT-1214-00") decides the search pick
+  when one result has it, and the search is retried with it alone until
+  one does.
+- Evals: `jev-question` (spec table, Jev), `subq-long-page` (an answer in
+  the middle of 900 Q&As and 500 reviews, SubQ). Checked live on
+  sweetwater.com.
 
 ### 12.4 More request kinds — todo
 - Add to cart (with a confirmation card), reorder from order history,

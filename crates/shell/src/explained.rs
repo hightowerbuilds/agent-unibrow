@@ -144,6 +144,11 @@ const FOCUS: &[Section] = &[
              bass nuts\", \"is this in stock?\") and Jev handles it in a second or two, without Claude.",
             "Jev handles finding, opening, prices, stock and the cart. Anything else, or anything it's unsure \
              of, goes to Claude, and the chat says so.",
+            "Questions about a product (\"does it come with glue?\", \"what's the warranty?\") are answered from \
+             its page: the reply quotes the part of the page that answers it. If the page doesn't say, Claude \
+             takes it.",
+            "Long pages go to SubQ, a decision model that reads up to 384K tokens at once (about a whole \
+             book), for a fraction of a cent. The note under each answer says which model answered.",
             "The Jev button on the site turns it off and on. View shows what it learned.",
         ])],
     },

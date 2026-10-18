@@ -580,17 +580,19 @@ impl Shell {
                 self.trace.push(Kind::Info, line.clone(), None);
                 self.notice(line);
             }
-            Event::Answer { id, text, calls, secs } => {
+            Event::Answer { id, text, calls, subq_calls, secs } => {
                 let Some((_, asked, site)) = self.jev_pending.take().filter(|p| p.0 == id) else { return };
                 self.push(ItemKind::Assistant, text.clone());
-                self.push(
-                    ItemKind::Note,
-                    format!("Answered by Jev on {site} · {calls} decisions · {secs:.1} s · no Claude tokens"),
-                );
+                let (by, decisions, model) = match (calls - subq_calls, subq_calls) {
+                    (_, 0) => ("Jev", format!("{calls} decisions"), "jev"),
+                    (0, s) => ("SubQ", format!("{s} decisions"), "subq"),
+                    (j, s) => ("Jev and SubQ", format!("{j} Jev + {s} SubQ decisions"), "jev+subq"),
+                };
+                self.push(ItemKind::Note, format!("Answered by {by} on {site} · {decisions} · {secs:.1} s · no Claude tokens"));
                 self.trace.push(
                     Kind::Assistant,
-                    format!("Turn finished (jev, {calls} calls, {secs:.1} s on {site})"),
-                    Some(format!("{text}\n\nmodel: jev")),
+                    format!("Turn finished (jev, {decisions}, {secs:.1} s on {site})"),
+                    Some(format!("{text}\n\nmodel: {model}")),
                 );
                 self.jev_context.push(format!("User: {asked}\nApp: {text}"));
                 self.set_busy(false, "", cx);

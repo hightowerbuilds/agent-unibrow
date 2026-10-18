@@ -1137,5 +1137,45 @@
         "Jev passed to Claude"
       ]
     }
+  },
+  {
+    "name": "jev-question",
+    "page": "p-bone.html",
+    "approve": "deny",
+    "env": {
+      "UNIBROW_ALLOW_JEV": "1",
+      "UNIBROW_TEST_JEV_LEARN": "localhost|{base}/shop.html"
+    },
+    "task": "What material is this nut made of?",
+    "expect": {
+      "reply_contains": [
+        "Unbleached bone"
+      ],
+      "trace_contains": [
+        "Turn finished (jev"
+      ],
+      "no_tool_calls": true
+    }
+  },
+  {
+    "name": "subq-long-page",
+    "page": "p-long.html",
+    "approve": "deny",
+    "env": {
+      "UNIBROW_ALLOW_JEV": "1",
+      "UNIBROW_TEST_JEV_LEARN": "localhost|{base}/shop.html"
+    },
+    "task": "Does this nut come with glue?",
+    "expect": {
+      "reply_contains": [
+        "Yes",
+        "tube of nut glue"
+      ],
+      "trace_contains": [
+        "Turn finished (jev",
+        "SubQ"
+      ],
+      "no_tool_calls": true
+    }
   }
 ]

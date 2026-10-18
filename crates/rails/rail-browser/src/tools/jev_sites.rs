@@ -6,14 +6,18 @@
 //!   results, what a result and a product page look like, which link is the
 //!   cart. What it finds is saved with the site (`browsing::jev_sites`).
 //! - [`handle`] answers a request about a learned site. One Jev call reads
-//!   the request: what kind it is (find, price, stock, open, cart, or
-//!   something else) and which words name the product. The app then does it
-//!   and answers from a template. Anything Jev can't do, or isn't sure of,
-//!   is handed back for Claude.
+//!   the request: what kind it is (find, price, stock, open, cart, a
+//!   question about a product, or something else) and which words name the
+//!   product. The app then does it and answers from a template. Anything
+//!   Jev can't do, or isn't sure of, is handed back for Claude.
+//! - Questions about a product ("does it come with glue?") are answered
+//!   from the page itself: the whole page goes to the decision model, which
+//!   picks the passage that answers it, and the reply quotes it. Long pages
+//!   go to SubQ, which reads up to 384K tokens.
 //!
-//! Jev answers typed questions only (pick one, yes/no); it never writes
-//! text, so every reply here is the app's own wording around what it read
-//! from the page.
+//! The decision models answer typed questions only (pick one, yes/no); they
+//! never write text, so every reply here is the app's own wording around
+//! what it read from the page.
 
 use super::Browser;
 use super::extract::{BgPage, run_js};
@@ -430,9 +434,14 @@ const INTENTS: &[(&str, &str)] = &[
     ("open", "Open or show one specific product page"),
     ("cart", "Show or open the shopping cart"),
     (
+        "question",
+        "A factual question about one product that its page would answer: what's included, size, material, \
+         compatibility, shipping, returns, warranty",
+    ),
+    (
         "other",
-        "Anything else: buying, adding to cart, checking out, comparing, reviews, specs, questions, orders, the account, \
-         or several things at once",
+        "Anything else: buying, adding to cart, checking out, comparing or recommending products, opinions, summaries, \
+         orders, the account, or several things at once",
     ),
 ];
 
@@ -490,16 +499,18 @@ pub async fn handle(bridge: &BrowserBridge, jev: &Jev, site: &JevSite, text: &st
         .or(answers["intent"]["confidence"].as_f64())
         .unwrap_or(0.0);
     if intent == "other" || intent.is_empty() {
-        return Ok(Handled::NotForJev("this isn't a find, price, stock, open or cart request".into()));
+        return Ok(Handled::NotForJev("this isn't a find, price, stock, open, cart or product question request".into()));
     }
     if intent_conf < 0.6 {
         return Ok(Handled::NotForJev(format!("Jev wasn't sure what you meant (confidence {intent_conf:.2})")));
     }
-    if !abilities.contains(&intent.as_str()) {
-        return Ok(Handled::NotForJev(format!("Jev hasn't learned how to do “{intent}” on {}", site.site)));
-    }
     let item = s(&answers["item"], "choice").parse::<usize>().ok().and_then(|i| spans.get(i).cloned());
     let here = answers["here"]["noul"].as_f64().unwrap_or(0.0) >= 0.6;
+    // A question about the page that's open needs nothing learned.
+    let ability = if intent == "question" { "open" } else { intent.as_str() };
+    if !abilities.contains(&ability) && !(intent == "question" && here) {
+        return Ok(Handled::NotForJev(format!("Jev hasn't learned how to do “{intent}” on {}", site.site)));
+    }
 
     let go = |url: String| async move {
         b.bridge.navigate(&url).await?;
@@ -517,6 +528,9 @@ pub async fn handle(bridge: &BrowserBridge, jev: &Jev, site: &JevSite, text: &st
         let st = bridge.state().await?;
         site.skills.product_pattern.as_deref().is_some_and(|p| url_pattern(&st.url) == p)
     };
+    if intent == "question" && here {
+        return answer_from_page(bridge, jev, text, name_of).await;
+    }
     let query = match (&item, here && on_product_page) {
         (_, true) => None,
         (Some(q), false) => Some(q.clone()),
@@ -539,13 +553,46 @@ pub async fn handle(bridge: &BrowserBridge, jev: &Jev, site: &JevSite, text: &st
     // open / price / stock: get to the product page.
     let mut listed_price = String::new();
     if let Some(q) = &query {
-        let search = site.skills.search_for(q).ok_or("no search")?;
-        let page = BgPage::open(bridge, &search).await?;
-        let results = results_of(&page.eval(json!({"mode": "items", "max_items": 30})).await.unwrap_or_default());
-        drop(page);
+        // Model numbers anywhere in the request ("PT-1214-00"), even if
+        // they're not in the words picked out as the product.
+        let codes = model_numbers(text);
+        let has_codes = |r: &Result_| codes.iter().all(|c| model_numbers(&r.title).contains(c));
+        // The words as given; then, until a result has the model number,
+        // the model number alone and the name without it.
+        let mut tries = vec![q.clone()];
+        if !codes.is_empty() {
+            tries.push(codes.join(" "));
+            let rest: Vec<&str> = q.split_whitespace().filter(|w| !model_numbers(w).iter().any(|c| codes.contains(c))).collect();
+            if rest.len() >= 2 {
+                tries.push(rest.join(" "));
+            }
+        }
+        let (mut search, mut results) = (String::new(), Vec::new());
+        for t in &tries {
+            let url = site.skills.search_for(t).ok_or("no search")?;
+            let page = BgPage::open(bridge, &url).await?;
+            let found = results_of(&page.eval(json!({"mode": "items", "max_items": 30})).await.unwrap_or_default());
+            if found.is_empty() {
+                continue;
+            }
+            let done = codes.is_empty() || found.iter().any(&has_codes);
+            if results.is_empty() || done {
+                (search, results) = (url, found);
+            }
+            if done {
+                break;
+            }
+        }
+        if search.is_empty() {
+            search = site.skills.search_for(q).ok_or("no search")?;
+        }
         let options: Vec<String> = results.iter().map(|r| if r.price.is_empty() { r.title.clone() } else { format!("{} — {}", r.title, r.price) }).collect();
-        let (pick, p) = jev
-            .pick(
+        // A model number the user typed settles it when one result has it.
+        let coded: Vec<usize> = (0..results.len()).filter(|&i| !codes.is_empty() && has_codes(&results[i])).collect();
+        let (pick, p) = if let [only] = coded[..] {
+            (Some(only), 1.0)
+        } else {
+            jev.pick(
                 &format!("Search results on {name_of} for “{q}”"),
                 &format!(
                     "Which result is the product the user means by “{q}”? Prefer the product itself over accessories or \
@@ -553,7 +600,8 @@ pub async fn handle(bridge: &BrowserBridge, jev: &Jev, site: &JevSite, text: &st
                 ),
                 &options,
             )
-            .await?;
+            .await?
+        };
         let i = match pick {
             Some(i) if p >= 0.5 => i,
             // Several fit about as well: show them, and the price if they share one.
@@ -569,13 +617,19 @@ pub async fn handle(bridge: &BrowserBridge, jev: &Jev, site: &JevSite, text: &st
             }
             None => {
                 go(search).await?;
-                return Ok(Handled::Answer {
-                    text: format!("Couldn't find “{q}” on {name_of}. Here's what the search shows:\n{}", results_text(&results, 5)),
-                });
+                let text = if results.is_empty() {
+                    format!("Searched {name_of} for “{q}” and found nothing.")
+                } else {
+                    format!("Couldn't find “{q}” on {name_of}. Here's what the search shows:\n{}", results_text(&results, 5))
+                };
+                return Ok(Handled::Answer { text });
             }
         };
         listed_price = results[i].price.clone();
         go(results[i].url.clone()).await?;
+    }
+    if intent == "question" {
+        return answer_from_page(bridge, jev, text, name_of).await;
     }
     let v = run_js(bridge, None, json!({"mode": "summary", "max_specs": 10, "excerpt_chars": 2500})).await?;
     let product = &v["product"];
@@ -613,6 +667,155 @@ pub async fn handle(bridge: &BrowserBridge, jev: &Jev, site: &JevSite, text: &st
     Ok(Handled::Answer { text })
 }
 
+/// Model and part numbers in `text`: words with both letters and digits,
+/// or digits joined by dashes ("PT-1214-00", "6643-00", "SM58"), in
+/// upper case.
+fn model_numbers(text: &str) -> Vec<String> {
+    text.split(|c: char| c.is_whitespace() || matches!(c, ',' | '(' | ')' | '/' | '“' | '”' | '"'))
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_uppercase())
+        .filter(|w| {
+            let digits = w.chars().filter(char::is_ascii_digit).count();
+            let letters = w.chars().filter(char::is_ascii_alphabetic).count();
+            w.len() >= 4 && digits >= 2 && (letters > 0 || w.contains('-')) && !w.ends_with("MM")
+        })
+        .collect()
+}
+
+/// The page's visible text, up to about 300K tokens.
+const PAGE_TEXT_JS: &str = r#"(() => ({
+  title: document.title || '',
+  text: (document.body ? document.body.innerText : '').slice(0, 1200000),
+}))()"#;
+
+/// Splits page text into passages of up to `PASSAGE_CHARS` for quoting:
+/// short lines (headings, table rows) are joined to the next line or two,
+/// and long paragraphs are split between sentences.
+const PASSAGE_CHARS: usize = 300;
+
+fn passages(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let flush = |cur: &mut String, out: &mut Vec<String>| {
+        let t = cur.trim();
+        if t.chars().count() >= 3 {
+            out.push(t.to_string());
+        }
+        cur.clear();
+    };
+    for line in text.lines() {
+        let line = line.split('\t').map(str::trim).filter(|c| !c.is_empty()).collect::<Vec<_>>().join(" · ");
+        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.is_empty() {
+            continue;
+        }
+        let mut pieces = Vec::new();
+        if line.chars().count() <= PASSAGE_CHARS {
+            pieces.push(line);
+        } else {
+            // Between sentences, or between words for a sentence that's too long.
+            let mut piece = String::new();
+            for word in line.split(' ') {
+                let ends = piece.ends_with(['.', '!', '?']);
+                if !piece.is_empty()
+                    && (piece.chars().count() + word.chars().count() >= PASSAGE_CHARS || (ends && piece.chars().count() > 180))
+                {
+                    pieces.push(std::mem::take(&mut piece));
+                }
+                if !piece.is_empty() {
+                    piece.push(' ');
+                }
+                piece.push_str(word);
+            }
+            pieces.push(piece);
+        }
+        for p in pieces {
+            if !cur.is_empty() && cur.chars().count() + p.chars().count() + 1 > PASSAGE_CHARS {
+                flush(&mut cur, &mut out);
+            }
+            if !cur.is_empty() {
+                cur.push('\n');
+            }
+            cur.push_str(&p);
+            // A paragraph, or a heading with a line or two after it.
+            if cur.chars().count() >= 60 || cur.lines().count() >= 3 {
+                flush(&mut cur, &mut out);
+            }
+        }
+    }
+    flush(&mut cur, &mut out);
+    out
+}
+
+/// The passages most likely to answer `question`, up to the option limit,
+/// in page order: those sharing the most words with it.
+fn likely_passages(all: Vec<String>, question: &str, max: usize) -> Vec<String> {
+    if all.len() <= max {
+        return all;
+    }
+    let words: Vec<String> = question
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() > 2 && !STOPWORDS.contains(&w.to_lowercase().as_str()))
+        .map(|w| w.to_lowercase())
+        .collect();
+    let score = |p: &str| {
+        let p = p.to_lowercase();
+        words.iter().filter(|w| p.contains(w.as_str())).count()
+    };
+    let mut ranked: Vec<(usize, usize)> = all.iter().enumerate().map(|(i, p)| (score(p), i)).collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut keep: Vec<usize> = ranked.into_iter().take(max).map(|(_, i)| i).collect();
+    keep.sort_unstable();
+    keep.into_iter().map(|i| all[i].clone()).collect()
+}
+
+/// Answers `question` from the page open in the user's tab, quoting the
+/// passage that answers it; Claude gets it when the page doesn't say.
+async fn answer_from_page(bridge: &BrowserBridge, jev: &Jev, question: &str, site: &str) -> Result<Handled, String> {
+    let r = bridge.cdp("Runtime.evaluate", json!({"expression": PAGE_TEXT_JS, "returnByValue": true, "timeout": 10000})).await?;
+    let v = &r["result"]["value"];
+    let (title, text) = (s(v, "title"), s(v, "text"));
+    let options = likely_passages(passages(text), question, 250);
+    if options.is_empty() {
+        return Ok(Handled::NotForJev("the page has no text to answer from".into()));
+    }
+    let mut criteria: serde_json::Map<String, Value> =
+        options.iter().enumerate().map(|(i, p)| (i.to_string(), Value::String(p.clone()))).collect();
+    criteria.insert("none".into(), Value::String("None of these passages answers the question".into()));
+    let questions = json!({
+        "passage": {
+            "type": "choice",
+            "instructions": "Which passage from the page answers the user's question? Only a passage that actually answers it.",
+            "criteria": criteria,
+        },
+        "yes_no": {"type": "noul", "instructions": "Is the user's question a yes/no question?"},
+        "yes": {"type": "noul", "instructions": "Going only by what the page says, is the answer to the user's question yes?"},
+    });
+    let state = format!("The user asked about this page: {question}\n\nThe page, “{title}” on {site}:\n{text}");
+    let (a, _) = jev.ask_with(json!(state), questions).await?;
+    let choice = s(&a["passage"], "choice");
+    let p = a["passage"]["probabilities"][choice].as_f64().unwrap_or(0.0);
+    // Several passages can answer it and split the vote; then it's enough
+    // that the page answers it at all (little weight on "none").
+    let none = a["passage"]["probabilities"]["none"].as_f64().unwrap_or(1.0);
+    let sure = p >= 0.5 || (p >= 0.25 && none <= 0.15);
+    let Some(passage) = choice.parse::<usize>().ok().and_then(|i| options.get(i)).filter(|_| sure) else {
+        let best = if choice == "none" { "none of the page".to_string() } else { format!("one passage at {p:.2}") };
+        return Ok(Handled::NotForJev(format!(
+            "the page doesn't clearly answer that ({} passages read, best pick {best})",
+            options.len()
+        )));
+    };
+    // "Bone Jazz Bass nut – Unibrow Test Shop" → "Bone Jazz Bass nut".
+    let name = [" – ", " | ", " - "].iter().fold(title, |t, sep| t.split(sep).next().unwrap_or(t)).trim();
+    let lead = match (a["yes_no"]["noul"].as_f64().unwrap_or(0.0), a["yes"]["noul"].as_f64().unwrap_or(0.5)) {
+        (q, y) if q >= 0.7 && y >= 0.8 => "Yes. ",
+        (q, y) if q >= 0.7 && y <= 0.2 => "No. ",
+        _ => "",
+    };
+    let quoted = passage.replace('\n', " / ");
+    Ok(Handled::Answer { text: format!("{lead}The {} page on {site} says:\n“{quoted}”", if name.is_empty() { "product" } else { name }) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,6 +846,27 @@ mod tests {
             r("https://s.com/help"),
         ];
         assert_eq!(result_pattern(&results).as_deref(), Some(url_pattern("https://s.com/store/detail/TusqNut--graph-tech-tusq").as_str()));
+    }
+
+    #[test]
+    fn model_numbers_pick_the_exact_product() {
+        assert_eq!(model_numbers("the Graph Tech PT-1214-00 TUSQ XL jazz bass nut"), vec!["PT-1214-00"]);
+        assert!(model_numbers("GRAPH TECH PQL-1214-00 TUSQ XL").iter().all(|c| c != "PT-1214-00"));
+        assert_eq!(model_numbers("Shure SM58 mic, 43mm"), vec!["SM58"]);
+        assert!(model_numbers("a 1962 Jazz Bass").is_empty());
+    }
+
+    #[test]
+    fn page_text_becomes_passages() {
+        let text = "Specifications\nMaterial\tUnbleached bone\nWidth\t38.0 mm\n\nQuestions\n".to_string()
+            + &"A very long answer sentence about the nut and its slots. ".repeat(12);
+        let p = passages(&text);
+        assert!(p[0].starts_with("Specifications\nMaterial · Unbleached bone\nWidth · 38.0 mm"), "{p:?}");
+        assert!(p.iter().all(|x| x.chars().count() <= PASSAGE_CHARS), "{p:?}");
+        let many: Vec<String> = (0..400).map(|i| format!("Review {i}: nice tone")).chain(["It comes with glue".into()]).collect();
+        let keep = likely_passages(many, "Does it come with glue?", 250);
+        assert_eq!(keep.len(), 250);
+        assert!(keep.contains(&"It comes with glue".to_string()));
     }
 
     #[test]
