@@ -1082,5 +1082,60 @@
         "MSE AAC => true"
       ]
     }
+  },
+  {
+    "name": "jev-price",
+    "page": "shop.html",
+    "approve": "deny",
+    "env": {
+      "UNIBROW_ALLOW_JEV": "1",
+      "UNIBROW_TEST_JEV_LEARN": "localhost|{base}/shop.html"
+    },
+    "task": "How much is the bone jazz bass nut?",
+    "expect": {
+      "reply_contains": [
+        "9.50",
+        "Bone Jazz Bass nut"
+      ],
+      "trace_contains": [
+        "Turn finished (jev",
+        "Jev learned localhost"
+      ],
+      "no_tool_calls": true
+    }
+  },
+  {
+    "name": "jev-find",
+    "page": "shop.html",
+    "approve": "deny",
+    "env": {
+      "UNIBROW_ALLOW_JEV": "1",
+      "UNIBROW_TEST_JEV_LEARN": "localhost|{base}/shop.html"
+    },
+    "task": "Find brass bass nuts",
+    "expect": {
+      "reply_contains": [
+        "Brass Jazz Bass nut"
+      ],
+      "trace_contains": [
+        "Turn finished (jev"
+      ],
+      "no_tool_calls": true
+    }
+  },
+  {
+    "name": "jev-hands-off",
+    "page": "shop.html",
+    "approve": "deny",
+    "env": {
+      "UNIBROW_ALLOW_JEV": "1",
+      "UNIBROW_TEST_JEV_LEARN": "localhost|{base}/shop.html"
+    },
+    "task": "Which of these nuts would suit a 1962 Jazz Bass best, and why? Answer in one short paragraph.",
+    "expect": {
+      "trace_contains": [
+        "Jev passed to Claude"
+      ]
+    }
   }
 ]

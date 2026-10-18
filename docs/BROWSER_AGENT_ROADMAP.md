@@ -31,10 +31,11 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
 | 5. Accounts and handoff | 5.1, 5.2, 5.3, 5.4 | 5.5 | |
 | 6. Safety and policy | ✅ all | | |
 | 7. Reliability | ✅ all | | |
-| 8. Focus sites | 8.1, 8.2, 8.5, 8.6 | 8.3 (slot for Jev) | 8.4 (SubQ) |
+| 8. Focus sites | 8.1, 8.2, 8.3, 8.5, 8.6 | | 8.4 (SubQ) |
 | 9. Extracting | ✅ 9.1, 9.2, 9.3, 9.4 | | |
 | 10. Polish | zoom, reader, context menu, favicons, audio, video codecs, fullscreen, region shots, shortcuts | | translate; spellcheck, PiP and DevTools blocked by CEF |
 | 11. Under the hood | throttling, crash recovery, memory caps | | GPU frame path, separate profiles |
+| 12. Jev sites | 12.1, 12.2, 12.3 | | 12.4, 12.5 |
 
 ## How the agent will see and drive pages
 
@@ -340,14 +341,19 @@ set path instead of starting from scratch each time.
 - Evals: `playbook-replay` (recorded searching "TUSQ nut", replayed for
   "bone nut" after a crash and restart, picks the bone result).
 
-### 8.3 Fast decisions (Jev) — ◐ partial (the slot)
+### 8.3 Fast decisions (Jev) — ✅ **COMPLETED**
 - Closed questions during replays ("Which search result matches?") go
   through the `Decider` trait, with the answer and confidence in the step
-  log. The built-in `WordMatch` stands in until Jev is wired in.
+  log. Jev (TypeSafe's decision model, `rail_browser::jev`) answers them when
+  a key is saved (keyring: service `agent-unibrow-models`, account `jev`, or
+  `JEV_API_KEY`); `WordMatch` stands in without one or if Jev can't be
+  reached. Test instances use Jev only with `UNIBROW_ALLOW_JEV=1`.
 
 ### 8.4 Long context (SubQ) — todo
 - Whole history, site maps and long pages in one context when a task
-  needs the big picture. Waiting on SubQ.
+  needs the big picture. The SubQ key saved so far (keyring account `subq`)
+  only allows `subq-snap-preview`, a decision model like Jev; the
+  long-context model (`subq-preview`) needs a key with access to it.
 
 ### 8.5 Falling off the map — ✅ **COMPLETED**
 - Before each step: is this the kind of page the recording was on? After
@@ -427,6 +433,57 @@ set path instead of starting from scratch each time.
 - **Renderer crash recovery**: "This page crashed" overlay with Reload, hung-page Wait/Stop, the agent is told — ✅ **COMPLETED**
 - **Separate profiles**: an isolated profile for agent experiments — todo
 - **Memory caps**: background tabs idle 30 min are discarded and reload when shown — ✅ **COMPLETED**
+
+---
+
+## Phase 12: Jev sites (requests on focus sites without Claude)
+
+Jev answers typed questions (pick one, yes/no, score) in a fraction of a
+second for a fraction of a cent. It doesn't write text, so it can't replace
+Claude everywhere; but most requests about a known shop are one of a few
+kinds, and each step of those is a closed question.
+
+### 12.1 Learn with Jev — ✅ **COMPLETED**
+- Focus → "Learn with Jev" on any focus site (or Relearn in its View).
+  The app explores the site in hidden pages; Jev makes every judgment:
+  which text box is the site's search (or the user's own searches there,
+  from history), which of the site's links names something to search for,
+  whether the page that comes back is search results, whether a result is
+  a product page, which link is the cart.
+- What it learns is saved per site (`jev_sites` table): the search address
+  with `{q}`, result and product URL patterns, whether product pages carry
+  price/stock data, the cart address, and a log of each finding with
+  Jev's probability. The Focus list shows "Jev ready: find · open · price ·
+  stock · cart"; the button switches Jev off and on for the site.
+
+### 12.2 Requests without Claude — ✅ **COMPLETED**
+- A message that names a Jev-ready site, or is sent while the page is on
+  one, goes to Jev first. One Jev call reads it: the kind of request
+  (find, price, stock, open, cart, or something else), which phrase of the
+  message names the product (a choice among its phrases), and whether it
+  means the product already open.
+- The app then does it in the user's tab: searches with the learned
+  address, lets Jev pick the matching result, opens it, reads price and
+  stock from the page's product data (Jev decides stock when the page
+  has none), and replies from a template, e.g. "Bone Jazz Bass nut is $9.50
+  on …, in stock." The chat notes "Answered by Jev · N decisions · no
+  Claude tokens".
+- Anything else (buying, comparing, reviews, questions, several things at
+  once), or a request Jev isn't sure about, goes to Claude, with a note
+  saying why. Claude is told what Jev answered meanwhile.
+- Evals: `jev-price`, `jev-find` (no agent calls at all), `jev-hands-off`
+  (a "which suits a 1962 Jazz Bass" question goes to Claude).
+
+### 12.3 Decisions in playbooks — ✅ **COMPLETED**
+- See 8.3: replays use Jev for "which result is it?".
+
+### 12.4 More request kinds — todo
+- Add to cart (with a confirmation card), reorder from order history,
+  track an order, a watch ("tell me when it drops") set up by Jev.
+
+### 12.5 Savings shown — todo
+- Tokens and cost per request on each focus site, with Jev and without,
+  in Focus → View.
 
 ---
 

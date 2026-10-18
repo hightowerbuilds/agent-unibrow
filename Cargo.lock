@@ -4667,6 +4667,7 @@ dependencies = [
  "futures",
  "keyring",
  "page-model",
+ "reqwest",
  "router",
  "serde",
  "serde_json",

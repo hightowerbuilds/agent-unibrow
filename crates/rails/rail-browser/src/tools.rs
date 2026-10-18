@@ -140,6 +140,7 @@ mod codes;
 mod forms;
 mod frames;
 mod history;
+mod jev_sites;
 mod injection;
 mod playbooks;
 mod pointer;
@@ -152,7 +153,8 @@ mod verify;
 
 pub use extract::watch_value;
 
-pub use playbooks::{Decider, WordMatch};
+pub use playbooks::{Decider, Decision, WordMatch};
+pub use jev_sites::{Handled, handle as jev_handle, learn as jev_learn, site_words as jev_site_words};
 
 /// The browser tools. Page-changing ones on focus sites are recorded in
 /// `store` for site maps and playbooks (Phase 8).

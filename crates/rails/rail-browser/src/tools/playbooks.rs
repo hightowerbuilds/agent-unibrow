@@ -12,8 +12,9 @@
 //!   to the model with what happened. Steps go through the same tools, so
 //!   anything that buys, sends or deletes still asks the user.
 //! - Closed choices along the way ("which search result matches?") go to a
-//!   [`Decider`], whose answer and confidence are reported. This is where a
-//!   fast decision model (Jev) plugs in; the default is a word-overlap match.
+//!   [`Decider`], whose answer and confidence are reported: Jev, TypeSafe's
+//!   decision model, when a key is set (see `crate::jev`), else a
+//!   word-overlap match.
 
 use super::{Browser, Click, History, Open, Press, Select, Type, check_keys, forms::FillForm, site};
 use crate::bridge::NavAction;
@@ -86,18 +87,25 @@ pub(super) fn refind(before: &[String], after: &[String], r: &str) -> Option<Str
     if count(before) != count(after) {
         return None;
     }
-    find(after, &t, "", &BTreeMap::new(), &WordMatch).filter(|f| f.confidence >= 1.0).map(|f| f.r)
+    find_by_words(after, &t, "", &BTreeMap::new()).filter(|f| f.confidence >= 1.0).map(|f| f.r)
 }
 
 // ------------------------------------------------------------ decisions (8.3)
 
-/// Answers closed questions inside known pages. A fast decision model (Jev)
+/// A [`Decider`]'s pick: which option, how sure, and who decided.
+#[derive(Clone, Debug)]
+pub struct Decision {
+    pub index: usize,
+    pub confidence: f32,
+    /// Shown in the step log, e.g. "Jev (jev-1.13.0)" or "word match".
+    pub by: String,
+}
+
+/// Answers closed questions inside known pages. Jev (`crate::jev`)
 /// implements this; [`WordMatch`] is the built-in stand-in.
 pub trait Decider: Send + Sync {
-    /// Shown in the trace with each decision.
-    fn name(&self) -> &'static str;
     /// Which option best matches `wanted`? `None` if none is close enough.
-    fn choose(&self, question: &str, wanted: &str, options: &[String]) -> Option<(usize, f32)>;
+    fn choose(&self, question: &str, wanted: &str, options: &[String]) -> BoxFuture<'static, Option<Decision>>;
 }
 
 /// Picks the option sharing the most words with what's wanted.
@@ -107,11 +115,8 @@ fn words(s: &str) -> Vec<String> {
     s.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 1).map(str::to_string).collect()
 }
 
-impl Decider for WordMatch {
-    fn name(&self) -> &'static str {
-        "word match"
-    }
-    fn choose(&self, _question: &str, wanted: &str, options: &[String]) -> Option<(usize, f32)> {
+impl WordMatch {
+    fn pick(&self, wanted: &str, options: &[String]) -> Option<Decision> {
         let want = words(wanted);
         if want.is_empty() {
             return None;
@@ -125,7 +130,14 @@ impl Decider for WordMatch {
                 best = Some((i, score));
             }
         }
-        best.filter(|(_, s)| *s >= 0.6)
+        best.filter(|(_, s)| *s >= 0.6).map(|(index, confidence)| Decision { index, confidence, by: "word match".into() })
+    }
+}
+
+impl Decider for WordMatch {
+    fn choose(&self, _question: &str, wanted: &str, options: &[String]) -> BoxFuture<'static, Option<Decision>> {
+        let d = self.pick(wanted, options);
+        Box::pin(async move { d })
     }
 }
 
@@ -137,19 +149,24 @@ struct Found {
     note: Option<String>,
 }
 
-fn find(lines: &[String], t: &Target, page: &str, values: &BTreeMap<String, String>, decider: &dyn Decider) -> Option<Found> {
-    let els = elements(lines);
+/// A step's element: found outright, or a question for a [`Decider`].
+enum Lookup<'a> {
+    Found(Found),
+    Ask { question: &'static str, wanted: String, candidates: Vec<&'a ElementLine> },
+}
+
+fn lookup<'a>(els: &'a [ElementLine], t: &Target, page: &str, values: &BTreeMap<String, String>) -> Lookup<'a> {
     let same_role: Vec<&ElementLine> = els.iter().filter(|e| e.role == t.role).collect();
     let by_params = t.matches_params && !values.is_empty();
     let exact: Vec<&&ElementLine> =
         if by_params { Vec::new() } else { same_role.iter().filter(|e| e.name == t.name).collect() };
     if !exact.is_empty() {
         let e = exact.get(t.nth).or(exact.last()).expect("not empty");
-        return Some(Found { r: e.r.clone(), confidence: 1.0, note: None });
+        return Lookup::Found(Found { r: e.r.clone(), confidence: 1.0, note: None });
     }
     if !by_params {
         if let Some(e) = same_role.iter().find(|e| e.name.eq_ignore_ascii_case(&t.name)) {
-            return Some(Found { r: e.r.clone(), confidence: 0.95, note: None });
+            return Lookup::Found(Found { r: e.r.clone(), confidence: 0.95, note: None });
         }
     }
     // The result for what's being searched now, or the recorded element
@@ -160,20 +177,72 @@ fn find(lines: &[String], t: &Target, page: &str, values: &BTreeMap<String, Stri
     } else {
         ("Which element is the recorded one?", t.name.clone())
     };
-    let names: Vec<String> = same_role.iter().map(|e| e.name.clone()).collect();
-    let (i, confidence) = decider.choose(question, &wanted, &names)?;
-    let e = same_role[i];
+    Lookup::Ask { question, wanted, candidates: same_role }
+}
+
+fn decided(question: &str, wanted: &str, candidates: &[&ElementLine], d: Option<Decision>) -> Option<Found> {
+    let d = d?;
+    let e = candidates.get(d.index)?;
     Some(Found {
         r: e.r.clone(),
-        confidence,
+        confidence: d.confidence,
         note: Some(format!(
             "{question} Picked {} “{}” for “{wanted}” ({}, confidence {:.2})",
-            e.role,
-            e.name,
-            decider.name(),
-            confidence
+            e.role, e.name, d.by, d.confidence
         )),
     })
+}
+
+async fn find(
+    lines: &[String],
+    t: &Target,
+    page: &str,
+    values: &BTreeMap<String, String>,
+    decider: &dyn Decider,
+) -> Option<Found> {
+    let els = elements(lines);
+    match lookup(&els, t, page, values) {
+        Lookup::Found(f) => Some(f),
+        Lookup::Ask { question, wanted, candidates } => {
+            let names: Vec<String> = candidates.iter().map(|e| e.name.clone()).collect();
+            let d = decider.choose(question, &wanted, &names).await;
+            decided(question, &wanted, &candidates, d)
+        }
+    }
+}
+
+/// [`find`] with the word match, without waiting on anything.
+fn find_by_words(lines: &[String], t: &Target, page: &str, values: &BTreeMap<String, String>) -> Option<Found> {
+    let els = elements(lines);
+    match lookup(&els, t, page, values) {
+        Lookup::Found(f) => Some(f),
+        Lookup::Ask { question, wanted, candidates } => {
+            let names: Vec<String> = candidates.iter().map(|e| e.name.clone()).collect();
+            decided(question, &wanted, &candidates, WordMatch.pick(&wanted, &names))
+        }
+    }
+}
+
+/// Where a step's element is now, noting any decision made.
+async fn locate(
+    lines: &[String],
+    t: &Target,
+    from: &str,
+    values: &BTreeMap<String, String>,
+    decider: &dyn Decider,
+    notes: &mut Vec<String>,
+) -> Result<String, String> {
+    match find(lines, t, from, values, decider).await {
+        Some(f) => {
+            match f.note {
+                Some(n) => notes.push(n),
+                None if f.confidence < 1.0 => notes.push(format!("Matched {} ignoring case", t.label())),
+                None => {}
+            }
+            Ok(f.r)
+        }
+        None => Err(format!("{} isn't on the page", t.label())),
+    }
 }
 
 // ------------------------------------------------------------ recording (8.1)
@@ -433,7 +502,7 @@ impl Tool for PlaybookRun {
             if pb.steps.len() > MAX_STEPS {
                 return Err(format!("Playbook “{}” has more than {MAX_STEPS} steps; it won't be replayed.", pb.name));
             }
-            let decider = WordMatch;
+            let decider = crate::jev::decider();
             let mut log: Vec<String> = Vec::new();
             let mut last: Option<ToolOutput> = None;
 
@@ -459,40 +528,28 @@ impl Tool for PlaybookRun {
                     Vec::new()
                 };
                 let mut notes: Vec<String> = Vec::new();
-                let mut locate = |t: &Target| -> Result<String, String> {
-                    match find(&lines, t, &step.from, &values, &decider) {
-                        Some(f) => {
-                            match f.note {
-                                Some(n) => notes.push(n),
-                                None if f.confidence < 1.0 => notes.push(format!("Matched {} ignoring case", t.label())),
-                                None => {}
-                            }
-                            Ok(f.r)
-                        }
-                        None => Err(format!("{} isn't on the page", t.label())),
-                    }
+                let target = match &step.target {
+                    Some(t) => locate(&lines, t, &step.from, &values, &*decider, &mut notes).await,
+                    None => Err("the step has no target".to_string()),
                 };
+                let mut fields = Vec::new();
+                for (t, v) in &step.fields {
+                    fields.push(locate(&lines, t, &step.from, &values, &*decider, &mut notes).await.map(|r| json!({"ref": r, "value": v})));
+                }
                 let call: Result<(Arc<dyn Tool>, Value), String> = match step.action.as_str() {
                     "open" => Ok((Arc::new(Open(b.clone())), json!({"url": step.value.clone().unwrap_or_default()}))),
                     "back" => Ok((Arc::new(History(b.clone(), NavAction::Back)), json!({}))),
                     "press" => Ok((Arc::new(Press(b.clone())), json!({"keys": step.value.clone().unwrap_or_default()}))),
-                    "click" => step
-                        .target
-                        .as_ref()
-                        .ok_or_else(|| "the step has no target".to_string())
-                        .and_then(|t| locate(t))
-                        .map(|r| (Arc::new(Click(b.clone())) as Arc<dyn Tool>, json!({"ref": r}))),
-                    "type" => step.target.as_ref().ok_or_else(|| "the step has no target".to_string()).and_then(|t| locate(t)).map(|r| {
+                    "click" => target.map(|r| (Arc::new(Click(b.clone())) as Arc<dyn Tool>, json!({"ref": r}))),
+                    "type" => target.map(|r| {
                         let args = json!({"ref": r, "text": step.value.clone().unwrap_or_default(), "submit": step.submit});
                         (Arc::new(Type(b.clone())) as Arc<dyn Tool>, args)
                     }),
-                    "select" => step.target.as_ref().ok_or_else(|| "the step has no target".to_string()).and_then(|t| locate(t)).map(|r| {
+                    "select" => target.map(|r| {
                         (Arc::new(Select(b.clone())) as Arc<dyn Tool>, json!({"ref": r, "option": step.value.clone().unwrap_or_default()}))
                     }),
-                    "fill" => step
-                        .fields
-                        .iter()
-                        .map(|(t, v)| locate(t).map(|r| json!({"ref": r, "value": v})))
+                    "fill" => fields
+                        .into_iter()
                         .collect::<Result<Vec<_>, _>>()
                         .map(|fields| (Arc::new(FillForm(b.clone())) as Arc<dyn Tool>, json!({"fields": fields}))),
                     other => Err(format!("unknown step `{other}`")),
@@ -620,7 +677,7 @@ mod tests {
         let t = target_for(&lines(), "e30").unwrap();
         assert!(!t.matches_params);
         assert_eq!((t.role.as_str(), t.name.as_str(), t.nth), ("button", "Add to cart", 1));
-        let f = find(&lines(), &t, "/item", &BTreeMap::new(), &WordMatch).unwrap();
+        let f = find_by_words(&lines(), &t, "/item", &BTreeMap::new()).unwrap();
         assert_eq!((f.r.as_str(), f.confidence), ("e30", 1.0));
     }
 
@@ -646,12 +703,12 @@ mod tests {
         let t = Target { role: "link".into(), name: "TUSQ XL Jazz Bass nut".into(), nth: 0, matches_params: true };
         let mut values = BTreeMap::new();
         values.insert("query".to_string(), "bone jazz nut".to_string());
-        let f = find(&lines(), &t, "/search?q", &values, &WordMatch).unwrap();
+        let f = find_by_words(&lines(), &t, "/search?q", &values).unwrap();
         assert_eq!(f.r, "e24");
         assert!(f.note.unwrap().contains("Which search result matches?"));
         // Nothing close: no guess.
         values.insert("query".to_string(), "brass saddle".to_string());
-        assert!(find(&lines(), &t, "/search?q", &values, &WordMatch).is_none());
+        assert!(find_by_words(&lines(), &t, "/search?q", &values).is_none());
     }
 
     #[test]

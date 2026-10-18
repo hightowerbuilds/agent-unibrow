@@ -20,5 +20,6 @@ router.workspace = true
 browsing.workspace = true
 page-model.workspace = true
 keyring.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 chrono.workspace = true

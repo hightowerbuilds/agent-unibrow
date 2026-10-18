@@ -14,6 +14,7 @@
 //! The store is `Send + Sync`: the UI writes visits, agent tools read.
 
 pub mod favicons;
+pub mod jev_sites;
 pub mod sitemap;
 mod tools;
 
@@ -236,6 +237,7 @@ impl Browsing {
         )
         .map_err(|e| format!("can't set up the history database: {e}"))?;
         sitemap::init(&conn).map_err(|e| format!("can't set up site maps: {e}"))?;
+        jev_sites::init(&conn).map_err(|e| format!("can't set up Jev sites: {e}"))?;
         favicons::init(&conn).map_err(|e| format!("can't set up site icons: {e}"))?;
         Ok(Self { conn: Mutex::new(conn), favicon_version: Default::default() })
     }

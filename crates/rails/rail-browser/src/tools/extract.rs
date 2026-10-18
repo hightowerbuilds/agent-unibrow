@@ -33,13 +33,13 @@ pub(super) fn tools(b: Arc<Browser>) -> Vec<Arc<dyn Tool>> {
 
 /// A hidden page the tool owns. Closes when dropped, including when the
 /// agent's turn is stopped mid-call.
-struct BgPage {
+pub(super) struct BgPage {
     bridge: BrowserBridge,
     id: u32,
 }
 
 impl BgPage {
-    async fn open(bridge: &BrowserBridge, url: &str) -> Result<Self, String> {
+    pub(super) async fn open(bridge: &BrowserBridge, url: &str) -> Result<Self, String> {
         let id = bridge.bg_open(url).await?;
         let page = BgPage { bridge: bridge.clone(), id };
         page.settle(LOAD_TIMEOUT).await?;
@@ -58,11 +58,25 @@ impl BgPage {
         Ok(page)
     }
 
-    async fn eval(&self, args: Value) -> Result<Value, String> {
+    pub(super) async fn eval(&self, args: Value) -> Result<Value, String> {
         run_js(&self.bridge, Some(self.id), args).await
     }
 
-    async fn navigate(&self, url: &str) -> Result<(), String> {
+    /// Runs a JavaScript expression in the page and returns its value.
+    pub(super) async fn eval_expr(&self, expression: &str) -> Result<Value, String> {
+        let r = self
+            .bridge
+            .bg_cdp(self.id, "Runtime.evaluate", json!({"expression": expression, "returnByValue": true, "timeout": 10000}))
+            .await?;
+        Ok(r["result"]["value"].clone())
+    }
+
+    /// The address the page is on now (after redirects).
+    pub(super) async fn url(&self) -> Result<String, String> {
+        Ok(self.bridge.bg_state(self.id).await?.url)
+    }
+
+    pub(super) async fn navigate(&self, url: &str) -> Result<(), String> {
         self.bridge.bg_cdp(self.id, "Page.navigate", json!({"url": url})).await?;
         self.settle(LOAD_TIMEOUT).await
     }
@@ -120,7 +134,7 @@ impl Drop for BgPage {
 }
 
 /// Runs one extraction mode in a page (`None` = the user's active tab).
-async fn run_js(bridge: &BrowserBridge, page: Option<u32>, args: Value) -> Result<Value, String> {
+pub(super) async fn run_js(bridge: &BrowserBridge, page: Option<u32>, args: Value) -> Result<Value, String> {
     let params = json!({
         "expression": format!("({EXTRACT_JS})({args})"),
         "returnByValue": true,

@@ -136,6 +136,18 @@ const FOCUS: &[Section] = &[
         ])],
     },
     Section {
+        title: "Jev: answers without Claude",
+        blocks: &[Block::Bullets(&[
+            "Learn with Jev, next to a focus site, has Jev (a fast decision model) explore the site in the \
+             background: its search, its results, its product pages, its cart.",
+            "After that, ask about the site (\"how much is the bone jazz bass nut on sweetwater?\", \"find brass \
+             bass nuts\", \"is this in stock?\") and Jev handles it in a second or two, without Claude.",
+            "Jev handles finding, opening, prices, stock and the cart. Anything else, or anything it's unsure \
+             of, goes to Claude, and the chat says so.",
+            "The Jev button on the site turns it off and on. View shows what it learned.",
+        ])],
+    },
+    Section {
         title: "Playbooks: your focus sites, learned",
         blocks: &[Block::Bullets(&[
             "On focus sites the agent keeps a map: the kinds of pages, the buttons and fields it uses there, and how \

@@ -217,7 +217,7 @@ def run_case(case, port, workdir: Path, site: Path, tls_port=None):
     )
     if case.get("task"):
         env["UNIBROW_AUTOSEND"] = fill(case["task"])
-    env.update({k: str(v) for k, v in case.get("env", {}).items()})
+    env.update({k: fill(str(v)) for k, v in case.get("env", {}).items()})
     if "policy" in case:
         data.mkdir(parents=True, exist_ok=True)
         (data / "policy.json").write_text(json.dumps(case["policy"]))
@@ -337,6 +337,8 @@ def check(case, trace, data: Path, seconds, log_path=None):
     for t in exp.get("tools_not", []):
         if t in calls:
             failures.append(f"{t} was called but shouldn't be")
+    if exp.get("no_tool_calls") and calls:
+        failures.append(f"the agent was used ({', '.join(calls)}) but Jev should have handled it")
     if exp.get("approval_requested") and not any(e.get("kind") == "approval_requested" for e in trace):
         failures.append("no approval was requested")
     for secret in exp.get("never_seen", []):

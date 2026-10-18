@@ -11,6 +11,7 @@
 //! CEF callbacks arrive there too and the view state needs no locking.
 
 pub mod bridge;
+pub mod jev;
 mod handlers;
 pub mod keys;
 pub mod permissions;

@@ -7,6 +7,7 @@
 mod browser_pane;
 mod chat_tools;
 mod explained;
+mod jev_worker;
 mod safety;
 mod site_icons;
 mod task_plan;
@@ -182,6 +183,15 @@ struct Shell {
     /// Start the next agent without resuming the saved conversation (the
     /// API model changed, and a conversation can't move between models).
     skip_resume: bool,
+    /// Jev (Phase 11): learning focus sites and handling requests about them.
+    jev_jobs: async_channel::Sender<jev_worker::Job>,
+    /// The latest learning line per site, while it learns.
+    jev_progress: std::collections::HashMap<String, String>,
+    /// The request Jev is working on: (id, text, site).
+    jev_pending: Option<(u64, String, String)>,
+    jev_next_id: u64,
+    /// Requests Jev answered, for Claude's context with the next message.
+    jev_context: Vec<String>,
     /// A chat whose Delete was clicked once and awaits the confirm click.
     confirm_delete: Option<chats::ChatId>,
     /// Rename, search and export (chat_tools.rs).
@@ -244,6 +254,7 @@ impl Shell {
             t
         });
         let (bridge, requests) = rail_browser::bridge::channel();
+        let (jev_jobs, jev_events) = jev_worker::spawn(store.clone(), bridge.clone());
         let browser = cx.new(|cx| BrowserPane::new(cef, store.clone(), requests, window, cx));
         let control_sub = cx.subscribe(&browser, |this: &mut Self, _, ev: &AgentControl, cx| match ev {
             AgentControl::Stop => this.stop_agent("Stopped.", cx),
@@ -298,6 +309,11 @@ impl Shell {
             model_menu_agent: None,
             opencode_models: None,
             skip_resume: false,
+            jev_jobs,
+            jev_progress: Default::default(),
+            jev_pending: None,
+            jev_next_id: 1,
+            jev_context: Vec::new(),
             confirm_delete: None,
             chat_tools,
             items,
@@ -347,6 +363,14 @@ impl Shell {
             }
         })
         .detach();
+        cx.spawn(async move |this, cx| {
+            while let Ok(ev) = jev_events.recv().await {
+                if this.update(cx, |s, cx| s.jev_event(ev, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         shell.start_backend(cx);
         // Test hook: press Stop this many seconds after the first message.
         if let Some(secs) = std::env::var("UNIBROW_AUTOSTOP_SECS").ok().and_then(|s| s.parse::<u64>().ok()) {
@@ -378,9 +402,27 @@ impl Shell {
                 .detach();
             }
         }
+        // Test hook (isolated test instances only): learn a site with Jev
+        // first, as "site|start address"; an automatic task waits for it.
+        let jev_learn = std::env::var("UNIBROW_TEST_JEV_LEARN")
+            .ok()
+            .filter(|_| std::env::var_os("UNIBROW_DATA_DIR").is_some())
+            .and_then(|v| v.split_once('|').map(|(a, b)| (a.to_string(), b.to_string())));
+        if let Some((site, start)) = jev_learn.clone() {
+            shell.learn_with_jev_from(site, Some(start), cx);
+        }
         // Test hook: send a task automatically once the page has loaded.
         if let Ok(task) = std::env::var("UNIBROW_AUTOSEND") {
+            let learning = jev_learn.map(|(site, _)| site);
             cx.spawn(async move |this, cx| {
+                if let Some(site) = learning {
+                    for _ in 0..720 {
+                        cx.background_executor().timer(std::time::Duration::from_millis(250)).await;
+                        if !this.update(cx, |s, _| s.jev_progress.contains_key(&site)).unwrap_or(false) {
+                            break;
+                        }
+                    }
+                }
                 for _ in 0..80 {
                     cx.background_executor().timer(std::time::Duration::from_millis(250)).await;
                     let ready = this
@@ -490,6 +532,86 @@ impl Shell {
         cx.notify();
     }
 
+    /// The Jev-ready site a request is about: one it names, or the one the
+    /// page is on.
+    fn jev_route(&self, text: &str, cx: &mut Context<Self>) -> Option<browsing::jev_sites::JevSite> {
+        let ready: Vec<_> = self.store.jev_sites().into_iter().filter(|s| s.ready()).collect();
+        if ready.is_empty() {
+            return None;
+        }
+        let words: Vec<String> =
+            text.to_lowercase().split(|c: char| !c.is_alphanumeric() && c != '.' && c != '-').map(str::to_string).collect();
+        let named = ready.iter().find(|s| {
+            rail_browser::tools::jev_site_words(&s.site).iter().any(|w| words.iter().any(|t| t == w || t.starts_with(&format!("{w}."))))
+        });
+        if let Some(s) = named {
+            return Some(s.clone());
+        }
+        let (url, _) = self.browser.read(cx).location();
+        let here = site_of(&url)?;
+        let here = here.trim_start_matches("www.");
+        ready.into_iter().find(|s| s.site == here)
+    }
+
+    fn learn_with_jev(&mut self, site: String, cx: &mut Context<Self>) {
+        self.learn_with_jev_from(site, None, cx);
+    }
+
+    fn learn_with_jev_from(&mut self, site: String, start: Option<String>, cx: &mut Context<Self>) {
+        self.jev_progress.insert(site.clone(), "Starting…".into());
+        self.trace.push(Kind::Info, format!("Jev is learning {site}"), None);
+        let _ = self.jev_jobs.try_send(jev_worker::Job::Learn { site, start });
+        cx.notify();
+    }
+
+    fn jev_event(&mut self, ev: jev_worker::Event, cx: &mut Context<Self>) {
+        use jev_worker::Event;
+        match ev {
+            Event::Progress { site, line } => {
+                self.trace.push(Kind::Info, format!("Jev · {site}: {line}"), None);
+                self.jev_progress.insert(site, line);
+            }
+            Event::Learned { site, result } => {
+                self.jev_progress.remove(&site);
+                let line = match result {
+                    Ok(abilities) => format!("Jev learned {site}. It can now {} there without Claude.", abilities.join(", ")),
+                    Err(e) => format!("Jev couldn't learn {site}: {e}"),
+                };
+                self.trace.push(Kind::Info, line.clone(), None);
+                self.notice(line);
+            }
+            Event::Answer { id, text, calls, secs } => {
+                let Some((_, asked, site)) = self.jev_pending.take().filter(|p| p.0 == id) else { return };
+                self.push(ItemKind::Assistant, text.clone());
+                self.push(
+                    ItemKind::Note,
+                    format!("Answered by Jev on {site} · {calls} decisions · {secs:.1} s · no Claude tokens"),
+                );
+                self.trace.push(
+                    Kind::Assistant,
+                    format!("Turn finished (jev, {calls} calls, {secs:.1} s on {site})"),
+                    Some(format!("{text}\n\nmodel: jev")),
+                );
+                self.jev_context.push(format!("User: {asked}\nApp: {text}"));
+                self.set_busy(false, "", cx);
+                self.scroll_to_bottom();
+            }
+            Event::Fallback { id, reason } => {
+                let Some((_, asked, _)) = self.jev_pending.take().filter(|p| p.0 == id) else { return };
+                self.set_busy(false, "", cx);
+                self.push(ItemKind::Note, format!("Jev: {reason}. Passing this to Claude."));
+                self.trace.push(Kind::Info, format!("Jev passed to Claude: {reason}"), None);
+                if self.agent.is_some() {
+                    self.send_to_agent(asked, cx);
+                } else {
+                    self.push(ItemKind::Error, "No agent is running to take it.".into());
+                }
+                self.scroll_to_bottom();
+            }
+        }
+        cx.notify();
+    }
+
     /// Ends the running agent before another starts.
     fn end_agent(&mut self, cx: &mut Context<Self>) {
         // Dropping the handle ends the old agent; dropping pending approval
@@ -584,6 +706,28 @@ impl Shell {
             self.start_agent(Some(text), cx);
             return;
         }
+        if self.jev_pending.is_some() {
+            self.notice("Jev is still on your last request. One moment.".into());
+            cx.notify();
+            return;
+        }
+        if !self.busy {
+            if let Some(site) = self.jev_route(&text, cx) {
+                self.can_continue = false;
+                self.chat_list_open = false;
+                self.push(ItemKind::User, text.clone());
+                self.trace.push(Kind::User, first_line(&text), Some(text.clone()));
+                let id = self.jev_next_id;
+                self.jev_next_id += 1;
+                self.trace.push(Kind::Info, format!("Jev handling a request on {}", site.site), None);
+                self.jev_pending = Some((id, text.clone(), site.site.clone()));
+                let _ = self.jev_jobs.try_send(jev_worker::Job::Handle { id, site, text });
+                self.set_busy(true, "Jev is on it…", cx);
+                self.scroll_to_bottom();
+                cx.notify();
+                return;
+            }
+        }
         if self.agent.is_none() {
             return;
         }
@@ -619,6 +763,12 @@ impl Shell {
         // An unfinished task plan: say where it stands (7.4).
         if let Some(line) = self.chats.plan_reminder(self.chat_id) {
             message = format!("{line}\n{message}");
+        }
+        if !self.jev_context.is_empty() {
+            message = format!(
+                "[The app answered these on its own with Jev, before this message:]\n{}\n[End.]\n\n{message}",
+                std::mem::take(&mut self.jev_context).join("\n")
+            );
         }
         if let Some(recap) = self.pending_recap.take() {
             message = format!(
@@ -707,6 +857,14 @@ impl Shell {
     /// over the page).
     fn stop_agent(&mut self, note: &str, cx: &mut Context<Self>) {
         if !self.busy {
+            return;
+        }
+        // Jev's request: its answer is dropped when it arrives.
+        if self.jev_pending.take().is_some() {
+            self.push(ItemKind::System, "Stopped.".into());
+            self.trace.push(Kind::Info, "Stopped Jev's request".to_string(), None);
+            self.set_busy(false, "", cx);
+            cx.notify();
             return;
         }
         if let Some(agent) = &self.agent {
@@ -1385,8 +1543,46 @@ impl Shell {
         let safety = self.render_safety(cx).into_any_element();
         let logins = self.render_logins(cx).into_any_element();
         let watches = self.render_watches(cx).into_any_element();
+        let jev: std::collections::HashMap<String, browsing::jev_sites::JevSite> =
+            self.store.jev_sites().into_iter().map(|j| (j.site.clone(), j)).collect();
         let rows = sites.into_iter().map(|f| {
             let site = f.site.clone();
+            let key = f.site.trim_start_matches("www.").to_ascii_lowercase();
+            let learned = jev.get(&key).cloned();
+            let progress = self.jev_progress.get(&key).cloned();
+            let jev_line: Option<String> = match (&progress, &learned) {
+                (Some(p), _) => Some(format!("Jev learning: {p}")),
+                (None, Some(j)) if j.status == "ready" && j.enabled => {
+                    Some(format!("Jev ready: {}", j.skills.abilities().join(" · ")))
+                }
+                (None, Some(j)) if j.status == "ready" => Some("Jev off for this site".into()),
+                (None, Some(j)) if j.status == "failed" => Some("Jev couldn't learn this site".into()),
+                _ => None,
+            };
+            let (jev_label, jev_on) = match (&progress, &learned) {
+                (Some(_), _) => ("Learning…", true),
+                (None, Some(j)) if j.status == "ready" && j.enabled => ("Jev ✓", true),
+                (None, Some(j)) if j.status == "ready" => ("Jev off", false),
+                (None, Some(j)) if j.status == "failed" => ("Retry Jev", false),
+                _ => ("Learn with Jev", false),
+            };
+            let jev_button = Self::small_button(SharedString::from(format!("focus-jev-{}", f.site)), jev_label, jev_on)
+                .on_click(cx.listener({
+                    let (key, learning) = (key.clone(), progress.is_some());
+                    let state = learned.as_ref().map(|j| (j.status.clone(), j.enabled));
+                    move |this, _, _, cx| {
+                        if learning {
+                            return;
+                        }
+                        match &state {
+                            Some((status, enabled)) if status == "ready" => {
+                                this.store.set_jev_enabled(&key, !enabled);
+                                cx.notify();
+                            }
+                            _ => this.learn_with_jev(key.clone(), cx),
+                        }
+                    }
+                }));
             div()
                 .id(SharedString::from(format!("focus-{}", f.site)))
                 .flex()
@@ -1410,8 +1606,10 @@ impl Shell {
                                 .text_color(rgb(theme::MUTED))
                                 .truncate()
                                 .child(format!("{} · added {}", f.label, f.added.format("%b %-d"))),
-                        ),
+                        )
+                        .children(jev_line.map(|l| div().text_xs().text_color(rgb(theme::ACCENT)).truncate().child(l))),
                 )
+                .child(jev_button)
                 .child(
                     Self::small_button(SharedString::from(format!("focus-view-{}", f.site)), "View", false).on_click(
                         cx.listener({
@@ -1525,6 +1723,63 @@ impl Shell {
                     )))
                     .child(div().flex_1().text_sm().text_color(rgb(theme::FG)).child(map.site.clone())),
             );
+
+        col = col.child(heading("JEV"));
+        let key = site.trim_start_matches("www.").to_ascii_lowercase();
+        match (self.jev_progress.get(&key), self.store.jev_site(&key)) {
+            (Some(p), _) => col = col.child(muted(format!("Learning… {p}"))),
+            (None, None) => {
+                col = col.child(muted(
+                    "Not learned yet. Learn with Jev explores the site in the background so Jev can handle requests \
+                     about it (find, price, stock, open, cart) without Claude."
+                        .into(),
+                ));
+            }
+            (None, Some(j)) => {
+                let status = match (j.status.as_str(), j.enabled) {
+                    ("ready", true) => format!("Ready: {}", j.skills.abilities().join(" · ")),
+                    ("ready", false) => "Learned, but off: requests go to Claude".to_string(),
+                    _ => "Learning failed".to_string(),
+                };
+                col = col.child(div().text_sm().text_color(rgb(theme::FG)).child(status));
+                for (label, value) in [
+                    ("Search", j.skills.search_url.clone()),
+                    ("Results", j.skills.result_pattern.clone()),
+                    ("Products", j.skills.product_pattern.clone()),
+                    ("Cart", j.skills.cart_url.clone()),
+                ] {
+                    col = col.child(muted(format!("{label}: {}", value.unwrap_or_else(|| "—".into()))));
+                }
+                for line in &j.log {
+                    col = col.child(div().pl_2().text_xs().text_color(rgb(theme::MUTED)).child(format!("· {line}")));
+                }
+            }
+        }
+        {
+            let (k1, k2) = (key.clone(), key.clone());
+            let learned = self.store.jev_site(&key).is_some();
+            col = col.child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Self::small_button("site-jev-learn".into(), if learned { "Relearn" } else { "Learn with Jev" }, false)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if !this.jev_progress.contains_key(&k1) {
+                                    this.learn_with_jev(k1.clone(), cx);
+                                }
+                            })),
+                    )
+                    .when(learned, |d| {
+                        d.child(Self::small_button("site-jev-forget".into(), "Forget", false).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.store.remove_jev_site(&k2);
+                                cx.notify();
+                            },
+                        )))
+                    }),
+            );
+        }
 
         col = col.child(heading("PLAYBOOKS"));
         if map.playbooks.is_empty() {

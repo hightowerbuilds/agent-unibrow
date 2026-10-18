@@ -1,0 +1,657 @@
+//! Jev sites (roadmap Phase 11): focus sites that Jev has learned, so the
+//! app can handle requests about them without Claude.
+//!
+//! - [`learn`] explores a site in hidden pages and lets Jev make every
+//!   judgment call: which box is the search, whether a page is search
+//!   results, what a result and a product page look like, which link is the
+//!   cart. What it finds is saved with the site (`browsing::jev_sites`).
+//! - [`handle`] answers a request about a learned site. One Jev call reads
+//!   the request: what kind it is (find, price, stock, open, cart, or
+//!   something else) and which words name the product. The app then does it
+//!   and answers from a template. Anything Jev can't do, or isn't sure of,
+//!   is handed back for Claude.
+//!
+//! Jev answers typed questions only (pick one, yes/no); it never writes
+//! text, so every reply here is the app's own wording around what it read
+//! from the page.
+
+use super::Browser;
+use super::extract::{BgPage, run_js};
+use crate::BrowserBridge;
+use crate::jev::Jev;
+use browsing::jev_sites::{JevSite, JevSkills};
+use browsing::sitemap::{page_kind, url_pattern};
+use browsing::{Browsing, HistoryQuery};
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+/// Query keys that carry the search words.
+const QUERY_KEYS: &[&str] = &[
+    "q", "k", "query", "s", "search", "keyword", "keywords", "term", "searchterm", "search_query", "text", "w", "st", "kw",
+    "ntt", "searchtext",
+];
+
+/// Lists the page's text inputs that look like they take a search.
+const FORMS_JS: &str = r#"(() => {
+  const vis = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const out = [];
+  for (const i of document.querySelectorAll('input')) {
+    const t = (i.getAttribute('type') || 'text').toLowerCase();
+    if (!['search', 'text'].includes(t) || !i.name) continue;
+    const f = i.form;
+    const label = (i.labels && i.labels[0] && i.labels[0].innerText) || '';
+    out.push({
+      name: i.name, placeholder: i.placeholder || '', aria: i.getAttribute('aria-label') || '',
+      label: label.trim().slice(0, 80), type: t, visible: vis(i),
+      action: f ? (f.getAttribute('action') ? f.action : location.href) : '',
+      method: f ? (f.getAttribute('method') || 'get').toLowerCase() : '',
+    });
+    if (out.length >= 40) break;
+  }
+  return out;
+})()"#;
+
+fn s<'a>(v: &'a Value, k: &str) -> &'a str {
+    v[k].as_str().unwrap_or("")
+}
+
+// ------------------------------------------------------------ learning
+
+/// The search address in a URL like `/search?q=tusq+nut`, with `{q}` for
+/// the words, and the words searched.
+fn template_from(url: &str) -> Option<(String, String)> {
+    let u = url::Url::parse(url).ok()?;
+    let (key, val) = u
+        .query_pairs()
+        .find(|(k, v)| QUERY_KEYS.contains(&k.to_ascii_lowercase().as_str()) && v.chars().any(char::is_alphabetic))?;
+    let mut base = u.clone();
+    base.set_query(None);
+    base.set_fragment(None);
+    Some((format!("{base}?{key}={{q}}"), val.to_string()))
+}
+
+/// Ways to search the site, best first: from the user's own searches there,
+/// from its search box (Jev picks which box), then common addresses.
+async fn search_candidates(
+    page: &BgPage,
+    store: &Browsing,
+    jev: &Jev,
+    site: &str,
+    home: &str,
+    log: &mut Vec<String>,
+) -> (Vec<String>, Option<String>) {
+    let mut out: Vec<String> = Vec::new();
+    let mut query = None;
+    let visits = store.history(&HistoryQuery { site: Some(site.to_string()), limit: 300, ..Default::default() });
+    for v in &visits {
+        if page_kind(&url_pattern(&v.url), &v.title) != "search" {
+            continue;
+        }
+        if let Some((t, q)) = template_from(&v.url) {
+            if !out.contains(&t) {
+                log.push(format!("Search: found one of your searches here (“{q}”)"));
+                query.get_or_insert(q);
+                out.push(t);
+            }
+        }
+    }
+    let inputs = page.eval_expr(FORMS_JS).await.ok().and_then(|v| v.as_array().cloned()).unwrap_or_default();
+    let usable: Vec<&Value> = inputs.iter().filter(|i| s(i, "method") == "get" && !s(i, "action").is_empty()).collect();
+    if !usable.is_empty() {
+        let options: Vec<String> = usable
+            .iter()
+            .map(|i| {
+                format!(
+                    "input name={} placeholder=“{}” label=“{}” aria=“{}” type={}{} (form goes to {})",
+                    s(i, "name"),
+                    s(i, "placeholder"),
+                    s(i, "label"),
+                    s(i, "aria"),
+                    s(i, "type"),
+                    if i["visible"].as_bool() == Some(true) { "" } else { ", hidden" },
+                    s(i, "action")
+                )
+            })
+            .collect();
+        let pick = jev
+            .choose_best(
+                &format!("Text boxes on the home page of {site}"),
+                "Which of these is the site's main search box, for searching its products or content?",
+                &options,
+            )
+            .await
+            .ok()
+            .flatten();
+        let mut ordered: Vec<&Value> = Vec::new();
+        if let Some((i, conf)) = pick {
+            log.push(format!("Search: Jev picked the search box “{}” (confidence {conf:.2})", s(usable[i], "name")));
+            ordered.push(usable[i]);
+        }
+        ordered.extend(usable.iter().filter(|i| QUERY_KEYS.contains(&s(i, "name").to_ascii_lowercase().as_str())));
+        for i in ordered {
+            let t = format!("{}?{}={{q}}", s(i, "action").split(['?', '#']).next().unwrap_or(""), s(i, "name"));
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        }
+    }
+    if let Ok(u) = url::Url::parse(home) {
+        let origin = u.origin().ascii_serialization();
+        for path in ["/search?q={q}", "/s?k={q}", "/search?query={q}"] {
+            let t = format!("{origin}{path}");
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        }
+    }
+    (out, query)
+}
+
+/// One search result as the page lists it.
+#[derive(Clone, Debug)]
+struct Result_ {
+    title: String,
+    url: String,
+    price: String,
+}
+
+fn results_of(v: &Value) -> Vec<Result_> {
+    v["items"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|i| Result_ { title: s(i, "title").into(), url: s(i, "url").into(), price: s(i, "price").into() })
+                .filter(|r| !r.title.is_empty() && r.url.starts_with("http"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn results_text(results: &[Result_], max: usize) -> String {
+    results
+        .iter()
+        .take(max)
+        .enumerate()
+        .map(|(i, r)| if r.price.is_empty() { format!("{}. {}", i + 1, r.title) } else { format!("{}. {} — {}", i + 1, r.title, r.price) })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The URL pattern most results share.
+fn result_pattern(results: &[Result_]) -> Option<String> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for r in results {
+        *counts.entry(url_pattern(&r.url)).or_default() += 1;
+    }
+    counts.into_iter().filter(|(_, n)| *n >= 2).max_by_key(|(_, n)| *n).map(|(p, _)| p)
+}
+
+/// Learns `site`: its search, results, product pages and cart. `progress`
+/// gets a line per finding. Errors only when nothing usable was learned.
+pub async fn learn(
+    bridge: &BrowserBridge,
+    store: &Browsing,
+    jev: &Jev,
+    site: &str,
+    start: Option<&str>,
+    progress: &(dyn Fn(String) + Send + Sync),
+) -> Result<(JevSkills, Vec<String>), String> {
+    let mut log: Vec<String> = Vec::new();
+    let say = |log: &mut Vec<String>, line: String| {
+        progress(line.clone());
+        log.push(line);
+    };
+    let start = start.map(str::to_string).unwrap_or_else(|| format!("https://{site}/"));
+    let page = BgPage::open(bridge, &start).await?;
+    let home = page.url().await.unwrap_or(start);
+    let mut skills = JevSkills { home: home.clone(), ..Default::default() };
+    say(&mut log, format!("Opened {home}"));
+    let home_links = page.eval(json!({"mode": "links", "max_links": 400})).await.unwrap_or_default();
+    let links: Vec<(String, String, String)> = home_links["links"]
+        .as_array()
+        .map(|a| a.iter().map(|l| (s(l, "text").to_string(), s(l, "url").to_string(), s(l, "area").to_string())).collect())
+        .unwrap_or_default();
+
+    // Search.
+    let mut found_log = Vec::new();
+    let (candidates, history_query) = search_candidates(&page, store, jev, site, &home, &mut found_log).await;
+    for l in found_log {
+        say(&mut log, l);
+    }
+    // Things to search for: the user's own search here, then what the
+    // site's links name (Jev's pick of a product first).
+    let title = s(&home_links, "title").to_lowercase();
+    let mut queries: Vec<String> = history_query.into_iter().collect();
+    let options: Vec<String> = links
+        .iter()
+        .filter(|(_, _, area)| area == "main" || area == "nav")
+        .map(|(t, _, _)| t.split_whitespace().take(4).collect::<Vec<_>>().join(" "))
+        .filter(|t| {
+            let n = t.split_whitespace().count();
+            let l = t.to_lowercase();
+            (1..=4).contains(&n)
+                && t.chars().any(char::is_alphabetic)
+                && !t.chars().any(|c| c.is_ascii_digit())
+                && !title.contains(&l)
+                && !site_words(site).iter().any(|w| l.contains(w.as_str()))
+        })
+        .take(200)
+        .collect();
+    if let Ok(Some((i, _))) = jev
+        .choose_best(
+            &format!("Links on the home page of {site} (“{}”)", s(&home_links, "title")),
+            "Which of these names a kind of product sold on this site, something a shopper might search for?",
+            &options,
+        )
+        .await
+    {
+        queries.push(options[i].clone());
+    }
+    for o in &options {
+        if queries.len() >= 4 {
+            break;
+        }
+        if !queries.contains(o) {
+            queries.push(o.clone());
+        }
+    }
+    if queries.is_empty() {
+        queries.push("gift".into());
+    }
+    let mut results: Vec<Result_> = Vec::new();
+    let mut tried = 0;
+    'search: for t in candidates.iter().take(5) {
+        for query in &queries {
+            if tried >= 10 {
+                break 'search;
+            }
+            tried += 1;
+        let url = t.replace("{q}", &url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>());
+        if page.navigate(&url).await.is_err() {
+            continue 'search;
+        }
+        let found = results_of(&page.eval(json!({"mode": "items", "max_items": 30})).await.unwrap_or_default());
+        if found.len() < 2 {
+            continue;
+        }
+        let p = jev
+            .yes(
+                &format!("A page on {site} titled “{}”. It lists:\n{}", page.url().await.unwrap_or_default(), results_text(&found, 8)),
+                &format!("Is this a page of search results for “{query}”?"),
+            )
+            .await
+            .unwrap_or(0.0);
+        if p >= 0.5 {
+            say(&mut log, format!("Search: {t} gives results for “{query}” (Jev {p:.2})"));
+            skills.search_url = Some(t.clone());
+            skills.sample_query = query.clone();
+            results = found;
+            break 'search;
+        }
+        say(&mut log, format!("Search: {t} didn't look like results for “{query}” (Jev {p:.2})"));
+        continue 'search;
+        }
+    }
+    if skills.search_url.is_none() {
+        say(&mut log, "Search: couldn't find a way to search this site".into());
+    }
+
+    // Results and product pages.
+    if let Some(pattern) = result_pattern(&results) {
+        say(&mut log, format!("Results: links shaped like {pattern}"));
+        skills.result_pattern = Some(pattern.clone());
+        let first = results.iter().find(|r| url_pattern(&r.url) == pattern).cloned();
+        if let Some(r) = first {
+            if page.navigate(&r.url).await.is_ok() {
+                let v = page.eval(json!({"mode": "summary", "max_specs": 10, "excerpt_chars": 1500})).await.unwrap_or_default();
+                let product = &v["product"];
+                skills.product_data = !s(product, "price").is_empty() || !s(product, "availability").is_empty();
+                let p = jev
+                    .yes(
+                        &format!("Title: {}\nHeading: {}\n{}", s(&v, "title"), s(&v, "heading"), s(&v, "excerpt")),
+                        "Is this the page for a single product that can be bought?",
+                    )
+                    .await
+                    .unwrap_or(0.0);
+                let at = page.url().await.unwrap_or(r.url.clone());
+                if p >= 0.5 {
+                    let pp = url_pattern(&at);
+                    say(
+                        &mut log,
+                        format!(
+                            "Products: pages like {pp} (Jev {p:.2}){}",
+                            if skills.product_data { ", with price and stock data" } else { "" }
+                        ),
+                    );
+                    skills.product_pattern = Some(pp);
+                } else {
+                    say(&mut log, format!("Products: the first result didn't look like a product page (Jev {p:.2})"));
+                }
+            }
+        }
+    } else if skills.search_url.is_some() {
+        say(&mut log, "Results: couldn't tell which links are results".into());
+    }
+
+    // Cart.
+    let cart_options: Vec<(String, String)> = links
+        .iter()
+        .filter(|(t, u, area)| {
+            let both = format!("{t} {u}").to_lowercase();
+            area == "nav" || ["cart", "bag", "basket"].iter().any(|w| both.contains(w))
+        })
+        .map(|(t, u, _)| (format!("{t} → {u}"), u.clone()))
+        .take(200)
+        .collect();
+    let names: Vec<String> = cart_options.iter().map(|(n, _)| n.clone()).collect();
+    match jev.choose_one(&format!("Links at the top of {site}"), "Which link opens the shopping cart (bag, basket)?", &names).await {
+        Ok(Some((i, conf))) if conf >= 0.6 => {
+            say(&mut log, format!("Cart: {} (Jev {conf:.2})", cart_options[i].1));
+            skills.cart_url = Some(cart_options[i].1.clone());
+        }
+        _ => say(&mut log, "Cart: no cart link found".into()),
+    }
+
+    say(&mut log, format!("Done: {} Jev calls, {} tokens read", jev.calls(), jev.input_tokens()));
+    if skills.search_url.is_none() && skills.cart_url.is_none() {
+        return Err(log.join("\n"));
+    }
+    Ok((skills, log))
+}
+
+// ------------------------------------------------------------ requests
+
+/// What became of a request.
+#[derive(Debug)]
+pub enum Handled {
+    /// Done without Claude; the reply to show.
+    Answer { text: String },
+    /// Not something Jev does (or it wasn't sure); hand it to Claude.
+    NotForJev(String),
+}
+
+const STOPWORDS: &[&str] = &[
+    "a", "an", "the", "on", "at", "in", "for", "of", "to", "me", "my", "find", "search", "look", "looking", "show", "get",
+    "open", "what", "what's", "whats", "is", "are", "how", "much", "price", "prices", "cost", "costs", "does", "do", "it",
+    "this", "that", "whether", "if", "any", "some", "please", "can", "you", "could", "tell", "check", "stock", "available",
+    "availability", "cart", "and", "with", "from", "about", "up", "there", "they", "have", "has", "i", "want", "need",
+    "go", "pull", "see", "list", "page", "site", "one", "ones", "be", "by", "or", "still", "now", "currently", "would",
+    "like", "should",
+];
+
+/// The phrases in a request that could name what it's about, longest first
+/// within each start: "find a tusq xl nut on sweetwater" → "tusq xl nut",
+/// "tusq xl", "tusq", "xl nut", … Site words are left out.
+fn candidate_spans(text: &str, site_words: &[String]) -> Vec<String> {
+    let words: Vec<String> = text
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != '"' && c != '\'').trim_matches(['"', '\'']).to_string())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let skip = |w: &str| {
+        let l = w.to_lowercase();
+        STOPWORDS.contains(&l.as_str()) || site_words.iter().any(|s| l == *s || l.starts_with(&format!("{s}.")))
+    };
+    let mut out: Vec<String> = Vec::new();
+    for i in 0..words.len() {
+        if skip(&words[i]) {
+            continue;
+        }
+        for len in (1..=7).rev() {
+            if i + len > words.len() {
+                continue;
+            }
+            let span = &words[i..i + len];
+            if skip(span.last().unwrap()) || span.iter().any(|w| site_words.iter().any(|s| w.to_lowercase() == *s)) {
+                continue;
+            }
+            let joined = span.join(" ");
+            if !out.contains(&joined) {
+                out.push(joined);
+            }
+        }
+    }
+    out.truncate(250);
+    out
+}
+
+/// The words of a site's name: "www.sweetwater.com" → ["sweetwater"].
+pub fn site_words(site: &str) -> Vec<String> {
+    let s = site.trim_start_matches("www.").to_lowercase();
+    let stem = s.rsplit_once('.').map(|(a, _)| a).unwrap_or(&s);
+    stem.split(['.', '-']).filter(|w| w.len() > 2).map(str::to_string).collect()
+}
+
+const INTENTS: &[(&str, &str)] = &[
+    ("find", "Search for or list products or items on the site"),
+    ("price", "Asks the price or cost of a product"),
+    ("stock", "Asks whether a product is in stock or available to buy"),
+    ("open", "Open or show one specific product page"),
+    ("cart", "Show or open the shopping cart"),
+    (
+        "other",
+        "Anything else: buying, adding to cart, checking out, comparing, reviews, specs, questions, orders, the account, \
+         or several things at once",
+    ),
+];
+
+fn money(product: &Value) -> String {
+    let price = s(product, "price");
+    if price.is_empty() {
+        return String::new();
+    }
+    match s(product, "currency") {
+        "USD" | "" if !price.starts_with('$') => format!("${price}"),
+        "" | "USD" => price.to_string(),
+        c => format!("{c} {price}"),
+    }
+}
+
+/// "InStock" / "https://schema.org/OutOfStock" → words.
+fn stock_words(availability: &str) -> Option<&'static str> {
+    let a = availability.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
+    Some(match a.as_str() {
+        "instock" | "in stock" | "limitedavailability" | "onlineonly" => "in stock",
+        "outofstock" | "out of stock" | "soldout" | "discontinued" => "out of stock",
+        "preorder" | "presale" => "available to pre-order",
+        "backorder" => "on backorder",
+        _ => return None,
+    })
+}
+
+/// Handles `text`, a request about `site`, in the user's tab.
+pub async fn handle(bridge: &BrowserBridge, jev: &Jev, site: &JevSite, text: &str) -> Result<Handled, String> {
+    let b = Browser::new(bridge.clone());
+    let abilities = site.skills.abilities();
+    let spans = candidate_spans(text, &site_words(&site.site));
+    let mut questions = json!({
+        "intent": {
+            "type": "choice",
+            "instructions": "What does the user want done on the site?",
+            "criteria": INTENTS.iter().map(|(k, d)| (k.to_string(), Value::String(d.to_string()))).collect::<serde_json::Map<_, _>>(),
+        },
+        "here": {"type": "noul", "instructions": "Does the request refer to the product already open on the page (this, it, this one)?"},
+    });
+    if !spans.is_empty() {
+        let mut criteria: serde_json::Map<String, Value> =
+            spans.iter().enumerate().map(|(i, s)| (i.to_string(), Value::String(s.clone()))).collect();
+        criteria.insert("none".into(), Value::String("No product or item is named".into()));
+        questions["item"] = json!({
+            "type": "choice",
+            "instructions": "Which phrase is the full name of the product or item the user wants (as much of the name as they gave)?",
+            "criteria": criteria,
+        });
+    }
+    let answers = jev.ask(json!(format!("A request to an assistant, about the website {}:\n{text}", site.site)), questions).await?;
+    let intent = s(&answers["intent"], "choice").to_string();
+    let intent_conf = answers["intent"]["probabilities"][intent.as_str()]
+        .as_f64()
+        .or(answers["intent"]["confidence"].as_f64())
+        .unwrap_or(0.0);
+    if intent == "other" || intent.is_empty() {
+        return Ok(Handled::NotForJev("this isn't a find, price, stock, open or cart request".into()));
+    }
+    if intent_conf < 0.6 {
+        return Ok(Handled::NotForJev(format!("Jev wasn't sure what you meant (confidence {intent_conf:.2})")));
+    }
+    if !abilities.contains(&intent.as_str()) {
+        return Ok(Handled::NotForJev(format!("Jev hasn't learned how to do “{intent}” on {}", site.site)));
+    }
+    let item = s(&answers["item"], "choice").parse::<usize>().ok().and_then(|i| spans.get(i).cloned());
+    let here = answers["here"]["noul"].as_f64().unwrap_or(0.0) >= 0.6;
+
+    let go = |url: String| async move {
+        b.bridge.navigate(&url).await?;
+        b.settle(Duration::from_secs(15)).await;
+        Ok::<(), String>(())
+    };
+    let name_of = &site.site;
+
+    if intent == "cart" {
+        go(site.skills.cart_url.clone().unwrap_or_default()).await?;
+        return Ok(Handled::Answer { text: format!("Opened your cart on {name_of}.") });
+    }
+
+    let on_product_page = {
+        let st = bridge.state().await?;
+        site.skills.product_pattern.as_deref().is_some_and(|p| url_pattern(&st.url) == p)
+    };
+    let query = match (&item, here && on_product_page) {
+        (_, true) => None,
+        (Some(q), false) => Some(q.clone()),
+        (None, false) => return Ok(Handled::NotForJev("Jev couldn't tell which product you mean".into())),
+    };
+
+    if intent == "find" {
+        let q = query.clone().or(item.clone()).ok_or("no search words")?;
+        let url = site.skills.search_for(&q).ok_or("no search")?;
+        go(url).await?;
+        let results = results_of(&run_js(bridge, None, json!({"mode": "items", "max_items": 20})).await.unwrap_or_default());
+        if results.is_empty() {
+            return Ok(Handled::Answer { text: format!("Searched {name_of} for “{q}”. The results are on the page.") });
+        }
+        return Ok(Handled::Answer {
+            text: format!("Top results on {name_of} for “{q}”:\n{}", results_text(&results, 5)),
+        });
+    }
+
+    // open / price / stock: get to the product page.
+    let mut listed_price = String::new();
+    if let Some(q) = &query {
+        let search = site.skills.search_for(q).ok_or("no search")?;
+        let page = BgPage::open(bridge, &search).await?;
+        let results = results_of(&page.eval(json!({"mode": "items", "max_items": 30})).await.unwrap_or_default());
+        drop(page);
+        let options: Vec<String> = results.iter().map(|r| if r.price.is_empty() { r.title.clone() } else { format!("{} — {}", r.title, r.price) }).collect();
+        let (pick, p) = jev
+            .pick(
+                &format!("Search results on {name_of} for “{q}”"),
+                &format!(
+                    "Which result is the product the user means by “{q}”? Prefer the product itself over accessories or \
+                     parts for it, unless they asked for an accessory."
+                ),
+                &options,
+            )
+            .await?;
+        let i = match pick {
+            Some(i) if p >= 0.5 => i,
+            // Several fit about as well: show them, and the price if they share one.
+            Some(_) => {
+                go(search).await?;
+                let top: Vec<&Result_> = results.iter().take(5).collect();
+                let same_price = top.first().map(|r| r.price.clone()).filter(|p| !p.is_empty() && top.iter().all(|r| r.price == *p));
+                let lead = match (intent.as_str(), same_price) {
+                    ("price", Some(price)) => format!("Several products on {name_of} match “{q}”, all {price}:"),
+                    _ => format!("Several products on {name_of} match “{q}”. Which one do you mean?"),
+                };
+                return Ok(Handled::Answer { text: format!("{lead}\n{}", results_text(&results, 5)) });
+            }
+            None => {
+                go(search).await?;
+                return Ok(Handled::Answer {
+                    text: format!("Couldn't find “{q}” on {name_of}. Here's what the search shows:\n{}", results_text(&results, 5)),
+                });
+            }
+        };
+        listed_price = results[i].price.clone();
+        go(results[i].url.clone()).await?;
+    }
+    let v = run_js(bridge, None, json!({"mode": "summary", "max_specs": 10, "excerpt_chars": 2500})).await?;
+    let product = &v["product"];
+    let name = [s(product, "name"), s(&v, "heading"), s(&v, "title")].into_iter().find(|n| !n.is_empty()).unwrap_or("This product").to_string();
+    let mut price = money(product);
+    if price.is_empty() {
+        price = listed_price;
+    }
+    let stock = match stock_words(s(product, "availability")) {
+        Some(w) => Some(w.to_string()),
+        None if intent == "stock" => {
+            let p = jev
+                .yes(
+                    &format!("Product page: {name}\n{}", s(&v, "excerpt")),
+                    "Can this product be bought now (in stock, not sold out or unavailable)?",
+                )
+                .await?;
+            Some(if p >= 0.7 { "in stock".into() } else if p <= 0.3 { "out of stock".into() } else { "unclear whether it's in stock".into() })
+        }
+        None => None,
+    };
+    let text = match intent.as_str() {
+        "price" if price.is_empty() => format!("Opened {name} on {name_of}, but the page doesn't show a price I can read."),
+        "price" => format!(
+            "{name} is {price} on {name_of}{}.",
+            stock.as_deref().map(|s| format!(", {s}")).unwrap_or_default()
+        ),
+        "stock" => format!(
+            "{name} is {} on {name_of}{}.",
+            stock.as_deref().unwrap_or("unclear"),
+            if price.is_empty() { String::new() } else { format!(" ({price})") }
+        ),
+        _ => format!("Opened {name} on {name_of}{}.", if price.is_empty() { String::new() } else { format!(" — {price}") }),
+    };
+    Ok(Handled::Answer { text })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spans_skip_filler_and_the_site() {
+        let spans = candidate_spans("Find a TUSQ XL jazz bass nut on Sweetwater", &site_words("www.sweetwater.com"));
+        assert_eq!(spans[0], "TUSQ XL jazz bass nut");
+        assert!(spans.contains(&"jazz bass nut".to_string()));
+        assert!(!spans.iter().any(|s| s.to_lowercase().contains("sweetwater")));
+        assert!(!spans.iter().any(|s| s.starts_with("a ") || s.ends_with(" on")));
+        assert_eq!(site_words("guitar-center.com"), vec!["guitar", "center"]);
+    }
+
+    #[test]
+    fn search_templates_from_history() {
+        let (t, q) = template_from("https://www.sweetwater.com/store/search?s=tusq+nut&sb=popular").unwrap();
+        assert_eq!((t.as_str(), q.as_str()), ("https://www.sweetwater.com/store/search?s={q}", "tusq nut"));
+        assert!(template_from("https://x.com/item/123").is_none());
+    }
+
+    #[test]
+    fn results_share_a_pattern() {
+        let r = |u: &str| Result_ { title: "x".into(), url: u.into(), price: String::new() };
+        let results = vec![
+            r("https://s.com/store/detail/TusqNut--graph-tech-tusq"),
+            r("https://s.com/store/detail/BoneNut--bone-nut-thing"),
+            r("https://s.com/help"),
+        ];
+        assert_eq!(result_pattern(&results).as_deref(), Some(url_pattern("https://s.com/store/detail/TusqNut--graph-tech-tusq").as_str()));
+    }
+
+    #[test]
+    fn stock_and_price_words() {
+        assert_eq!(stock_words("https://schema.org/InStock"), Some("in stock"));
+        assert_eq!(stock_words("OutOfStock"), Some("out of stock"));
+        assert_eq!(stock_words(""), None);
+        assert_eq!(money(&json!({"price": "9.99", "currency": "USD"})), "$9.99");
+        assert_eq!(money(&json!({"price": "9.99", "currency": "EUR"})), "EUR 9.99");
+        assert_eq!(money(&json!({})), "");
+    }
+}
