@@ -6,19 +6,22 @@
 
 mod browser_pane;
 mod explained;
+mod safety;
 mod text_input;
 mod theme;
+mod watcher;
 
 use agent_core::{AgentEvent, AgentHandle, Approval, BackendKind, Settings};
 use gpui::{
-    App, Application, Bounds, Context, Entity, FocusHandle, Focusable, ScrollHandle, SharedString,
-    Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, div, prelude::*, px,
-    rgb, size,
+    AnyView, App, Application, Bounds, Context, Entity, FocusHandle, Focusable, ScrollHandle, SharedString,
+    StyleRefinement, Subscription, Task, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, div,
+    prelude::*, px, rgb, size,
 };
 use policy::Policy;
 use router::Registry;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use browser_pane::{AgentControl, BrowserPane, BrowsingChanged};
 use rail_browser::BrowserBridge;
 use browsing::{Browsing, HistoryQuery, site_of};
@@ -27,7 +30,7 @@ use trace::{Kind, Trace};
 
 gpui::actions!(
     shell,
-    [ToggleSidebar, ShowChat, ShowHistory, ShowFocus, ShowTrace, ShowExplained, StopAgent, NewTab, CloseTab, NextTab, PrevTab, FocusAddress, FindInPage]
+    [ToggleSidebar, ShowChat, ShowHistory, ShowFocus, ShowTrace, ShowExplained, StopAgent, NewTab, CloseTab, NextTab, PrevTab, FocusAddress, FindInPage, ZoomIn, ZoomOut, ZoomReset]
 );
 
 const KEYRING_SERVICE: &str = "agent-unibrow";
@@ -41,12 +44,75 @@ enum ItemKind {
     Note,
     Error,
     System,
+    /// Typed while the agent was working (chats roadmap C3).
+    Steer(SteerState),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SteerState {
+    /// Waiting for the agent's next step.
+    Queued,
+    Delivered,
+    /// The turn was stopped before it got there.
+    NotSent,
+}
+
+impl ItemKind {
+    /// How the chat store names it.
+    fn key(self) -> &'static str {
+        match self {
+            ItemKind::User => "user",
+            ItemKind::Assistant => "assistant",
+            ItemKind::Note => "note",
+            ItemKind::Error => "error",
+            ItemKind::System => "system",
+            ItemKind::Steer(SteerState::Queued) => "steer_queued",
+            ItemKind::Steer(SteerState::Delivered) => "steer",
+            ItemKind::Steer(SteerState::NotSent) => "steer_not_sent",
+        }
+    }
+
+    fn from_key(key: &str) -> Self {
+        match key {
+            "user" => ItemKind::User,
+            "assistant" => ItemKind::Assistant,
+            "note" => ItemKind::Note,
+            "error" => ItemKind::Error,
+            "steer" => ItemKind::Steer(SteerState::Delivered),
+            // A queued message from a session that ended never arrived.
+            "steer_queued" | "steer_not_sent" => ItemKind::Steer(SteerState::NotSent),
+            _ => ItemKind::System,
+        }
+    }
+}
+
+const IDLE_PLACEHOLDER: &str = "Ask Claude to do something…";
+const BUSY_PLACEHOLDER: &str = "Steer: add to what it's doing… (Enter)";
+
+/// The name a backend's resume handle is saved under.
+fn backend_key(kind: BackendKind) -> String {
+    serde_json::to_value(kind).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
+}
+
+fn load_items(chats: &chats::Chats, id: chats::ChatId) -> Vec<Item> {
+    chats
+        .items(id)
+        .into_iter()
+        .map(|i| Item { kind: ItemKind::from_key(&i.kind), text: i.text, db: Some(i.id) })
+        .collect()
 }
 
 struct Item {
     kind: ItemKind,
     text: String,
+    /// Its row in the chat store; `None` for notices that aren't kept.
+    db: Option<chats::ItemId>,
 }
+
+/// How often a streaming reply is saved while it grows.
+const STREAM_SAVE_EVERY: Duration = Duration::from_secs(1);
+/// Longest recap given to a model that can't resume a chat.
+const RECAP_CHARS: usize = 12_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SidebarTab {
@@ -86,9 +152,26 @@ struct Shell {
     login_user: Entity<TextInput>,
     login_pass: Entity<TextInput>,
     login_error: Option<String>,
+    /// Saved chats (chats roadmap C1/C2).
+    chats: Arc<chats::Chats>,
+    /// The chat on screen, which is also the one the agent works in.
+    chat_id: chats::ChatId,
+    /// The All chats list is showing instead of the conversation.
+    chat_list_open: bool,
+    /// A chat whose Delete was clicked once and awaits the confirm click.
+    confirm_delete: Option<chats::ChatId>,
+    /// The active chat's messages.
     items: Vec<Item>,
     /// Index of the assistant item currently receiving streamed text.
     streaming: Option<usize>,
+    stream_saved: Instant,
+    /// Context for a model that couldn't resume this chat; goes with the
+    /// next message.
+    pending_recap: Option<String>,
+    /// The last message sent, for resending after a failed resume.
+    last_sent: Option<String>,
+    /// Interrupt was pressed: send the queued steering once stopped.
+    interrupt_pending: bool,
     trace: Trace,
     expanded: HashSet<usize>,
     approvals: Vec<PendingApproval>,
@@ -98,6 +181,8 @@ struct Shell {
     busy: bool,
     status: SharedString,
     sidebar_open: bool,
+    /// The sidebar, as its own cached view (see [`SidebarView`]).
+    sidebar_view: Option<Entity<SidebarView>>,
     tab: SidebarTab,
     bookmarks_open: bool,
     needs_key: bool,
@@ -109,7 +194,18 @@ struct Shell {
 
 impl Shell {
     fn new(cef: Result<(), String>, store: Arc<Browsing>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| TextInput::new("Ask Claude to do something…", cx));
+        let chats = Arc::new(chats::Chats::open_default().unwrap_or_else(|e| {
+            eprintln!("agent-unibrow: chats unavailable ({e}); using a temporary store");
+            chats::Chats::in_memory()
+        }));
+        // Reopen the chat used last (C1.3).
+        let chat_id = chats
+            .last_active()
+            .or_else(|| chats.open_chats().last().map(|c| c.id))
+            .unwrap_or_else(|| chats.create());
+        chats.mark_active(chat_id);
+        let items = load_items(&chats, chat_id);
+        let input = cx.new(|cx| TextInput::new(IDLE_PLACEHOLDER, cx));
         let (bridge, requests) = rail_browser::bridge::channel();
         let browser = cx.new(|cx| BrowserPane::new(cef, store.clone(), requests, window, cx));
         let control_sub = cx.subscribe(&browser, |this: &mut Self, _, ev: &AgentControl, cx| match ev {
@@ -136,6 +232,12 @@ impl Shell {
         let filter_sub = cx.subscribe(&history_filter, |_: &mut Self, _, _: &Changed, cx| cx.notify());
         window.focus(&input.focus_handle(cx));
 
+        // Site scope (6.3) checks against the focus sites.
+        let mut policy = Policy::load();
+        let focus = store.clone();
+        policy.set_focus_source(Arc::new(move || focus.focus_sites().into_iter().map(|f| f.site).collect()));
+        let policy = Arc::new(Mutex::new(policy));
+
         let mut shell = Self {
             focus_handle: cx.focus_handle(),
             input,
@@ -149,17 +251,26 @@ impl Shell {
             login_user,
             login_pass,
             login_error: None,
-            items: Vec::new(),
+            chats,
+            chat_id,
+            chat_list_open: false,
+            confirm_delete: None,
+            items,
             streaming: None,
+            stream_saved: Instant::now(),
+            pending_recap: None,
+            last_sent: None,
+            interrupt_pending: false,
             trace: Trace::open_session(),
             expanded: HashSet::new(),
             approvals: Vec::new(),
             agent: None,
             settings: Settings::load(),
-            policy: Arc::new(Mutex::new(Policy::load())),
+            policy,
             busy: false,
             status: "".into(),
             sidebar_open: true,
+            sidebar_view: None,
             tab: SidebarTab::Chat,
             bookmarks_open: false,
             needs_key: false,
@@ -171,6 +282,21 @@ impl Shell {
         if let Some(p) = shell.trace.path().cloned() {
             shell.trace.push(Kind::Info, "Trace file opened", Some(p.display().to_string()));
         }
+        // Watches (9.4): changes arrive from the checker thread.
+        let fired = watcher::spawn(shell.store.clone(), shell.bridge.clone());
+        cx.spawn(async move |this, cx| {
+            while let Ok(f) = fired.recv().await {
+                let ok = this.update(cx, |s, cx| match f {
+                    Some(f) => s.watch_fired(f, cx),
+                    None if matches!(s.tab, SidebarTab::Focus) => cx.notify(),
+                    None => {}
+                });
+                if ok.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         shell.start_backend(cx);
         // Test hook: press Stop this many seconds after the first message.
         if let Some(secs) = std::env::var("UNIBROW_AUTOSTOP_SECS").ok().and_then(|s| s.parse::<u64>().ok()) {
@@ -185,6 +311,22 @@ impl Shell {
                 let _ = this.update(cx, |s, cx| s.stop_agent("Stopped.", cx));
             })
             .detach();
+        }
+        // Test hook: steer the agent ("secs|text") that long after it starts working.
+        if let Ok(spec) = std::env::var("UNIBROW_AUTOSTEER") {
+            if let Some((secs, text)) = spec.split_once('|').and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.to_string()))) {
+                cx.spawn(async move |this, cx| {
+                    loop {
+                        cx.background_executor().timer(std::time::Duration::from_millis(250)).await;
+                        if this.update(cx, |s, _| s.busy).unwrap_or(false) {
+                            break;
+                        }
+                    }
+                    cx.background_executor().timer(std::time::Duration::from_secs(secs)).await;
+                    let _ = this.update(cx, |s, cx| s.submit(text, cx));
+                })
+                .detach();
+            }
         }
         // Test hook: send a task automatically once the page has loaded.
         if let Ok(task) = std::env::var("UNIBROW_AUTOSEND") {
@@ -207,7 +349,7 @@ impl Shell {
 
     fn ask_for_key(&mut self, message: &str, cx: &mut Context<Self>) {
         self.needs_key = true;
-        self.items.push(Item { kind: ItemKind::System, text: message.to_string() });
+        self.notice(message.to_string());
         self.input.update(cx, |i, cx| {
             i.set_masked(true, cx);
             i.set_placeholder("sk-ant-…", cx);
@@ -237,27 +379,38 @@ impl Shell {
         self.agent = None;
         self._events = None;
         self.approvals.clear();
-        self.streaming = None;
+        self.end_stream();
         self.set_busy(false, "", cx);
         if self.needs_key {
             self.needs_key = false;
             self.input.update(cx, |i, cx| {
                 i.set_masked(false, cx);
-                i.set_placeholder("Ask Claude to do something…", cx);
+                i.set_placeholder(IDLE_PLACEHOLDER, cx);
             });
         }
         self.settings.backend = kind;
         self.settings.save();
-        self.items.push(Item { kind: ItemKind::System, text: format!("Switched to {}. New conversation.", kind.label()) });
+        // The chat stays; the new backend gets a recap with the next message.
+        self.pending_recap = self.chats.recap(self.chat_id, RECAP_CHARS);
+        self.push(ItemKind::System, format!("Switched to {}. It gets a recap of this chat with your next message.", kind.label()));
         self.trace.push(Kind::Info, format!("Switched agent to {}", kind.label()), None);
         self.start_backend(cx);
         cx.notify();
     }
 
     fn start_agent(&mut self, api_key: Option<String>, cx: &mut Context<Self>) {
-        let (rail, notes) = rail_api::ApiRail::from_config();
         let mut registry = Registry::new();
-        registry.add_rail(&rail);
+        // Isolated test instances never get the user's real Gmail: they'd
+        // be signed in through the shared keyring otherwise.
+        let test_instance = std::env::var_os("UNIBROW_DATA_DIR").is_some()
+            && std::env::var("UNIBROW_ALLOW_GMAIL").as_deref() != Ok("1");
+        let notes = if test_instance {
+            vec!["Gmail tools off in this test instance".to_string()]
+        } else {
+            let (rail, notes) = rail_api::ApiRail::from_config();
+            registry.add_rail(&rail);
+            notes
+        };
         for tool in browsing::tools(self.store.clone()) {
             registry.add_tool(tool);
         }
@@ -267,17 +420,23 @@ impl Shell {
         for n in &notes {
             self.trace.push(Kind::Info, n.clone(), None);
         }
-        if notes.iter().any(|n| n.starts_with("Gmail tools off")) {
+        if !test_instance && notes.iter().any(|n| n.starts_with("Gmail tools off")) {
             let path = rail_api::client_secret_path().map(|p| p.display().to_string()).unwrap_or_default();
-            self.items.push(Item {
-                kind: ItemKind::System,
-                text: format!(
-                    "Gmail isn't connected yet. Save a Google OAuth client (Desktop app) as {path} and restart to enable it."
-                ),
-            });
+            self.notice(format!(
+                "Gmail isn't connected yet. Save a Google OAuth client (Desktop app) as {path} and restart to enable it."
+            ));
         }
         self.trace.push(Kind::Info, format!("Starting {}", self.settings.backend.label()), None);
-        let (handle, events) = agent_core::spawn(self.settings.clone(), api_key, registry, self.policy.clone());
+        // Pick the chat up where it left off (C1.2), or recap it for a
+        // backend that has never seen it.
+        let backend_key = backend_key(self.settings.backend);
+        let chat = self.chats.get(self.chat_id);
+        let resume = chat.as_ref().filter(|c| c.backend.as_deref() == Some(backend_key.as_str())).and_then(|c| c.resume.clone());
+        if resume.is_none() && self.pending_recap.is_none() {
+            self.pending_recap = self.chats.recap(self.chat_id, RECAP_CHARS);
+        }
+        let (handle, events) =
+            agent_core::spawn(self.settings.clone(), api_key, registry, self.policy.clone(), resume);
         self.agent = Some(handle);
         self._events = Some(cx.spawn(async move |this, cx| {
             while let Ok(ev) = events.recv().await {
@@ -294,41 +453,128 @@ impl Shell {
             self.needs_key = false;
             self.input.update(cx, |i, cx| {
                 i.set_masked(false, cx);
-                i.set_placeholder("Ask Claude to do something…", cx);
+                i.set_placeholder(IDLE_PLACEHOLDER, cx);
             });
             match store_api_key(&text) {
                 Ok(()) => self.trace.push(Kind::Info, "API key saved to keyring", None),
                 Err(e) => self.trace.push(Kind::Error, format!("Couldn't save the API key ({e}); using it for this session only"), None),
             };
-            self.items.push(Item { kind: ItemKind::System, text: "API key set.".into() });
+            self.notice("API key set.".into());
             self.start_agent(Some(text), cx);
             return;
         }
-        let Some(agent) = &self.agent else { return };
+        if self.agent.is_none() {
+            return;
+        }
         if self.busy {
+            // Steering (C3.1): goes to the agent mid-task.
+            self.push(ItemKind::Steer(SteerState::Queued), text.clone());
+            self.trace.push(Kind::User, format!("Steer: {}", first_line(&text)), Some(text.clone()));
+            if let Some(agent) = &self.agent {
+                agent.steer(text);
+            }
+            self.scroll_to_bottom();
+            cx.notify();
             return;
         }
         self.can_continue = false;
-        self.items.push(Item { kind: ItemKind::User, text: text.clone() });
+        self.chat_list_open = false;
+        self.push(ItemKind::User, text.clone());
         self.trace.push(Kind::User, first_line(&text), Some(text.clone()));
+        self.send_to_agent(text, cx);
+        self.scroll_to_bottom();
+        cx.notify();
+    }
+
+    /// Sends a message the chat already shows.
+    fn send_to_agent(&mut self, text: String, cx: &mut Context<Self>) {
+        let Some(agent) = &self.agent else { return };
+        self.last_sent = Some(text.clone());
         // The agent always knows which sites are in focus.
-        let message = match self.store.focus_summary() {
+        let mut message = match self.store.focus_summary() {
             Some(sites) => format!("[Focus sites: {sites}]\n{text}"),
             None => text,
         };
+        if let Some(recap) = self.pending_recap.take() {
+            message = format!(
+                "[Earlier in this chat, before you joined it. You can't see these messages otherwise:]\n{recap}\n[End of the earlier messages.]\n\n{message}"
+            );
+        }
         if agent.send(message) {
             self.set_busy(true, "Thinking…", cx);
         } else {
-            self.items.push(Item { kind: ItemKind::Error, text: "The agent stopped. Restart the app.".into() });
+            self.push(ItemKind::Error, "The agent stopped. Restart the app.".into());
         }
-        self.scroll_to_bottom();
-        cx.notify();
+    }
+
+    /// Adds an item to the chat and saves it.
+    fn push(&mut self, kind: ItemKind, text: String) {
+        let db = Some(self.chats.append(self.chat_id, kind.key(), &text));
+        self.items.push(Item { kind, text, db });
+    }
+
+    /// Shows a notice in the chat that isn't saved with it.
+    fn notice(&mut self, text: String) {
+        self.items.push(Item { kind: ItemKind::System, text, db: None });
+    }
+
+    /// Ends the streamed reply, saving its final text.
+    fn end_stream(&mut self) {
+        if let Some(i) = self.streaming.take() {
+            if let Some(item) = self.items.get(i) {
+                if let Some(db) = item.db {
+                    self.chats.update_text(db, &item.text);
+                }
+            }
+        }
+    }
+
+    /// Marks the oldest `count` queued steering messages as delivered.
+    fn mark_steered(&mut self, count: usize, state: SteerState) {
+        let mut left = count;
+        for item in self.items.iter_mut() {
+            if left == 0 {
+                break;
+            }
+            if item.kind == ItemKind::Steer(SteerState::Queued) {
+                item.kind = ItemKind::Steer(state);
+                if let Some(db) = item.db {
+                    self.chats.update_kind(db, item.kind.key());
+                }
+                left -= 1;
+            }
+        }
+    }
+
+    fn queued_steering(&self) -> Vec<String> {
+        self.items.iter().filter(|i| i.kind == ItemKind::Steer(SteerState::Queued)).map(|i| i.text.clone()).collect()
+    }
+
+    /// Interrupt (C3.3): stop the current step and send what's in the box
+    /// (and anything queued) as a new message straight away.
+    fn interrupt(&mut self, cx: &mut Context<Self>) {
+        if !self.busy {
+            return;
+        }
+        let text = self.input.read(cx).text().trim().to_string();
+        if !text.is_empty() {
+            self.input.update(cx, |i, cx| i.set_text("", cx));
+            self.push(ItemKind::Steer(SteerState::Queued), text.clone());
+            self.trace.push(Kind::User, format!("Interrupt: {}", first_line(&text)), Some(text));
+        }
+        if self.queued_steering().is_empty() {
+            self.stop_agent("Stopped.", cx);
+            return;
+        }
+        self.interrupt_pending = true;
+        self.stop_agent("Interrupted. Sending your message now.", cx);
     }
 
     fn set_busy(&mut self, busy: bool, status: &str, cx: &mut Context<Self>) {
         self.busy = busy;
         self.status = status.to_string().into();
-        self.input.update(cx, |i, cx| i.set_disabled(busy, cx));
+        // The box stays open while the agent works: Enter steers it.
+        self.input.update(cx, |i, cx| i.set_placeholder(if busy { BUSY_PLACEHOLDER } else { IDLE_PLACEHOLDER }, cx));
         self.browser.update(cx, |b, cx| b.set_agent_busy(busy, cx));
     }
 
@@ -343,8 +589,8 @@ impl Shell {
         }
         // Dropping the senders answers pending approvals with Deny.
         self.approvals.clear();
-        self.streaming = None;
-        self.items.push(Item { kind: ItemKind::System, text: note.to_string() });
+        self.end_stream();
+        self.push(ItemKind::System, note.to_string());
         self.trace.push(Kind::Info, note.to_string(), None);
         self.status = "Stopping…".into();
         cx.notify();
@@ -356,27 +602,55 @@ impl Shell {
                 self.trace.push(Kind::Info, s, None);
             }
             AgentEvent::TurnStarted => {
-                self.streaming = None;
+                self.end_stream();
+                if !self.busy {
+                    // A follow-up turn carrying steering.
+                    self.set_busy(true, "Thinking…", cx);
+                }
                 self.status = "Thinking…".into();
             }
             AgentEvent::TextDelta(t) => {
                 let idx = match self.streaming {
                     Some(i) => i,
                     None => {
-                        self.items.push(Item { kind: ItemKind::Assistant, text: String::new() });
+                        self.push(ItemKind::Assistant, String::new());
+                        self.stream_saved = Instant::now();
                         self.streaming = Some(self.items.len() - 1);
                         self.items.len() - 1
                     }
                 };
                 self.items[idx].text.push_str(&t);
+                // Saved as it grows, so a crash loses at most a second.
+                if self.stream_saved.elapsed() >= STREAM_SAVE_EVERY {
+                    self.stream_saved = Instant::now();
+                    if let Some(db) = self.items[idx].db {
+                        self.chats.update_text(db, &self.items[idx].text);
+                    }
+                }
+            }
+            AgentEvent::Resume(handle) => {
+                self.chats.set_resume(self.chat_id, &backend_key(self.settings.backend), Some(&handle));
+            }
+            AgentEvent::ResumeFailed => {
+                // The saved session is gone: resend the last message with a recap.
+                self.end_stream();
+                if let Some(text) = self.last_sent.clone() {
+                    let recap = self.chats.recap(self.chat_id, RECAP_CHARS);
+                    self.pending_recap = recap.map(|r| format!("{r}\n(Answer the last user message.)"));
+                    self.send_to_agent(text, cx);
+                }
+            }
+            AgentEvent::Steered { count } => {
+                self.mark_steered(count, SteerState::Delivered);
+                self.trace.push(Kind::Info, format!("Steering delivered ({count} message{})", if count == 1 { "" } else { "s" }), None);
             }
             AgentEvent::Note(n) => {
-                self.streaming = None;
-                self.items.push(Item { kind: ItemKind::Note, text: n.clone() });
+                self.end_stream();
+                self.push(ItemKind::Note, n.clone());
                 self.trace.push(Kind::Assistant, format!("Note: {}", first_line(&n)), Some(n));
             }
             AgentEvent::ToolCall { name, input, .. } => {
-                self.streaming = None;
+                self.end_stream();
                 self.status = format!("Running {name}").into();
                 let pretty = serde_json::to_string_pretty(&input).unwrap_or_default();
                 self.trace.push(Kind::ToolCall, format!("{name} {}", compact(&input)), Some(pretty));
@@ -416,7 +690,7 @@ impl Shell {
                 self.trace.push(Kind::ApprovalDecision, format!("{name} {verb}"), None);
             }
             AgentEvent::Done { stop_reason, model, usage } => {
-                self.streaming = None;
+                self.end_stream();
                 self.approvals.clear();
                 let tokens = format!(
                     "in {} · out {} · cache read {}",
@@ -441,11 +715,26 @@ impl Shell {
                     format!("Turn finished ({stop_reason})"),
                     Some(format!("{}\n\nmodel: {}\n{tokens}", reply.join("\n\n"), model.unwrap_or_default())),
                 );
-                self.set_busy(false, "", cx);
+                let queued = self.queued_steering();
+                if stop_reason == "cancelled" {
+                    if std::mem::take(&mut self.interrupt_pending) && !queued.is_empty() {
+                        // Interrupt: what was queued goes as the next message.
+                        self.mark_steered(queued.len(), SteerState::Delivered);
+                        self.set_busy(false, "", cx);
+                        self.send_to_agent(queued.join("\n\n"), cx);
+                    } else {
+                        self.mark_steered(queued.len(), SteerState::NotSent);
+                        self.set_busy(false, "", cx);
+                    }
+                } else if queued.is_empty() {
+                    self.set_busy(false, "", cx);
+                }
+                // Otherwise the agent sends the queued messages as its next
+                // turn and stays busy.
             }
             AgentEvent::Error(e) => {
-                self.streaming = None;
-                self.items.push(Item { kind: ItemKind::Error, text: e.clone() });
+                self.end_stream();
+                self.push(ItemKind::Error, e.clone());
                 self.trace.push(Kind::Error, first_line(&e), Some(e.clone()));
                 self.set_busy(false, "", cx);
                 if e.contains("API 401") && self.settings.backend.needs_api_key() {
@@ -620,8 +909,10 @@ impl Shell {
             .flex_col()
             .flex_1()
             .min_h(px(0.))
+            .child(self.render_chat_strip(cx))
             .child(self.render_backend_bar(cx))
-            .child(
+            .when(self.chat_list_open, |d| d.child(self.render_chat_list(cx)))
+            .when(!self.chat_list_open, |d| d.child(
                 div()
                     .id("conversation")
                     .flex()
@@ -646,7 +937,7 @@ impl Shell {
                     })
                     .children(self.items.iter().map(Self::render_item))
                     .children(approvals),
-            )
+            ))
             .child(
                 div()
                     .flex()
@@ -676,8 +967,30 @@ impl Shell {
                                 .child("Continue: hand the page back to the agent"),
                         )
                     })
-                    .child(self.input.clone()),
+                    .child(self.input.clone())
+                    .when(self.busy, |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(div().flex_1().text_xs().text_color(rgb(theme::MUTED)).child(
+                                    "Enter adds to what it's doing; it reads it at its next step.",
+                                ))
+                                .child(
+                                    Self::small_button("interrupt".into(), "Interrupt & send", false)
+                                        .on_click(cx.listener(|this, _, _, cx| this.interrupt(cx))),
+                                ),
+                        )
+                    }),
             )
+    }
+
+    fn watch_fired(&mut self, f: browsing::WatchFired, cx: &mut Context<Self>) {
+        let line = watcher::describe(&f);
+        self.push(ItemKind::System, format!("◷ Watch: {line}\n{}", f.watch.url));
+        self.trace.push(Kind::Info, format!("Watch fired: {line}"), Some(f.watch.url.clone()));
+        cx.notify();
     }
 
     fn open_url(&mut self, url: String, cx: &mut Context<Self>) {
@@ -920,7 +1233,9 @@ impl Shell {
         let current_site = site_of(&current_url);
         let current_in_focus = current_site.as_deref().is_some_and(|s| self.store.is_focused(s));
 
+        let safety = self.render_safety(cx).into_any_element();
         let logins = self.render_logins(cx).into_any_element();
+        let watches = self.render_watches(cx).into_any_element();
         let rows = sites.into_iter().map(|f| {
             let site = f.site.clone();
             div()
@@ -998,7 +1313,9 @@ impl Shell {
                         }))
                     })),
             )
+            .child(safety)
             .child(logins)
+            .child(watches)
             .child(
                 div()
                     .id("focus-list")
@@ -1116,6 +1433,93 @@ impl Shell {
             .children(form)
     }
 
+    /// Watches (roadmap 9.4): pages the app re-checks for the user. Agents
+    /// add them with browser_watch; the user can remove them here.
+    fn render_watches(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let watches = self.store.watches();
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .border_b_1()
+            .border_color(rgb(theme::RULE))
+            .child(div().text_xs().text_color(rgb(theme::ACCENT)).child("WATCHES"))
+            .when(watches.is_empty(), |d| {
+                d.child(div().text_xs().text_color(rgb(theme::MUTED)).child(
+                    "None yet. Ask the agent things like \"tell me when this price drops\" or \"let me know when it's back in stock\".",
+                ))
+            })
+            .children(watches.into_iter().map(|w| {
+                let id = w.id;
+                let url = w.url.clone();
+                let mut status = match (&w.last_value, &w.last_checked) {
+                    (Some(v), Some(at)) => format!("{v} · checked {}", at.format("%b %-d %-I:%M %p")),
+                    _ => "not checked yet".to_string(),
+                };
+                if let Some(e) = &w.last_error {
+                    status = format!("{status} · last check failed: {e}");
+                }
+                let every = if w.every_min % 60 == 0 { format!("{}h", w.every_min / 60) } else { format!("{}m", w.every_min) };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id(("watch-open", id as usize))
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| this.open_url(url.clone(), cx)))
+                            .child(div().text_sm().truncate().text_color(rgb(theme::FG)).child(format!(
+                                "{} · when it {} · every {every}",
+                                w.label, w.when
+                            )))
+                            .child(div().text_xs().truncate().text_color(if w.last_error.is_some() {
+                                rgb(theme::ERROR)
+                            } else {
+                                rgb(theme::MUTED)
+                            }).child(status)),
+                    )
+                    .child(Self::small_button(SharedString::from(format!("watch-remove-{id}")), "Remove", false).on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.store.remove_watch(id);
+                            this.trace.push(Kind::Info, format!("Removed watch #{id}"), None);
+                            cx.notify();
+                        }),
+                    ))
+            }))
+    }
+
+    /// The sidebar's contents. Rendered by [`SidebarView`].
+    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let body = match self.tab {
+            SidebarTab::Chat => self.render_chat(cx).into_any_element(),
+            SidebarTab::History => self.render_history(cx).into_any_element(),
+            SidebarTab::Focus => self.render_focus(cx).into_any_element(),
+            SidebarTab::Trace => self.render_trace(cx).into_any_element(),
+            SidebarTab::Explained => {
+                let me = cx.entity().downgrade();
+                explained::render(move |text, window, cx| {
+                    let _ = me.update(cx, |this, cx| this.use_example(text, window, cx));
+                })
+                .into_any_element()
+            }
+        };
+        div()
+            .flex()
+            .flex_col()
+            .w(px(SIDEBAR_WIDTH))
+            .h_full()
+            .flex_none()
+            .bg(rgb(theme::PANE))
+            .child(self.render_tabs(cx))
+            .child(body)
+    }
+
     fn render_trace(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let rows: Vec<_> = self
             .trace
@@ -1191,7 +1595,259 @@ impl Shell {
                 .border_color(rgb(theme::RULE))
                 .text_color(rgb(theme::MUTED))
                 .child(item.text.clone()),
+            ItemKind::Steer(state) => {
+                let (label, color) = match state {
+                    SteerState::Queued => ("While it works · waiting for its next step", theme::WARN),
+                    SteerState::Delivered => ("While it worked · delivered", theme::ACCENT),
+                    SteerState::NotSent => ("While it worked · not sent (stopped)", theme::MUTED),
+                };
+                div().flex().flex_col().items_end().gap_1().child(
+                    base.max_w(px(360.))
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(color))
+                        .bg(rgb(theme::RAISED))
+                        .text_color(rgb(theme::FG))
+                        .child(item.text.clone()),
+                )
+                .child(div().text_xs().text_color(rgb(color)).child(label))
+            }
         }
+    }
+
+    // ------------------------------------------------------------- chats
+
+    /// Why the agent can't leave its chat right now, if it can't.
+    fn busy_guard(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.busy {
+            self.notice("The agent is working in this chat. Let it finish, or press Stop, before switching chats.".into());
+            self.chat_list_open = false;
+            self.scroll_to_bottom();
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    /// Shows chat `id` and points the agent at it (C2.3).
+    fn switch_chat(&mut self, id: chats::ChatId, cx: &mut Context<Self>) {
+        if id == self.chat_id {
+            self.chat_list_open = false;
+            cx.notify();
+            return;
+        }
+        if self.busy_guard(cx) {
+            return;
+        }
+        self.end_stream();
+        self.chat_id = id;
+        self.chats.mark_active(id);
+        self.items = load_items(&self.chats, id);
+        self.chat_list_open = false;
+        self.confirm_delete = None;
+        self.can_continue = false;
+        self.pending_recap = None;
+        self.last_sent = None;
+        // A fresh agent on this chat's saved conversation.
+        self.agent = None;
+        self._events = None;
+        self.approvals.clear();
+        let title = self.chats.get(id).map(|c| c.title).unwrap_or_default();
+        self.trace.push(Kind::Info, format!("Opened chat “{title}”"), None);
+        self.start_backend(cx);
+        self.scroll_to_bottom();
+        cx.notify();
+    }
+
+    fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // An empty chat is already a new chat.
+        if self.items.iter().all(|i| i.db.is_none()) {
+            self.chat_list_open = false;
+            window.focus(&self.input.focus_handle(cx));
+            cx.notify();
+            return;
+        }
+        if self.busy_guard(cx) {
+            return;
+        }
+        let id = self.chats.create();
+        self.switch_chat(id, cx);
+        window.focus(&self.input.focus_handle(cx));
+    }
+
+    /// Takes a chat out of the strip (it stays in All chats), or deletes it.
+    fn close_chat(&mut self, id: chats::ChatId, delete: bool, cx: &mut Context<Self>) {
+        if id == self.chat_id && self.busy_guard(cx) {
+            return;
+        }
+        let empty = self.chats.get(id).is_some_and(|c| c.items == 0);
+        if id == self.chat_id {
+            let open: Vec<chats::ChatId> = self.chats.open_chats().iter().map(|c| c.id).filter(|c| *c != id).collect();
+            let next = open.last().copied().unwrap_or_else(|| self.chats.create());
+            self.switch_chat(next, cx);
+        }
+        if delete || empty {
+            self.chats.delete(id);
+            self.trace.push(Kind::Info, "Deleted a chat", None);
+        } else {
+            self.chats.set_open(id, false);
+        }
+        self.confirm_delete = None;
+        cx.notify();
+    }
+
+    /// Open chats as tabs, with new chat and All chats (C2.1).
+    fn render_chat_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let open = self.chats.open_chats();
+        let chip = |id: SharedString| {
+            div().id(id).flex().items_center().gap_1().px_2().py(px(3.)).rounded_md().text_xs().border_1()
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(rgb(theme::RULE))
+            .child(
+                div()
+                    .id("chat-tabs")
+                    .flex()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .gap_1()
+                    .overflow_x_scroll()
+                    .children(open.into_iter().map(|c| {
+                        let active = c.id == self.chat_id;
+                        let id = c.id;
+                        let title: String = if c.title.chars().count() > 22 {
+                            c.title.chars().take(21).collect::<String>() + "…"
+                        } else {
+                            c.title.clone()
+                        };
+                        chip(SharedString::from(format!("chat-{id}")))
+                            .flex_none()
+                            .border_color(rgb(if active { theme::ACCENT } else { theme::RULE }))
+                            .bg(rgb(if active { theme::RAISED } else { theme::PANE }))
+                            .text_color(rgb(if active { theme::FG } else { theme::MUTED }))
+                            .when(!active, |d| d.cursor_pointer().hover(|s| s.text_color(rgb(theme::FG))))
+                            .on_click(cx.listener(move |this, _, _, cx| this.switch_chat(id, cx)))
+                            .when(active && self.busy, |d| d.child(div().text_color(rgb(theme::ACCENT)).child("●")))
+                            .child(title)
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("chat-close-{id}")))
+                                    .px(px(3.))
+                                    .rounded_sm()
+                                    .text_color(rgb(theme::MUTED))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(theme::RULE)).text_color(rgb(theme::FG)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.close_chat(id, false, cx);
+                                    }))
+                                    .child("×"),
+                            )
+                    })),
+            )
+            .child(
+                chip("chat-new".into())
+                    .flex_none()
+                    .border_color(rgb(theme::RULE))
+                    .text_color(rgb(theme::FG))
+                    .cursor_pointer()
+                    .hover(|s| s.border_color(rgb(theme::ACCENT)))
+                    .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx)))
+                    .child("+ New"),
+            )
+            .child(
+                chip("chat-all".into())
+                    .flex_none()
+                    .border_color(rgb(if self.chat_list_open { theme::ACCENT } else { theme::RULE }))
+                    .text_color(rgb(if self.chat_list_open { theme::ACCENT } else { theme::FG }))
+                    .cursor_pointer()
+                    .hover(|s| s.border_color(rgb(theme::ACCENT)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.chat_list_open = !this.chat_list_open;
+                        this.confirm_delete = None;
+                        cx.notify();
+                    }))
+                    .child("All chats"),
+            )
+    }
+
+    /// Every saved chat, newest first (C2.2).
+    fn render_chat_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let all = self.chats.all();
+        let today = chrono::Local::now().date_naive();
+        div()
+            .id("chat-list")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .when(all.is_empty(), |d| d.child(div().p_3().text_sm().text_color(rgb(theme::MUTED)).child("No chats yet.")))
+            .children(all.into_iter().map(|c| {
+                let id = c.id;
+                let active = id == self.chat_id;
+                let confirming = self.confirm_delete == Some(id);
+                let when = if c.updated.date_naive() == today {
+                    c.updated.format("%-I:%M %p").to_string()
+                } else {
+                    c.updated.format("%b %-d").to_string()
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(theme::RULE))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("chat-row-{id}")))
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| this.switch_chat(id, cx)))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .truncate()
+                                    .text_color(rgb(if active { theme::ACCENT } else { theme::FG }))
+                                    .child(c.title.clone()),
+                            )
+                            .child(div().text_xs().text_color(rgb(theme::MUTED)).child(format!(
+                                "{} message{} · {when}{}",
+                                c.items,
+                                if c.items == 1 { "" } else { "s" },
+                                if active { " · open now" } else if c.open { " · in the strip" } else { "" }
+                            ))),
+                    )
+                    .child(
+                        Self::small_button(
+                            SharedString::from(format!("chat-delete-{id}")),
+                            if confirming { "Confirm delete" } else { "Delete" },
+                            confirming,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if this.confirm_delete == Some(id) {
+                                this.close_chat(id, true, cx);
+                                this.chat_list_open = true;
+                            } else {
+                                this.confirm_delete = Some(id);
+                            }
+                            cx.notify();
+                        })),
+                    )
+            }))
     }
 
     fn render_approval(&self, a: &PendingApproval, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1329,29 +1985,18 @@ impl Focusable for Shell {
 
 impl Render for Shell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.sidebar_view.is_none() {
+            let shell = cx.entity();
+            self.sidebar_view = Some(cx.new(|cx| SidebarView {
+                _observe: cx.observe(&shell, |_, _, cx| cx.notify()),
+                shell: shell.downgrade(),
+            }));
+        }
+        // Cached: page frames redraw the browser pane (and so this view),
+        // but the sidebar only re-renders when the shell itself changes.
         let sidebar = self.sidebar_open.then(|| {
-            let body = match self.tab {
-                SidebarTab::Chat => self.render_chat(cx).into_any_element(),
-                SidebarTab::History => self.render_history(cx).into_any_element(),
-                SidebarTab::Focus => self.render_focus(cx).into_any_element(),
-                SidebarTab::Trace => self.render_trace(cx).into_any_element(),
-                SidebarTab::Explained => {
-                    let me = cx.entity().downgrade();
-                    explained::render(move |text, window, cx| {
-                        let _ = me.update(cx, |this, cx| this.use_example(text, window, cx));
-                    })
-                    .into_any_element()
-                }
-            };
-            div()
-                .flex()
-                .flex_col()
-                .w(px(SIDEBAR_WIDTH))
-                .h_full()
-                .flex_none()
-                .bg(rgb(theme::PANE))
-                .child(self.render_tabs(cx))
-                .child(body)
+            AnyView::from(self.sidebar_view.clone().expect("created above"))
+                .cached(StyleRefinement::default().w(px(SIDEBAR_WIDTH)).h_full().flex_none())
         });
 
         div()
@@ -1370,6 +2015,9 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &NextTab, _, cx| this.browser.update(cx, |b, cx| b.cycle_tab(true, cx))))
             .on_action(cx.listener(|this, _: &PrevTab, _, cx| this.browser.update(cx, |b, cx| b.cycle_tab(false, cx))))
             .on_action(cx.listener(|this, _: &FindInPage, window, cx| this.browser.update(cx, |b, cx| b.open_find(window, cx))))
+            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.browser.update(cx, |b, cx| b.zoom(1, cx))))
+            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.browser.update(cx, |b, cx| b.zoom(-1, cx))))
+            .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.browser.update(cx, |b, cx| b.zoom(0, cx))))
             .on_action(cx.listener(|this, _: &FocusAddress, window, cx| {
                 this.browser.update(cx, |b, cx| b.focus_address(window, cx))
             }))
@@ -1449,6 +2097,24 @@ fn google_signin() -> std::process::ExitCode {
     }
 }
 
+/// The sidebar as its own view, so it can be cached. GPUI redraws every
+/// view above one that changed; without this, each frame the web page
+/// paints would rebuild the whole sidebar (history rows and all). It
+/// renders through the shell, which owns the state, and re-renders when
+/// the shell notifies.
+struct SidebarView {
+    shell: WeakEntity<Shell>,
+    _observe: Subscription,
+}
+
+impl Render for SidebarView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.shell
+            .update(cx, |shell, cx| shell.render_sidebar(cx).into_any_element())
+            .unwrap_or_else(|_| div().into_any_element())
+    }
+}
+
 fn main() -> std::process::ExitCode {
     // Chromium re-runs this binary for its renderer/GPU/utility processes.
     // Those must hand off to CEF before anything else starts.
@@ -1462,8 +2128,14 @@ fn main() -> std::process::ExitCode {
         eprintln!("agent-unibrow: history unavailable ({e}); using a temporary store");
         Browsing::in_memory()
     }));
-    // Test hook (isolated test instances only): pre-save a login, "site|user|password".
+    // Test hooks (isolated test instances only): pre-save a login,
+    // "site|user|password"; put sites in focus, "site,site".
     if std::env::var_os("UNIBROW_DATA_DIR").is_some() {
+        if let Ok(sites) = std::env::var("UNIBROW_TEST_FOCUS") {
+            for site in sites.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                store.add_focus(site, site);
+            }
+        }
         if let Ok(spec) = std::env::var("UNIBROW_TEST_LOGIN") {
             let parts: Vec<&str> = spec.splitn(3, '|').collect();
             if let [site, user, pass] = parts[..] {
@@ -1488,6 +2160,13 @@ fn main() -> std::process::ExitCode {
             gpui::KeyBinding::new("ctrl-shift-tab", PrevTab, None),
             gpui::KeyBinding::new("ctrl-l", FocusAddress, None),
             gpui::KeyBinding::new("ctrl-f", FindInPage, None),
+            // Ctrl+Shift+= arrives as ctrl-+; the keypad keys as add/subtract.
+            gpui::KeyBinding::new("ctrl-=", ZoomIn, None),
+            gpui::KeyBinding::new("ctrl-+", ZoomIn, None),
+            gpui::KeyBinding::new("ctrl-add", ZoomIn, None),
+            gpui::KeyBinding::new("ctrl--", ZoomOut, None),
+            gpui::KeyBinding::new("ctrl-subtract", ZoomOut, None),
+            gpui::KeyBinding::new("ctrl-0", ZoomReset, None),
             gpui::KeyBinding::new("alt-1", ShowChat, None),
             gpui::KeyBinding::new("alt-2", ShowHistory, None),
             gpui::KeyBinding::new("alt-3", ShowFocus, None),

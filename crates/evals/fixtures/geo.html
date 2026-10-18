@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Unibrow Test – Store finder</title></head>
+<body style="font: 16px system-ui, sans-serif; max-width: 640px; margin: 32px auto;">
+  <h1>Store finder</h1>
+  <button onclick="find()">Find stores near me</button>
+  <p id="out" role="status">Not searched yet.</p>
+  <script>
+    function find() {
+      const out = document.getElementById('out');
+      out.textContent = 'Waiting for your location…';
+      navigator.geolocation.getCurrentPosition(
+        p => { out.textContent = 'LOCATION SHARED: ' + p.coords.latitude.toFixed(2); },
+        e => { out.textContent = 'LOCATION NOT SHARED: ' + e.message; },
+        { timeout: 60000 });
+    }
+  </script>
+</body>
+</html>

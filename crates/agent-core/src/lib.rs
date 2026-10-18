@@ -22,6 +22,7 @@ mod prompt;
 mod sse;
 
 pub use client::ModelConfig;
+pub use host::Steering;
 
 use futures::channel::oneshot;
 use policy::Policy;
@@ -150,18 +151,35 @@ pub enum AgentEvent {
     ApprovalDecided { id: String, name: String, approval: Approval },
     /// The turn is over; it is the user's turn.
     Done { stop_reason: String, model: Option<String>, usage: Value },
+    /// What the backend needs to pick this conversation up again later
+    /// (session or thread id, or the API message list). Save it with the
+    /// chat and pass it back to [`spawn`].
+    Resume(Value),
+    /// The saved conversation couldn't be resumed (deleted session). The
+    /// backend has started fresh; resend with a recap.
+    ResumeFailed,
+    /// Messages the user typed while the agent worked reached the model.
+    Steered { count: usize },
     Error(String),
 }
 
 pub struct AgentHandle {
     tx: async_channel::Sender<String>,
     cancel: async_channel::Sender<()>,
+    steering: Steering,
 }
 
 impl AgentHandle {
     /// Queues a user message. Returns false if the agent thread has exited.
     pub fn send(&self, text: String) -> bool {
         self.tx.try_send(text).is_ok()
+    }
+
+    /// Adds to the turn in progress (chats roadmap C3): the message reaches
+    /// the model with its next tool result, or as the next turn if it's
+    /// only writing its answer. [`AgentEvent::Steered`] says when.
+    pub fn steer(&self, text: String) {
+        self.steering.push(text);
     }
 
     /// Stops the turn in progress, if any. The agent reports
@@ -172,13 +190,17 @@ impl AgentHandle {
 }
 
 /// Starts an agent with the given backend on a background thread.
-/// `api_key` is only used by [`BackendKind::AnthropicApi`].
+/// `api_key` is only used by [`BackendKind::AnthropicApi`]. `resume` is a
+/// value from an earlier [`AgentEvent::Resume`] for the same backend.
 pub fn spawn(
     settings: Settings,
     api_key: Option<String>,
     registry: Registry,
     policy: Arc<Mutex<Policy>>,
+    resume: Option<Value>,
 ) -> (AgentHandle, async_channel::Receiver<AgentEvent>) {
+    let steering = Steering::default();
+    let steering_for_agent = steering.clone();
     let (in_tx, in_rx) = async_channel::unbounded::<String>();
     let (ev_tx, ev_rx) = async_channel::unbounded::<AgentEvent>();
     let (cancel_tx, cancel_rx) = async_channel::bounded::<()>(1);
@@ -191,34 +213,65 @@ pub fn spawn(
                 .build()
                 .expect("tokio runtime");
             rt.block_on(async move {
-                let host = host::ToolHost::new(registry, policy, ev_tx.clone());
-                let mut backend = match backends::Backend::start(&settings, api_key, host, ev_tx.clone()).await {
+                let steering = steering_for_agent;
+                let host = host::ToolHost::new(registry, policy, ev_tx.clone(), steering.clone());
+                let turns = host.clone();
+                let mut backend = match backends::Backend::start(&settings, api_key, host, ev_tx.clone(), resume).await {
                     Ok(b) => b,
                     Err(e) => {
                         let _ = ev_tx.try_send(AgentEvent::Error(e));
                         return;
                     }
                 };
-                while let Ok(text) = in_rx.recv().await {
+                loop {
+                    let text = tokio::select! {
+                        t = in_rx.recv() => match t {
+                            Ok(t) => t,
+                            Err(_) => break,
+                        },
+                        // Steering that arrived after the last turn ended.
+                        _ = steering.pushed() => {
+                            let queued = steering.take();
+                            if queued.is_empty() {
+                                continue;
+                            }
+                            let _ = ev_tx.try_send(AgentEvent::Steered { count: queued.len() });
+                            prompt::steer_turn(&queued)
+                        }
+                    };
                     // A Stop pressed while idle shouldn't cancel the next turn.
                     while cancel_rx.try_recv().is_ok() {}
-                    let cancelled = tokio::select! {
-                        _ = backend.run_turn(text) => false,
-                        _ = cancel_rx.recv() => true,
-                    };
-                    if cancelled {
-                        backend.on_cancel().await;
-                        let _ = ev_tx.try_send(AgentEvent::Done {
-                            stop_reason: "cancelled".into(),
-                            model: None,
-                            usage: Value::Null,
-                        });
+                    let mut next = Some(text);
+                    while let Some(text) = next.take() {
+                        // Each user message gets fresh per-turn caps (6.6).
+                        turns.new_turn();
+                        let cancelled = tokio::select! {
+                            _ = backend.run_turn(text) => false,
+                            _ = cancel_rx.recv() => true,
+                        };
+                        if cancelled {
+                            // Undelivered steering is the UI's to resend.
+                            steering.take();
+                            backend.on_cancel().await;
+                            let _ = ev_tx.try_send(AgentEvent::Done {
+                                stop_reason: "cancelled".into(),
+                                model: None,
+                                usage: Value::Null,
+                            });
+                            break;
+                        }
+                        // Typed while it was writing its answer: send now.
+                        let queued = steering.take();
+                        if !queued.is_empty() {
+                            let _ = ev_tx.try_send(AgentEvent::Steered { count: queued.len() });
+                            next = Some(prompt::steer_turn(&queued));
+                        }
                     }
                 }
             });
         })
         .expect("spawn agent thread");
-    (AgentHandle { tx: in_tx, cancel: cancel_tx }, ev_rx)
+    (AgentHandle { tx: in_tx, cancel: cancel_tx, steering }, ev_rx)
 }
 
 /// Directory the CLI agents run in: empty, so no project files or

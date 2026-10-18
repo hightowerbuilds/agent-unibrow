@@ -1,0 +1,11 @@
+[package]
+name = "chats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde_json.workspace = true
+chrono.workspace = true
+dirs.workspace = true

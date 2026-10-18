@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Unibrow Test Shop – Frames</title>
+<style>
+  body { font: 16px system-ui, sans-serif; max-width: 720px; margin: 32px auto; padding: 0 16px; color: #1b2733; background: #fff; }
+  iframe { display: block; width: 100%; height: 220px; border: 1px solid #d5dce2; border-radius: 8px; margin: 16px 0; }
+</style>
+</head>
+<body>
+  <h1>Order extras</h1>
+  <p>The newsletter box and the gift message box below are embedded frames.</p>
+  <iframe id="news" title="Newsletter" src="frame-newsletter.html"></iframe>
+  <iframe id="gift" title="Gift message (partner site)"></iframe>
+  <script>
+    // A different host on the same port: another site, so Chromium puts it
+    // in its own process (an out-of-process iframe).
+    const other = location.hostname === '127.0.0.1' ? 'localhost' : '127.0.0.1';
+    document.getElementById('gift').src = `${location.protocol}//${other}:${location.port}/frame-gift.html`;
+  </script>
+</body>
+</html>

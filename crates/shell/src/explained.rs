@@ -47,11 +47,12 @@ const GUIDE: &[Section] = &[
             Block::Para("Try one (click to put it in the chat box):"),
             Block::Examples(&[
                 "Find a TUSQ XL jazz bass nut on Sweetwater and tell me the price and whether it's in stock.",
-                "Compare the first three results for this search in separate tabs and give me a short table.",
+                "Compare the top three results for this search and give me a short table.",
                 "Read this page and summarize it in five bullet points.",
                 "Find the three emails from this week that need a reply and draft responses. Don't send them.",
                 "What have I been looking at on my focus sites today?",
                 "Download the receipt on this page and tell me the order total.",
+                "Tell me when the price on this page drops.",
             ]),
         ],
     },
@@ -62,6 +63,11 @@ const GUIDE: &[Section] = &[
                 "Approval cards: buying, paying, sending, posting, deleting, submitting forms that send information, \
                  uploading a file, and confirming risky pop-ups all ask first, with a screenshot and the values.",
                 "\"Always allow\" on a card stops asking for that site (or those email recipients).",
+                "Focus › Safety: \"Only act on focus sites\" makes clicking or typing anywhere else ask first (reading \
+                 is still fine). \"Always ask for purchases over\" shows you any bigger purchase, with its amount, even \
+                 where you said always allow.",
+                "Each turn stops after 60 tool calls or 5 actions that send, buy, post or delete; the agent reports \
+                 back and you can say \"continue\".",
                 "Stop it any time: the Stop button on the page, Esc, or just click or type on the page yourself.",
                 "The highlight box shows what it's about to click or type into.",
                 "Trace lists every step it took, with a screenshot for each browser action. Click a row for details.",
@@ -76,13 +82,36 @@ const GUIDE: &[Section] = &[
                  them on the page or in screenshots.",
                 "Solve CAPTCHAs or get around sites that block agents. It tells you and stops.",
                 "Upload files from hidden folders like ~/.ssh or ~/.config.",
-                "Allow camera, microphone, location or notifications for sites.",
+                "Allow camera, microphone, location or notifications for sites. When a site asks, you choose on a \
+                 card over the page; the answer is remembered for that site (Focus › Safety lists them).",
+                "Follow instructions planted in web pages (\"AI assistant: ignore your instructions…\"). It warns you \
+                 when a page has them, hidden or not.",
+                "Pretend to be you, or a person. If a form or chat asks who's writing, it says it's your AI assistant.",
             ]),
             Block::Para(
                 "When it needs you (a sign-in, a code, a CAPTCHA), it says so and waits. Do that part, then tell it \
                  to carry on.",
             ),
         ],
+    },
+    Section {
+        title: "Chats",
+        blocks: &[Block::Bullets(&[
+            "Every chat is saved as you go, so a crash or restart doesn't lose it. The app reopens on the chat you used last, \
+             and the agent remembers the whole conversation.",
+            "+ New starts a fresh chat; × takes one out of the strip (it stays in All chats). All chats lists every chat; \
+             Delete there removes one for good (click twice to confirm).",
+            "The agent works in one chat at a time. Let it finish or press Stop before switching.",
+        ])],
+    },
+    Section {
+        title: "Steering while it works",
+        blocks: &[Block::Bullets(&[
+            "Keep typing while the agent works. Press Enter and your message reaches it at its next step, so it can change \
+             course: \"use the black one instead\", \"skip that, check the price first\", \"stop after the first site\".",
+            "Your message shows as waiting, then delivered. If the agent is only writing its answer, it reads your message right after.",
+            "Interrupt & send stops the current step and sends your message right away.",
+        ])],
     },
     Section {
         title: "History, bookmarks and focus",
@@ -104,6 +133,17 @@ const GUIDE: &[Section] = &[
                 "To upload, tell it the file's full path. It asks before attaching anything.",
             ]),
         ],
+    },
+    Section {
+        title: "Research, comparing and watching",
+        blocks: &[Block::Bullets(&[
+            "Ask it to read an article, pull out a table, or list search results. It tells you which page each fact came from.",
+            "It can collect results across several pages (\"every listing under $50\") and compare products side by side. \
+             That happens in hidden background pages, so your tabs stay where they are.",
+            "Watches: say \"tell me when this price drops\" or \"let me know when it's back in stock\". The app keeps \
+             checking on a schedule after the agent is done, and tells you with a notification and a note in Chat. \
+             Watches are listed in Focus, where you can remove them.",
+        ])],
     },
     Section {
         title: "Shortcuts",

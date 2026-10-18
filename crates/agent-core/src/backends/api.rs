@@ -20,7 +20,8 @@ pub struct ApiBackend {
 }
 
 impl ApiBackend {
-    pub fn new(api_key: String, host: ToolHost, events: async_channel::Sender<AgentEvent>) -> Self {
+    /// `messages` continues a saved conversation (from [`AgentEvent::Resume`]).
+    pub fn new(api_key: String, host: ToolHost, events: async_channel::Sender<AgentEvent>, messages: Vec<Value>) -> Self {
         let config = ModelConfig::default();
         let _ = events.try_send(AgentEvent::Info(format!(
             "Anthropic API: {} at {} effort (API key billing)",
@@ -30,8 +31,8 @@ impl ApiBackend {
             client: Client::new(api_key, config),
             tools: host.registry().definitions(true),
             host,
-            messages: Vec::new(),
-            turn_start: 0,
+            turn_start: messages.len(),
+            messages,
             events,
         }
     }
@@ -47,6 +48,14 @@ impl ApiBackend {
     }
 
     pub async fn run_turn(&mut self, text: String) {
+        self.run_steps(text).await;
+        // Saved with the chat. Images are left out; they're large and the
+        // model doesn't need old screenshots to continue.
+        let history: Vec<Value> = self.messages.iter().map(without_images).collect();
+        self.emit(AgentEvent::Resume(json!({"api_messages": history})));
+    }
+
+    async fn run_steps(&mut self, text: String) {
         self.turn_start = self.messages.len();
         self.messages.push(json!({
             "role": "user",
@@ -192,6 +201,23 @@ fn after_fallback(content: &[Value]) -> Vec<Value> {
         })
         .map(|(_, b)| b.clone())
         .collect()
+}
+
+/// A message with image blocks inside tool results replaced by a note.
+fn without_images(message: &Value) -> Value {
+    let mut m = message.clone();
+    if let Some(blocks) = m["content"].as_array_mut() {
+        for b in blocks.iter_mut() {
+            if let Some(inner) = b["content"].as_array_mut() {
+                for part in inner.iter_mut() {
+                    if part["type"] == "image" {
+                        *part = json!({"type": "text", "text": "[screenshot not kept]"});
+                    }
+                }
+            }
+        }
+    }
+    m
 }
 
 /// Removes client-side bookkeeping fields before a block goes back on the wire.

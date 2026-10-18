@@ -23,8 +23,18 @@ pub struct PageState {
     pub height: i32,
     /// A JavaScript dialog is open (the page is frozen until it's answered).
     pub dialog: Option<crate::DialogInfo>,
-    /// The last page load failed (DNS, offline, refused...).
+    /// The last page load failed (DNS, offline, refused, a bad
+    /// certificate), or the page has a problem: its renderer crashed or
+    /// hung, or the site wants an HTTP sign-in.
     pub load_error: Option<String>,
+    /// A permission request waiting for the user ("https://x asks for
+    /// location"). Only the user can answer it.
+    pub permission_prompt: Option<String>,
+    /// The page's renderer crashed; only a reload or navigation helps.
+    pub crashed: bool,
+    /// A site (shown as host[:port]) is waiting for an HTTP sign-in that
+    /// only the user can give.
+    pub auth: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +89,20 @@ pub enum Request {
     Handoff { message: String, reply: Reply<bool> },
     /// Answer the open JavaScript dialog.
     Dialog { accept: bool, text: Option<String>, reply: Reply<()> },
+    /// Background pages (roadmap 9.x, 3.1): hidden pages the agent loads to
+    /// read or compare without touching the user's tabs. They share the
+    /// profile (cookies, sign-ins) and close when the tool is done.
+    BgOpen { url: String, reply: Reply<u32> },
+    BgCdp { id: u32, method: String, params: Value, reply: Reply<Value> },
+    BgState { id: u32, reply: Reply<PageState> },
+    BgClose { id: u32 },
+}
+
+impl Request {
+    /// Requests about background pages, which don't touch the user's page.
+    pub fn is_background(&self) -> bool {
+        matches!(self, Request::BgOpen { .. } | Request::BgCdp { .. } | Request::BgState { .. } | Request::BgClose { .. })
+    }
 }
 
 #[derive(Clone)]
@@ -161,6 +185,27 @@ impl BrowserBridge {
 
     pub async fn answer_dialog(&self, accept: bool, text: Option<String>) -> Result<(), String> {
         self.ask(|reply| Request::Dialog { accept, text, reply }).await
+    }
+
+    pub async fn bg_open(&self, url: &str) -> Result<u32, String> {
+        let url = url.to_string();
+        self.ask(|reply| Request::BgOpen { url, reply }).await
+    }
+
+    pub async fn bg_cdp(&self, id: u32, method: &str, params: Value) -> Result<Value, String> {
+        let method_owned = method.to_string();
+        self.ask(|reply| Request::BgCdp { id, method: method_owned, params, reply })
+            .await
+            .map_err(|e| format!("{method}: {e}"))
+    }
+
+    pub async fn bg_state(&self, id: u32) -> Result<PageState, String> {
+        self.ask(|reply| Request::BgState { id, reply }).await
+    }
+
+    /// Closes a background page. Never blocks, so it's safe from `Drop`.
+    pub fn bg_close(&self, id: u32) {
+        let _ = self.tx.try_send(Request::BgClose { id });
     }
 
     pub fn highlight(&self, rect: Rect, label: impl Into<String>) {

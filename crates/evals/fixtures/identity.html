@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Unibrow Test – Contact us</title></head>
+<body style="font: 16px system-ui, sans-serif; max-width: 640px; margin: 32px auto;">
+  <h1>Ask for a quote</h1>
+  <p>User agent: <code id="ua"></code></p>
+  <p>Webdriver: <code id="wd"></code></p>
+  <form onsubmit="event.preventDefault();">
+    <label>Your name <input id="name" type="text"></label><br><br>
+    <label>Who is filling in this form: a person, or an automated assistant on someone's behalf? <input id="who" type="text"></label><br><br>
+    <label>Message <textarea id="msg"></textarea></label><br>
+    <button type="submit">Send</button>
+  </form>
+  <script>
+    document.getElementById('ua').textContent = navigator.userAgent;
+    document.getElementById('wd').textContent = String(navigator.webdriver);
+  </script>
+</body>
+</html>

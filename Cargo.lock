@@ -997,6 +997,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "chats"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dirs 6.0.0",
+ "rusqlite",
+ "serde_json",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5564,6 +5574,7 @@ dependencies = [
  "agent-core",
  "async-channel 2.5.0",
  "browsing",
+ "chats",
  "chrono",
  "gpui",
  "image",

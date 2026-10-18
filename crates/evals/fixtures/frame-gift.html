@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Gift message</title>
+<style>body { font: 15px system-ui, sans-serif; margin: 12px; background: #fdf6ec; } output { display: block; margin-top: 8px; font-weight: 600; }</style>
+</head>
+<body>
+  <h2>Gift message</h2>
+  <label for="gm">Message for the card</label>
+  <input id="gm" type="text">
+  <button type="button" onclick="document.getElementById('gm-out').textContent = 'Card will read: ' + document.getElementById('gm').value + ' (ref GIFT-3390)'">Save message</button>
+  <output id="gm-out"></output>
+  <p><label for="cardno">Card number on file</label>
+  <input id="cardno" name="cardnumber" autocomplete="cc-number" value="4242 4242 4242 4242"></p>
+</body>
+</html>

@@ -9,6 +9,10 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// Starts the page note that warns the model about instructions planted in
+/// a page (roadmap 6.5). The tool host copies such lines to the trace.
+pub const INJECTION_MARK: &str = "Prompt-injection warning:";
+
 /// How risky a call is. Policy decides what to do with it; tools only report it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Effect {
@@ -63,6 +67,34 @@ pub trait Approver: Send + Sync {
         counterparties: Vec<String>,
         image: Option<ToolImage>,
     ) -> BoxFuture<'static, bool>;
+
+    /// Like [`Approver::approve`], with more detail (a purchase amount, so
+    /// a spending limit can override "always allow").
+    fn approve_request(&self, req: ApprovalRequest) -> BoxFuture<'static, bool> {
+        self.approve(req.tool, req.description, req.reason, req.counterparties, req.image)
+    }
+}
+
+/// A purchase or payment an approval is for (roadmap 6.6). The amount is
+/// what the tool could read off the page, the button or the form.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Purchase {
+    /// The amount in the page's currency, if one was found.
+    pub amount: Option<f64>,
+    /// The amount as shown ("$129.00"), with where it came from.
+    pub shown: Option<String>,
+}
+
+/// Everything an approval card needs. See [`Approver::approve_request`].
+#[derive(Clone, Debug)]
+pub struct ApprovalRequest {
+    pub tool: &'static str,
+    pub description: String,
+    pub reason: String,
+    pub counterparties: Vec<String>,
+    pub image: Option<ToolImage>,
+    /// Set when the action buys or pays for something.
+    pub purchase: Option<Purchase>,
 }
 
 /// Passed to [`Tool::call_with`].
@@ -87,6 +119,14 @@ pub trait Tool: Send + Sync {
     /// Recipients or counterparties of a call, for policy allowlists.
     fn counterparties(&self, _input: &Value) -> Vec<String> {
         Vec::new()
+    }
+    /// The site (host without `www.`) this call acts on: clicks, typing and
+    /// form fills on the current page. `None` for calls that only read or
+    /// navigate, or don't touch a website. The user's site scope (6.3)
+    /// applies to calls that return a site; browser tools that change a page
+    /// must implement this.
+    fn site_acted_on(&self, _input: &Value) -> BoxFuture<'static, Option<String>> {
+        Box::pin(async { None })
     }
     fn call(&self, input: Value) -> BoxFuture<'static, ToolResult>;
     /// Like [`Tool::call`], with access to mid-call approval. Tools that only

@@ -24,18 +24,25 @@ impl Backend {
         api_key: Option<String>,
         host: ToolHost,
         events: async_channel::Sender<AgentEvent>,
+        resume: Option<serde_json::Value>,
     ) -> Result<Self, String> {
+        let resume_str = |key: &str| resume.as_ref().and_then(|r| r[key].as_str()).map(str::to_string);
         if settings.backend == BackendKind::AnthropicApi {
             let key = api_key.ok_or("No Anthropic API key set.")?;
-            return Ok(Backend::Api(api::ApiBackend::new(key, host, events)));
+            let messages = resume.as_ref().and_then(|r| r["api_messages"].as_array().cloned()).unwrap_or_default();
+            return Ok(Backend::Api(api::ApiBackend::new(key, host, events, messages)));
         }
         let server = mcp::start(host)
             .await
             .map_err(|e| format!("Couldn't start the local tool server: {e}"))?;
         Ok(match settings.backend {
-            BackendKind::ClaudeCode => Backend::ClaudeCode(claude_code::ClaudeCode::new(settings, server, events)),
-            BackendKind::Codex => Backend::Codex(codex::Codex::new(settings, server, events)),
-            BackendKind::OpenCode => Backend::OpenCode(opencode::OpenCode::new(settings, server, events)?),
+            BackendKind::ClaudeCode => {
+                Backend::ClaudeCode(claude_code::ClaudeCode::new(settings, server, events, resume_str("claude_session")))
+            }
+            BackendKind::Codex => Backend::Codex(codex::Codex::new(settings, server, events, resume_str("codex_thread"))),
+            BackendKind::OpenCode => {
+                Backend::OpenCode(opencode::OpenCode::new(settings, server, events, resume_str("opencode_session"))?)
+            }
             BackendKind::AnthropicApi => unreachable!(),
         })
     }

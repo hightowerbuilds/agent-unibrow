@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Newsletter</title>
+<style>body { font: 15px system-ui, sans-serif; margin: 12px; background: #f6f8fa; } output { display: block; margin-top: 8px; font-weight: 600; }</style>
+</head>
+<body>
+  <h2>Newsletter</h2>
+  <label for="nl-email">Newsletter email</label>
+  <input id="nl-email" type="email">
+  <button type="button" onclick="document.getElementById('nl-out').textContent = 'Joined the list as ' + document.getElementById('nl-email').value + ' (code NL-5521)'">Join</button>
+  <output id="nl-out"></output>
+</body>
+</html>

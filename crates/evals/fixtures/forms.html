@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Unibrow Test Shop – Book a lesson</title>
+<style>
+  body { font: 16px system-ui, sans-serif; max-width: 640px; margin: 32px auto; padding: 0 16px; color: #1b2733; background: #fff; }
+  label, fieldset { display: block; margin: 12px 0 4px; }
+  input, select, button { font: inherit; padding: 4px 8px; }
+  .editor { border: 1px solid #b8c2cc; border-radius: 6px; min-height: 60px; padding: 8px; }
+  .editor p { margin: 0 0 4px; }
+  output { display: block; margin-top: 12px; font-weight: 600; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+  <h1>Book a lesson</h1>
+  <form method="post" action="/book" onsubmit="event.preventDefault(); document.getElementById('review').textContent = 'BOOKED';">
+    <label for="name">Your name</label>
+    <input id="name" name="name" autocomplete="name">
+
+    <label for="date">Lesson date</label>
+    <input id="date" name="date" type="date" min="2026-01-01" max="2027-12-31">
+
+    <label for="time">Start time</label>
+    <input id="time" name="time" type="time">
+
+    <label for="students">Number of students</label>
+    <input id="students" name="students" type="number" min="1" max="8">
+
+    <label for="level">Skill level (1–10)</label>
+    <input id="level" name="level" type="range" min="1" max="10" value="5">
+
+    <label for="instrument">Instrument</label>
+    <select id="instrument" name="instrument">
+      <option value="">Choose…</option>
+      <option value="gtr">Guitar</option>
+      <option value="bass">Bass</option>
+      <option value="uke">Ukulele</option>
+    </select>
+
+    <fieldset>
+      <legend>Experience</legend>
+      <label><input type="radio" name="exp" value="Beginner"> Beginner</label>
+      <label><input type="radio" name="exp" value="Intermediate"> Intermediate</label>
+      <label><input type="radio" name="exp" value="Advanced"> Advanced</label>
+    </fieldset>
+
+    <label><input type="checkbox" id="remind" name="remind"> Send me a reminder</label>
+
+    <!-- Like Gmail's compose body: a contenteditable box with role=textbox. -->
+    <div id="notes-label">Notes for the teacher</div>
+    <div id="notes" class="editor" contenteditable="true" role="textbox" aria-multiline="true" aria-labelledby="notes-label"></div>
+
+    <!-- Like Notion/Lexical: the editor keeps its own model and draws the
+         text itself, so only real input events change what it holds. -->
+    <div id="plan-label">Lesson plan</div>
+    <div id="plan" class="editor" contenteditable="true" aria-labelledby="plan-label"><p><br></p></div>
+
+    <p>
+      <button type="button" id="review-btn">Review booking</button>
+      <button type="submit">Book lesson</button>
+    </p>
+  </form>
+  <output id="review"></output>
+
+  <script>
+    // --- model-backed editor -------------------------------------------
+    const plan = document.getElementById('plan');
+    let model = [''];
+    const render = () => {
+      plan.replaceChildren(...model.map(t => { const p = document.createElement('p'); if (t) p.textContent = t; else p.appendChild(document.createElement('br')); return p; }));
+      const s = getSelection(); const r = document.createRange();
+      r.selectNodeContents(plan.lastChild); r.collapse(false); s.removeAllRanges(); s.addRange(r);
+    };
+    plan.addEventListener('beforeinput', (e) => {
+      e.preventDefault();
+      const sel = getSelection();
+      const replacing = sel.rangeCount && !sel.getRangeAt(0).collapsed;
+      if (replacing) model = [''];
+      const last = model.length - 1;
+      switch (e.inputType) {
+        case 'insertText': case 'insertCompositionText': case 'insertReplacementText':
+          model[last] += (e.data ?? (e.dataTransfer && e.dataTransfer.getData('text/plain')) ?? ''); break;
+        case 'insertFromPaste':
+          model[last] += e.dataTransfer ? e.dataTransfer.getData('text/plain') : ''; break;
+        case 'insertParagraph': case 'insertLineBreak':
+          model.push(''); break;
+        case 'deleteContentBackward':
+          if (!replacing) { if (model[last]) model[last] = model[last].slice(0, -1); else if (model.length > 1) model.pop(); } break;
+        default:
+          if (e.inputType.startsWith('delete')) model = model.length ? model : [''];
+      }
+      render();
+    });
+
+    document.getElementById('review-btn').addEventListener('click', () => {
+      const v = id => document.getElementById(id).value;
+      const exp = (document.querySelector('input[name=exp]:checked') || {}).value || 'none';
+      const inst = document.getElementById('instrument');
+      const notes = document.getElementById('notes').innerText.trim().replace(/\s+/g, ' ');
+      const lines = [
+        `Name: ${v('name') || '(none)'}`,
+        `When: ${v('date') || '(no date)'} at ${v('time') || '(no time)'}`,
+        `Students: ${v('students') || '?'}, level ${v('level')}, ${inst.selectedOptions[0].text}, ${exp}, reminder ${document.getElementById('remind').checked ? 'yes' : 'no'}`,
+        `Notes: ${notes || '(empty)'}`,
+        `Plan has ${model.filter(Boolean).length} line(s): ${model.filter(Boolean).join(' / ') || '(empty)'}`,
+      ];
+      const out = document.getElementById('review');
+      out.replaceChildren(...lines.map(t => { const d = document.createElement('div'); d.textContent = t; return d; }));
+    });
+  </script>
+</body>
+</html>

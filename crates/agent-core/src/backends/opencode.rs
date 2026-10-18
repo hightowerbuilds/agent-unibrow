@@ -27,7 +27,12 @@ pub struct OpenCode {
 }
 
 impl OpenCode {
-    pub fn new(settings: &Settings, mcp: McpServer, events: async_channel::Sender<AgentEvent>) -> Result<Self, String> {
+    pub fn new(
+        settings: &Settings,
+        mcp: McpServer,
+        events: async_channel::Sender<AgentEvent>,
+        session_id: Option<String>,
+    ) -> Result<Self, String> {
         if settings.opencode_model.trim().is_empty() {
             return Err("OpenCode needs a model. Sign in to a provider with `opencode auth login`, then set \
                  \"opencode_model\" (as provider/model, from `opencode models`) in \
@@ -52,7 +57,7 @@ impl OpenCode {
         // Holds the per-launch token, so it's written owner-only.
         let config_path = workspace_dir().join(".opencode-unibrow.json");
         write_private(&config_path, &config.to_string()).map_err(|e| format!("Couldn't write OpenCode config: {e}"))?;
-        Ok(Self { model: settings.opencode_model.clone(), config_path, _mcp: mcp, session_id: None, events })
+        Ok(Self { model: settings.opencode_model.clone(), config_path, _mcp: mcp, session_id, events })
     }
 
     fn emit(&self, ev: AgentEvent) {
@@ -97,6 +102,9 @@ impl OpenCode {
             if let Some(id) = ev["sessionID"].as_str() {
                 if self.session_id.is_none() {
                     self.emit(AgentEvent::Info(format!("OpenCode session {id} on {}", self.model)));
+                }
+                if self.session_id.as_deref() != Some(id) {
+                    self.emit(AgentEvent::Resume(json!({"opencode_session": id})));
                 }
                 self.session_id = Some(id.to_string());
             }

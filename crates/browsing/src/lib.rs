@@ -6,6 +6,10 @@
 //!   with every message and can look it up with a tool. It is the scope later
 //!   decision models (Jev) and long-context models (SubQ) work within.
 //!
+//! - **Watches**: pages the app re-checks on a schedule ("tell me when
+//!   this price drops"). The app's checker loads them in the background and
+//!   tells the user when the watched value changes the way they asked.
+//!
 //! Stored in SQLite at `~/.local/share/agent-unibrow/browsing.sqlite3`.
 //! The store is `Send + Sync`: the UI writes visits, agent tools read.
 
@@ -48,6 +52,80 @@ pub struct FocusSite {
     /// A readable name (the page title when it was added, or the user's).
     pub label: String,
     pub added: DateTime<Local>,
+}
+
+/// A page the app checks on a schedule (roadmap 9.4).
+#[derive(Clone, Debug)]
+pub struct Watch {
+    pub id: i64,
+    pub url: String,
+    pub label: String,
+    /// `price` or `text`.
+    pub kind: String,
+    /// CSS selector for the part of the page to read, if not the whole page.
+    pub selector: Option<String>,
+    /// For text watches: text whose presence is tracked ("In stock").
+    pub needle: Option<String>,
+    /// `changes`, `drops`, `rises`, `appears` or `disappears`.
+    pub when: String,
+    pub every_min: i64,
+    pub last_value: Option<String>,
+    pub last_checked: Option<DateTime<Local>>,
+    pub last_changed: Option<DateTime<Local>>,
+    pub last_error: Option<String>,
+    pub created: DateTime<Local>,
+}
+
+/// A watch saw the change it was waiting for.
+#[derive(Clone, Debug)]
+pub struct WatchFired {
+    pub watch: Watch,
+    pub old: String,
+    pub new: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NewWatch {
+    pub url: String,
+    pub label: String,
+    pub kind: String,
+    pub selector: Option<String>,
+    pub needle: Option<String>,
+    pub when: String,
+    pub every_min: i64,
+}
+
+/// Most watches kept at once.
+pub const MAX_WATCHES: usize = 50;
+
+/// The number in a price string: "$1,299.00" → 1299.0, "13,98 €" → 13.98.
+pub fn parse_price(text: &str) -> Option<f64> {
+    let start = text.find(|c: char| c.is_ascii_digit())?;
+    let num: String = text[start..].chars().take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ',').collect();
+    let num = num.trim_end_matches(['.', ',']);
+    let normalized = match (num.rfind('.'), num.rfind(',')) {
+        // "1.299,00": dots group, comma is the decimal point.
+        (Some(d), Some(c)) if c > d => num.replace('.', "").replace(',', "."),
+        (Some(_), Some(_)) => num.replace(',', ""),
+        // "13,98": a comma with two digits after it is a decimal point.
+        (None, Some(c)) if num.len() - c - 1 == 2 => num.replace(',', "."),
+        _ => num.replace(',', ""),
+    };
+    normalized.parse().ok()
+}
+
+/// Whether going from `old` to `new` is what the watch waits for.
+fn watch_fires(when: &str, old: &str, new: &str) -> bool {
+    if old == new {
+        return false;
+    }
+    match when {
+        "drops" => matches!((parse_price(old), parse_price(new)), (Some(o), Some(n)) if n < o),
+        "rises" => matches!((parse_price(old), parse_price(new)), (Some(o), Some(n)) if n > o),
+        "appears" => new == "present",
+        "disappears" => new == "absent",
+        _ => true,
+    }
 }
 
 #[derive(Default, Clone, Debug)]
@@ -134,6 +212,21 @@ impl Browsing {
                  site TEXT PRIMARY KEY,
                  label TEXT NOT NULL DEFAULT '',
                  added INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS watches (
+                 id INTEGER PRIMARY KEY,
+                 url TEXT NOT NULL,
+                 label TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 selector TEXT,
+                 needle TEXT,
+                 notify_when TEXT NOT NULL,
+                 every_min INTEGER NOT NULL,
+                 last_value TEXT,
+                 last_checked INTEGER,
+                 last_changed INTEGER,
+                 last_error TEXT,
+                 created INTEGER NOT NULL
              );",
         )
         .map_err(|e| format!("can't set up the history database: {e}"))?;
@@ -352,6 +445,95 @@ impl Browsing {
         }
     }
 
+    pub fn add_watch(&self, w: &NewWatch) -> Result<i64, String> {
+        if self.watches().len() >= MAX_WATCHES {
+            return Err(format!("There are already {MAX_WATCHES} watches; remove some first."));
+        }
+        let c = self.conn();
+        c.execute(
+            "INSERT INTO watches (url, label, kind, selector, needle, notify_when, every_min, created)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![w.url, w.label, w.kind, w.selector, w.needle, w.when, w.every_min, Local::now().timestamp()],
+        )
+        .map_err(|e| format!("couldn't save the watch: {e}"))?;
+        Ok(c.last_insert_rowid())
+    }
+
+    pub fn remove_watch(&self, id: i64) -> bool {
+        self.conn().execute("DELETE FROM watches WHERE id = ?1", params![id]).map(|n| n > 0).unwrap_or(false)
+    }
+
+    pub fn watches(&self) -> Vec<Watch> {
+        self.query_watches("SELECT id, url, label, kind, selector, needle, notify_when, every_min, last_value,
+                                   last_checked, last_changed, last_error, created FROM watches ORDER BY id", [])
+    }
+
+    /// Watches whose next check is due at `now` (Unix seconds).
+    pub fn due_watches(&self, now: i64) -> Vec<Watch> {
+        self.query_watches(
+            "SELECT id, url, label, kind, selector, needle, notify_when, every_min, last_value,
+                    last_checked, last_changed, last_error, created FROM watches
+             WHERE last_checked IS NULL OR last_checked + every_min * 60 <= ?1 ORDER BY id",
+            [now],
+        )
+    }
+
+    fn query_watches<P: rusqlite::Params>(&self, sql: &str, p: P) -> Vec<Watch> {
+        let c = self.conn();
+        let Ok(mut stmt) = c.prepare(sql) else { return Vec::new() };
+        stmt.query_map(p, |r| {
+            Ok(Watch {
+                id: r.get(0)?,
+                url: r.get(1)?,
+                label: r.get(2)?,
+                kind: r.get(3)?,
+                selector: r.get(4)?,
+                needle: r.get(5)?,
+                when: r.get(6)?,
+                every_min: r.get(7)?,
+                last_value: r.get(8)?,
+                last_checked: r.get::<_, Option<i64>>(9)?.map(when),
+                last_changed: r.get::<_, Option<i64>>(10)?.map(when),
+                last_error: r.get(11)?,
+                created: when(r.get(12)?),
+            })
+        })
+        .map(|rows| rows.filter_map(Result::ok).collect())
+        .unwrap_or_default()
+    }
+
+    /// Records a check. Returns the change when it's one the watch waits
+    /// for. The first value seen is the baseline and never fires.
+    pub fn record_watch_check(&self, id: i64, result: Result<String, String>) -> Option<WatchFired> {
+        let now = Local::now().timestamp();
+        let watch = self.watches().into_iter().find(|w| w.id == id)?;
+        let c = self.conn();
+        match result {
+            Ok(value) => {
+                let changed = watch.last_value.as_deref().is_some_and(|old| old != value);
+                let _ = c.execute(
+                    "UPDATE watches SET last_value = ?2, last_checked = ?3, last_error = NULL,
+                         last_changed = CASE WHEN ?4 THEN ?3 ELSE last_changed END WHERE id = ?1",
+                    params![id, value, now, changed],
+                );
+                let old = watch.last_value.clone()?;
+                watch_fires(&watch.when, &old, &value).then(|| WatchFired { watch, old, new: value })
+            }
+            Err(e) => {
+                let _ = c.execute(
+                    "UPDATE watches SET last_checked = ?2, last_error = ?3 WHERE id = ?1",
+                    params![id, now, e],
+                );
+                None
+            }
+        }
+    }
+
+    /// Makes a watch due now (the agent asked for a fresh check).
+    pub fn check_watch_soon(&self, id: i64) {
+        let _ = self.conn().execute("UPDATE watches SET last_checked = NULL WHERE id = ?1 AND last_value IS NOT NULL", params![id]);
+    }
+
     /// One line naming the focus sites, for the context sent with each message.
     pub fn focus_summary(&self) -> Option<String> {
         let sites = self.focus_sites();
@@ -439,6 +621,44 @@ mod tests {
         assert_eq!(all.iter().find(|m| m.site == "sweetwater.com").unwrap().url, "https://www.sweetwater.com/item");
         assert!(!b.toggle_bookmark("https://www.sweetwater.com/item", ""));
         assert_eq!(b.bookmarks().len(), 1);
+    }
+
+    #[test]
+    fn prices_parse() {
+        assert_eq!(parse_price("$1,299.00"), Some(1299.0));
+        assert_eq!(parse_price("USD 13.98"), Some(13.98));
+        assert_eq!(parse_price("13,98 €"), Some(13.98));
+        assert_eq!(parse_price("1.299,50 €"), Some(1299.5));
+        assert_eq!(parse_price("£1,299"), Some(1299.0));
+        assert_eq!(parse_price("free"), None);
+    }
+
+    #[test]
+    fn watches_fire_on_the_right_change() {
+        let b = Browsing::in_memory();
+        let id = b
+            .add_watch(&NewWatch {
+                url: "https://x.test/nut".into(),
+                label: "TUSQ nut".into(),
+                kind: "price".into(),
+                when: "drops".into(),
+                every_min: 60,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(b.due_watches(Local::now().timestamp()).len(), 1);
+        // First value is the baseline.
+        assert!(b.record_watch_check(id, Ok("$13.98".into())).is_none());
+        assert!(b.due_watches(Local::now().timestamp()).is_empty());
+        assert!(b.record_watch_check(id, Ok("$14.50".into())).is_none(), "a rise isn't a drop");
+        let fired = b.record_watch_check(id, Ok("$11.00".into())).expect("drop fires");
+        assert_eq!((fired.old.as_str(), fired.new.as_str()), ("$14.50", "$11.00"));
+        assert!(b.record_watch_check(id, Err("offline".into())).is_none());
+        let w = &b.watches()[0];
+        assert_eq!(w.last_value.as_deref(), Some("$11.00"));
+        assert_eq!(w.last_error.as_deref(), Some("offline"));
+        assert!(b.remove_watch(id));
+        assert!(b.watches().is_empty());
     }
 
     #[test]

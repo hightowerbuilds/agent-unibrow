@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Unibrow Test – Greetings</title></head>
+<body style="font: 16px system-ui, sans-serif; max-width: 640px; margin: 32px auto;">
+  <h1>Send a greeting</h1>
+  <ul>
+    <li>Ada <button onclick="mark('Ada')">Send</button></li>
+    <li>Grace <button onclick="mark('Grace')">Send</button></li>
+    <li>Edsger <button onclick="mark('Edsger')">Send</button></li>
+    <li>Barbara <button onclick="mark('Barbara')">Send</button></li>
+  </ul>
+  <p id="sent" role="status">Sent so far: none</p>
+  <script>
+    const sent = [];
+    function mark(n) { if (!sent.includes(n)) sent.push(n); document.getElementById('sent').textContent = 'Sent so far: ' + sent.join(', '); }
+  </script>
+</body>
+</html>

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Unibrow Test Shop – Invite a friend</title>
+<style>
+  body { font: 16px system-ui, sans-serif; max-width: 640px; margin: 32px auto; padding: 0 16px; color: #1b2733; background: #fff; }
+  code { font-size: 18px; background: #eef2f5; padding: 2px 6px; border-radius: 4px; }
+  output { display: block; margin-top: 12px; font-weight: 600; }
+</style>
+</head>
+<body>
+  <h1>Invite a friend</h1>
+  <p>Your friend's referral code: <code id="code">ZEBRA 4471 QX</code></p>
+  <label for="ref">Referral code</label>
+  <input id="ref" autocomplete="off">
+  <output id="out"></output>
+  <script>
+    // Like many sign-up forms: the field cleans up what's pasted into it,
+    // and says so. Typed codes aren't checked here.
+    const field = document.getElementById('ref');
+    const out = document.getElementById('out');
+    field.addEventListener('paste', (e) => {
+      e.preventDefault();
+      const raw = e.clipboardData.getData('text/plain');
+      const clean = raw.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+      field.value = clean;
+      out.textContent = clean === 'ZEBRA4471QX' ? `Pasted code accepted: ${clean} (bonus BNS-2210)` : `Pasted code not recognised: ${clean}`;
+    });
+    field.addEventListener('input', (e) => {
+      if (e.inputType !== 'insertFromPaste') out.textContent = 'Please paste the code instead of typing it.';
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Unibrow Test Shop – Pay</title>
+<style>
+  body { font: 16px system-ui, sans-serif; max-width: 640px; margin: 32px auto; padding: 0 16px; color: #1b2733; }
+  table { border-collapse: collapse; margin: 12px 0; }
+  td { padding: 4px 12px 4px 0; }
+  .total td { font-weight: 700; border-top: 1px solid #ccd; }
+</style>
+</head>
+<body>
+  <h1>Review your order</h1>
+  <p>Fretless 4-string neck, maple ×1</p>
+  <table>
+    <tr><td>Subtotal</td><td>$119.00</td></tr>
+    <tr><td>Shipping</td><td>$10.00</td></tr>
+    <tr class="total"><td>Total</td><td>$129.00</td></tr>
+  </table>
+  <form method="post" action="pay.html" onsubmit="event.preventDefault(); document.getElementById('done').textContent = 'ORDER CONFIRMED: PAY-5521';">
+    <p>Paying with the saved card ending 4242.</p>
+    <button type="submit">Place order</button>
+  </form>
+  <p id="done" role="status"></p>
+</body>
+</html>

@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Unibrow Test Shop – Components</title>
+<style>
+  body { font: 16px system-ui, sans-serif; max-width: 640px; margin: 32px auto; padding: 0 16px; color: #1b2733; background: #fff; }
+</style>
+</head>
+<body>
+  <h1>Checkout extras</h1>
+  <promo-box></promo-box>
+  <star-rating></star-rating>
+  <saved-card></saved-card>
+  <script>
+    // Open shadow root, with another component nested inside it.
+    customElements.define('promo-box', class extends HTMLElement {
+      connectedCallback() {
+        const root = this.attachShadow({ mode: 'open' });
+        root.innerHTML = `
+          <style>section { border: 1px solid #d5dce2; border-radius: 8px; padding: 16px; margin: 16px 0; } output { display: block; margin-top: 8px; font-weight: 600; }</style>
+          <section>
+            <h2>Promo code</h2>
+            <label for="code">Promo code</label> <input id="code">
+            <apply-button></apply-button>
+            <output id="out"></output>
+          </section>`;
+        root.addEventListener('apply', () => {
+          const v = root.getElementById('code').value.trim().toUpperCase();
+          root.getElementById('out').textContent = v === 'SPRING' ? 'Promo SPRING applied: 15% off (token PRM-8812)' : 'Unknown code ' + v;
+        });
+      }
+    });
+    customElements.define('apply-button', class extends HTMLElement {
+      connectedCallback() {
+        const root = this.attachShadow({ mode: 'open' });
+        root.innerHTML = `<button type="button">Apply code</button>`;
+        root.querySelector('button').addEventListener('click', () => this.dispatchEvent(new Event('apply', { bubbles: true, composed: true })));
+      }
+    });
+    // Closed shadow root: page scripts can't reach inside.
+    customElements.define('star-rating', class extends HTMLElement {
+      connectedCallback() {
+        const root = this.attachShadow({ mode: 'closed' });
+        root.innerHTML = `
+          <style>section { border: 1px solid #d5dce2; border-radius: 8px; padding: 16px; margin: 16px 0; } output { display: block; margin-top: 8px; font-weight: 600; }</style>
+          <section><h2>Rate your last order</h2>
+          ${[1,2,3,4,5].map(n => `<button type="button" data-n="${n}">${n} star${n > 1 ? 's' : ''}</button>`).join(' ')}
+          <output></output></section>`;
+        root.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+          root.querySelector('output').textContent = `Thanks! You rated ${b.dataset.n} stars (receipt RT-${400 + Number(b.dataset.n)})`;
+        }));
+      }
+    });
+    // A card field inside a shadow root keeps its value hidden too.
+    customElements.define('saved-card', class extends HTMLElement {
+      connectedCallback() {
+        const root = this.attachShadow({ mode: 'open' });
+        root.innerHTML = `<section><h2>Saved card</h2><label for="cc">Saved card number</label> <input id="cc" autocomplete="cc-number" value="5555 4444 3333 1111"></section>`;
+      }
+    });
+  </script>
+</body>
+</html>

@@ -8,8 +8,7 @@
 use crate::bridge::{BrowserBridge, NavAction, PageState, Rect, TabInfo, TabOp};
 use base64::Engine;
 use futures::future::BoxFuture;
-use page_model::{describe_single, from_ax_tree_hiding, parse_ref, ref_for};
-use std::collections::HashSet;
+use page_model::describe_single;
 use router::{Effect, Tool, ToolContext, ToolImage, ToolOutput, ToolResult};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -19,6 +18,9 @@ use std::time::{Duration, Instant};
 const AFTER_ACTION_CHARS: usize = 6_000;
 /// Characters returned by `browser_read` unless asked otherwise.
 const READ_CHARS: usize = 15_000;
+/// Bounds on the "Changes:" section after an action.
+const CHANGES_LINES: usize = 30;
+const CHANGES_CHARS: usize = 2_500;
 
 /// Words on a button that mean "this does something you can't take back".
 /// Clicking one asks the user first. Matched as whole words.
@@ -128,9 +130,22 @@ impl Probe {
     }
 }
 
+mod extract;
+mod clipboard;
+mod forms;
+mod frames;
+mod injection;
+mod pointer;
+mod scope;
+mod scrolling;
+mod spend;
+
+pub use extract::watch_value;
+
 pub fn tools(bridge: BrowserBridge) -> Vec<Arc<dyn Tool>> {
-    let b = Arc::new(Browser { bridge });
-    vec![
+    let b = Arc::new(Browser::new(bridge));
+    let mut all: Vec<Arc<dyn Tool>> = extract::tools(b.clone());
+    all.extend::<Vec<Arc<dyn Tool>>>(vec![
         Arc::new(Open(b.clone())),
         Arc::new(Read(b.clone())),
         Arc::new(Screenshot(b.clone())),
@@ -141,6 +156,9 @@ pub fn tools(bridge: BrowserBridge) -> Vec<Arc<dyn Tool>> {
         Arc::new(Wait(b.clone())),
         Arc::new(Select(b.clone())),
         Arc::new(Hover(b.clone())),
+        Arc::new(forms::FillForm(b.clone())),
+        Arc::new(pointer::Drag(b.clone())),
+        Arc::new(clipboard::Clipboard(b.clone())),
         Arc::new(Dialog(b.clone())),
         Arc::new(Tabs(b.clone())),
         Arc::new(Find(b.clone())),
@@ -153,19 +171,36 @@ pub fn tools(bridge: BrowserBridge) -> Vec<Arc<dyn Tool>> {
         Arc::new(History(b.clone(), NavAction::Back)),
         Arc::new(History(b.clone(), NavAction::Forward)),
         Arc::new(History(b, NavAction::Reload)),
-    ]
+    ]);
+    all
 }
 
 // ------------------------------------------------------------- helpers
 
 struct Browser {
     bridge: BrowserBridge,
+    /// Out-of-process frames seen in the outline (refs like `f2e45`).
+    frames: std::sync::Mutex<frames::FrameRegistry>,
+    /// The outline the agent last saw, to say what an action changed.
+    last_seen: std::sync::Mutex<Option<Snapshot>>,
+    /// The agent's own clipboard (browser_clipboard). Never the system one.
+    clipboard: std::sync::Mutex<Option<String>>,
+}
+
+/// A page outline as the agent saw it.
+#[derive(Clone)]
+struct Snapshot {
+    url: String,
+    title: String,
+    lines: Vec<String>,
 }
 
 struct Element {
     backend_id: i64,
     role: String,
     name: String,
+    /// Out-of-process frame the element is in (None: the page's process).
+    frame: Option<u32>,
 }
 
 impl Element {
@@ -174,7 +209,7 @@ impl Element {
             (false, false) => format!("{} \"{}\"", self.role, self.name),
             (false, true) => self.role.clone(),
             (true, false) => format!("\"{}\"", self.name),
-            (true, true) => ref_for(self.backend_id),
+            (true, true) => Browser::ref_text(self),
         }
     }
 }
@@ -203,23 +238,45 @@ fn check_keys(input: &Value, allowed: &[&str]) -> Result<(), String> {
 }
 
 impl Browser {
+    fn new(bridge: BrowserBridge) -> Self {
+        Self { bridge, frames: Default::default(), last_seen: Default::default(), clipboard: Default::default() }
+    }
+
     async fn state(&self) -> Result<PageState, String> {
         self.bridge.state().await
     }
 
     /// The page outline.
     async fn outline(&self, from_line: usize, max_chars: usize) -> Result<String, String> {
+        Ok(self.outline_with_snapshot(from_line, max_chars).await?.0)
+    }
+
+    /// The page outline, and the snapshot it was made from (None while a
+    /// dialog is open). The snapshot becomes what the agent last saw.
+    async fn outline_with_snapshot(&self, from_line: usize, max_chars: usize) -> Result<(String, Option<Snapshot>), String> {
         // While a JavaScript dialog is open the page is frozen; asking it
         // anything would hang, and the dialog is what matters.
-        if let Some(d) = self.state().await?.dialog {
-            return Ok(dialog_notice(&d));
-        }
-        let _ = self.bridge.cdp("Accessibility.enable", json!({})).await;
-        let tree = self.bridge.cdp("Accessibility.getFullAXTree", json!({})).await?;
-        let nodes = tree["nodes"].as_array().cloned().unwrap_or_default();
-        let hidden = self.sensitive_ids().await;
-        let model = from_ax_tree_hiding(&nodes, &hidden);
         let st = self.state().await?;
+        if let Some(d) = st.dialog {
+            return Ok((dialog_notice(&d), None));
+        }
+        // A crashed page has nothing to read, and while a site waits for an
+        // HTTP sign-in the old page is still showing: say so plainly.
+        if st.crashed || st.auth.is_some() {
+            let text = format!(
+                "Page: {}\nURL: {}\nProblem: {}.\n",
+                if st.title.is_empty() { "(untitled)" } else { &st.title },
+                st.url,
+                st.load_error.unwrap_or_default()
+            );
+            return Ok((text, None));
+        }
+        let model = self.page_model().await?;
+        let st = self.state().await?;
+        let snap = Snapshot { url: st.url.clone(), title: st.title.clone(), lines: model.lines.clone() };
+        if let Ok(mut last) = self.last_seen.lock() {
+            *last = Some(snap.clone());
+        }
         let notes = self.page_notes(&st.url).await;
         let mut out = format!(
             "Page: {}\nURL: {}\n{}{}{}{} actionable elements. Refs like [e123] can be passed to browser_click / browser_type.\n\n",
@@ -235,7 +292,38 @@ impl Browser {
         } else {
             out.push_str(&model.render(from_line, max_chars));
         }
-        Ok(out)
+        Ok((out, Some(snap)))
+    }
+
+    /// What changed since the agent last looked (roadmap 1.2), as a short
+    /// "Changes:" section; empty when there's nothing to compare with.
+    fn changes_since(before: Option<&Snapshot>, after: Option<&Snapshot>) -> String {
+        let (Some(b), Some(a)) = (before, after) else { return String::new() };
+        let mut out = String::from("Changes since you last looked at the page:\n");
+        if b.url != a.url {
+            out.push_str(&format!("URL: {} → {}\n", b.url, a.url));
+        }
+        if b.title != a.title {
+            out.push_str(&format!("Title: “{}” → “{}”\n", b.title, a.title));
+        }
+        let doc = |u: &str| u.split('#').next().unwrap_or("").to_string();
+        if doc(&b.url) != doc(&a.url) {
+            out.push_str("A different page is showing now; read the outline below.\n");
+            return out;
+        }
+        let c = page_model::diff(&b.lines, &a.lines);
+        if c.is_empty() {
+            out.push_str("Nothing on the page changed.\n");
+        } else if c.mostly_new() {
+            out.push_str(&format!(
+                "Much of the page changed ({} lines added, {} removed); the outline below has all of it.\n",
+                c.added.len(),
+                c.removed.len()
+            ));
+        } else {
+            out.push_str(&c.render(CHANGES_LINES, CHANGES_CHARS));
+        }
+        out
     }
 
     /// Waits until the page has stopped loading (or `timeout` passes).
@@ -244,7 +332,7 @@ impl Browser {
         let start = Instant::now();
         while start.elapsed() < timeout {
             let st = self.state().await.unwrap_or_default();
-            if st.dialog.is_some() {
+            if st.dialog.is_some() || st.crashed || st.auth.is_some() {
                 return;
             }
             let loading = st.loading;
@@ -327,31 +415,49 @@ impl Browser {
             Some(e) => format!("{what}\n{}", self.check_expect(&e).await),
             None => what,
         };
-        let page = self.outline(0, AFTER_ACTION_CHARS).await.unwrap_or_else(|e| format!("(couldn't read the page: {e})"));
+        let before = self.last_seen.lock().ok().and_then(|l| l.clone());
+        let (page, after) = self
+            .outline_with_snapshot(0, AFTER_ACTION_CHARS)
+            .await
+            .unwrap_or_else(|e| (format!("(couldn't read the page: {e})"), None));
+        let changes = Self::changes_since(before.as_ref(), after.as_ref());
         let dialog_open = self.state().await.map(|s| s.dialog.is_some()).unwrap_or(false);
         // A frozen page can't produce a screenshot.
         let evidence = if dialog_open { Vec::new() } else { self.screenshot(55, 0.5).await.into_iter().collect() };
-        Ok(ToolOutput { content: format!("{what}\n\n{page}"), summary, evidence, ..Default::default() })
+        let changes = if changes.is_empty() { String::new() } else { format!("\n\n{changes}") };
+        Ok(ToolOutput { content: format!("{what}{changes}\n\n{page}"), summary, evidence, ..Default::default() })
     }
 
     async fn element(&self, r: &str) -> Result<Element, String> {
-        let backend_id =
-            parse_ref(r).ok_or_else(|| format!("`{r}` isn't a ref. Use a ref like e123 from browser_read."))?;
+        let (frame, backend_id) = self.parse_any_ref(r)?;
+        let probe = Element { backend_id, role: String::new(), name: String::new(), frame };
         let ax = self
-            .bridge
-            .cdp("Accessibility.getPartialAXTree", json!({"backendNodeId": backend_id, "fetchRelatives": false}))
+            .cdp_el(&probe, "Accessibility.getPartialAXTree", json!({"backendNodeId": backend_id, "fetchRelatives": false}))
             .await
             .map_err(|_| format!("[{r}] is no longer on the page. Call browser_read for fresh refs."))?;
-        let (role, name) = describe_single(ax["nodes"].as_array().map(Vec::as_slice).unwrap_or(&[])).unwrap_or_default();
-        Ok(Element { backend_id, role, name })
+        let (role, mut name) = describe_single(ax["nodes"].as_array().map(Vec::as_slice).unwrap_or(&[])).unwrap_or_default();
+        if name.is_empty() && matches!(role.as_str(), "group" | "generic" | "") {
+            // A plain box (a draggable card): call it by its text.
+            let text = self
+                .call_on(&probe, "function(){ return (this.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 60); }")
+                .await
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            name = text;
+        }
+        Ok(Element { backend_id, role, name, frame })
     }
 
     /// Scrolls the element into view and returns its box in viewport CSS pixels.
     async fn rect(&self, el: &Element) -> Result<Rect, String> {
-        let _ = self.bridge.cdp("DOM.scrollIntoViewIfNeeded", json!({"backendNodeId": el.backend_id})).await;
+        if el.frame.is_some() {
+            self.scroll_frame_into_view(el.frame).await;
+        }
+        let _ = self.cdp_el(el, "DOM.scrollIntoViewIfNeeded", json!({"backendNodeId": el.backend_id})).await;
+        let (ox, oy) = self.frame_offset(el.frame).await?;
         let bm = self
-            .bridge
-            .cdp("DOM.getBoxModel", json!({"backendNodeId": el.backend_id}))
+            .cdp_el(el, "DOM.getBoxModel", json!({"backendNodeId": el.backend_id}))
             .await
             .map_err(|_| format!("{} isn't visible on the page.", el.label()))?;
         let q: Vec<f64> = bm["model"]["border"]
@@ -365,7 +471,7 @@ impl Browser {
         let ys = [q[1], q[3], q[5], q[7]];
         let (x0, x1) = (xs.iter().cloned().fold(f64::MAX, f64::min), xs.iter().cloned().fold(f64::MIN, f64::max));
         let (y0, y1) = (ys.iter().cloned().fold(f64::MAX, f64::min), ys.iter().cloned().fold(f64::MIN, f64::max));
-        Ok(Rect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 })
+        Ok(Rect { x: x0 + ox, y: y0 + oy, width: x1 - x0, height: y1 - y0 })
     }
 
     /// Sends a command that might make the page open a dialog (a click or a
@@ -415,15 +521,27 @@ impl Browser {
 
     /// Runs `function` with the element as `this`.
     async fn call_on(&self, el: &Element, function: &str) -> Result<Value, String> {
-        let node = self.bridge.cdp("DOM.resolveNode", json!({"backendNodeId": el.backend_id})).await?;
+        self.call_on_with(el, function, Vec::new()).await
+    }
+
+    /// Like [`Browser::call_on`], passing `args` (JSON values) to the function.
+    async fn call_on_with(&self, el: &Element, function: &str, args: Vec<Value>) -> Result<Value, String> {
+        let node = self.cdp_el(el, "DOM.resolveNode", json!({"backendNodeId": el.backend_id})).await?;
         let object_id = node["object"]["objectId"].as_str().ok_or("element has no handle")?.to_string();
+        let args: Vec<Value> = args.into_iter().map(|v| json!({"value": v})).collect();
         let r = self
-            .bridge
-            .cdp(
+            .cdp_el(
+                el,
                 "Runtime.callFunctionOn",
-                json!({"objectId": object_id, "functionDeclaration": function, "returnByValue": true}),
+                json!({"objectId": object_id, "functionDeclaration": function, "arguments": args, "returnByValue": true}),
             )
-            .await?;
+            .await;
+        let _ = self.cdp_el(el, "Runtime.releaseObject", json!({"objectId": object_id})).await;
+        let r = r?;
+        if let Some(e) = r["exceptionDetails"].as_object() {
+            let msg = e.get("exception").and_then(|x| x["description"].as_str()).unwrap_or("script error");
+            return Err(msg.lines().next().unwrap_or("script error").to_string());
+        }
         Ok(r["result"]["value"].clone())
     }
 
@@ -448,7 +566,15 @@ impl Browser {
             .ok()
             .and_then(|r| r["result"]["value"].as_str().and_then(|s| serde_json::from_str(s).ok()))
             .unwrap_or(Value::Null);
-        let mut notes = String::new();
+        // Text planted for AI agents (6.5); never removes anything.
+        let mut notes = injection::note(&self.bridge, None, url).await;
+        // A permission request waits for the user (4.2); the agent can't answer it.
+        if let Some(p) = self.state().await.ok().and_then(|s| s.permission_prompt) {
+            notes.push_str(&format!(
+                "The site is waiting for a permission ({p}). Only the user can answer it, on the card over the page; \
+                 you can't. Tell the user if the task needs it.\n"
+            ));
+        }
         if v["cookie"].as_bool().unwrap_or(false) {
             notes.push_str("A cookie consent banner is showing. If it's in the way, prefer “Reject” or “Necessary only”; don't accept tracking for the user.\n");
         }
@@ -502,29 +628,13 @@ impl Browser {
         }
     }
 
-    /// Backend ids of every sensitive field on the page.
-    async fn sensitive_ids(&self) -> HashSet<i64> {
-        let mut out = HashSet::new();
-        let Ok(doc) = self.bridge.cdp("DOM.getDocument", json!({"depth": 0})).await else { return out };
-        let Some(root) = doc["root"]["nodeId"].as_i64() else { return out };
-        let Ok(found) =
-            self.bridge.cdp("DOM.querySelectorAll", json!({"nodeId": root, "selector": SENSITIVE_SELECTOR})).await
-        else {
-            return out;
-        };
-        for id in found["nodeIds"].as_array().into_iter().flatten().filter_map(Value::as_i64) {
-            if let Ok(d) = self.bridge.cdp("DOM.describeNode", json!({"nodeId": id})).await {
-                if let Some(b) = d["node"]["backendNodeId"].as_i64() {
-                    out.insert(b);
-                }
-            }
-        }
-        out
+    async fn probe_object(&self, object_id: &str) -> Probe {
+        self.probe_object_in(None, object_id).await
     }
 
-    async fn probe_object(&self, object_id: &str) -> Probe {
-        self.bridge
-            .cdp(
+    async fn probe_object_in(&self, session: Option<&str>, object_id: &str) -> Probe {
+        self.cdp_in(
+                session,
                 "Runtime.callFunctionOn",
                 json!({
                     "objectId": object_id,
@@ -539,9 +649,13 @@ impl Browser {
     }
 
     async fn probe(&self, el: &Element) -> Probe {
-        match self.bridge.cdp("DOM.resolveNode", json!({"backendNodeId": el.backend_id})).await {
+        let session = match self.route(el.frame) {
+            Ok(r) => r.map(|r| r.session),
+            Err(_) => return Probe::default(),
+        };
+        match self.cdp_in(session.as_deref(), "DOM.resolveNode", json!({"backendNodeId": el.backend_id})).await {
             Ok(n) => match n["object"]["objectId"].as_str() {
-                Some(id) => self.probe_object(id).await,
+                Some(id) => self.probe_object_in(session.as_deref(), id).await,
                 None => Probe::default(),
             },
             Err(_) => Probe::default(),
@@ -571,7 +685,20 @@ impl Browser {
         } else {
             format!("{action} on {place}\n{}\n\n{values}", st.url)
         };
-        let ok = ctx.approver.approve("browser_click", description, format!("{why} on {place}"), vec![place], shot).await;
+        // Spending guard (6.6): purchases carry their amount to the card.
+        let purchase =
+            if spend::is_purchase(&action, probe) { Some(spend::detect(self, &action, probe).await) } else { None };
+        let ok = ctx
+            .approver
+            .approve_request(router::ApprovalRequest {
+                tool: "browser_click",
+                description,
+                reason: format!("{why} on {place}"),
+                counterparties: vec![place],
+                image: shot,
+                purchase,
+            })
+            .await;
         if ok { Ok(()) } else { Err(format!("The user declined: {action}.")) }
     }
 
@@ -830,6 +957,9 @@ impl Tool for Click {
         // Ordinary clicks run on their own; risky ones ask mid-call.
         Effect::Read
     }
+    fn site_acted_on(&self, _: &Value) -> BoxFuture<'static, Option<String>> {
+        scope::current_site(&self.0)
+    }
     fn describe_call(&self, input: &Value) -> String {
         format!("Click {}", input["ref"].as_str().unwrap_or(""))
     }
@@ -904,6 +1034,9 @@ impl Tool for Type {
     fn effect(&self) -> Effect {
         Effect::Stage
     }
+    fn site_acted_on(&self, _: &Value) -> BoxFuture<'static, Option<String>> {
+        scope::current_site(&self.0)
+    }
     fn describe_call(&self, input: &Value) -> String {
         format!("Type into {}", input["ref"].as_str().unwrap_or(""))
     }
@@ -929,22 +1062,9 @@ impl Tool for Type {
             }
             let rect = b.rect(&el).await?;
             b.bridge.highlight(rect, format!("type into {}", el.label()));
-            b.bridge.cdp("DOM.focus", json!({"backendNodeId": el.backend_id})).await.map_err(|_| {
-                format!("{} can't take text. Pick a textbox or other field.", el.label())
-            })?;
-            // Select existing content so the typed text replaces it, or put
-            // the caret at the end to append.
-            let f = if clear {
-                "function(){ if (typeof this.select === 'function') { this.select(); } else if (this.isContentEditable) { const r=document.createRange(); r.selectNodeContents(this); const s=getSelection(); s.removeAllRanges(); s.addRange(r); } }"
-            } else {
-                "function(){ if (typeof this.setSelectionRange === 'function' && typeof this.value === 'string') { const n=this.value.length; this.setSelectionRange(n,n); } }"
-            };
-            let _ = b.call_on(&el, f).await;
-            if clear && text.is_empty() {
-                b.key(&parse_keys("Backspace")?.0, 0).await?;
-            } else {
-                b.bridge.cdp("Input.insertText", json!({"text": text})).await?;
-            }
+            // Text fields get the text typed; date, time and similar inputs
+            // get their value set; rich text editors get it line by line.
+            let note = b.type_into(&el, &text, clear).await?;
             if submit {
                 let probe = b.probe(&el).await;
                 if probe.submit_commits() {
@@ -954,7 +1074,7 @@ impl Tool for Type {
             }
             let shown: String = text.chars().take(60).collect();
             b.after_action_expecting(
-                format!("Typed \"{shown}\" into [{r}] {}{}.", el.label(), if submit { " and pressed Enter" } else { "" }),
+                format!("Typed \"{shown}\" into [{r}] {}{}.{note}", el.label(), if submit { " and pressed Enter" } else { "" }),
                 format!("typed into {}", el.label()),
                 input["expect"].as_str().map(str::to_string),
             )
@@ -986,6 +1106,9 @@ impl Tool for Press {
     fn effect(&self) -> Effect {
         Effect::Stage
     }
+    fn site_acted_on(&self, _: &Value) -> BoxFuture<'static, Option<String>> {
+        scope::current_site(&self.0)
+    }
     fn describe_call(&self, input: &Value) -> String {
         format!("Press {}", input["keys"].as_str().unwrap_or(""))
     }
@@ -999,6 +1122,12 @@ impl Tool for Press {
             let combo = arg_str(&input, "keys")?.to_string();
             let times = input["times"].as_u64().unwrap_or(1).clamp(1, 50);
             let (key, mods) = parse_keys(&combo)?;
+            if clipboard::clipboard_shortcut(&key.key, mods) {
+                return Err(format!(
+                    "{combo} would use the user's system clipboard, which the agent doesn't touch. \
+                     Use browser_clipboard to copy and paste."
+                ));
+            }
             if key.key == "Enter" && mods == 0 {
                 let probe = b.probe_focused().await;
                 if probe.submit_commits() {
@@ -1019,8 +1148,9 @@ impl Tool for Scroll {
         "browser_scroll"
     }
     fn description(&self) -> &'static str {
-        "Scroll the current page, or bring an element into view by its ref. Use it to see more of a long page \
-         or to load more results on pages that load as you scroll."
+        "Scroll the current page, or bring an element into view by its ref. Use it to see more of a long page. \
+         For feeds and results that load as you scroll (infinite scroll), set load_more: it keeps scrolling to \
+         the end until nothing new appears (or until min_items entries are there) and says how much loaded."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -1029,7 +1159,10 @@ impl Tool for Scroll {
                 "direction": {"type": "string", "enum": ["down", "up", "left", "right"], "description": "Default down."},
                 "pages": {"type": "number", "minimum": 0.1, "maximum": 20, "description": "How far, in screenfuls. Default 1."},
                 "ref": {"type": "string", "description": "Scroll this element into view instead."},
-                "to": {"type": "string", "enum": ["top", "bottom"], "description": "Jump to the top or bottom of the page."}
+                "to": {"type": "string", "enum": ["top", "bottom"], "description": "Jump to the top or bottom of the page."},
+                "load_more": {"type": "boolean", "description": "Keep scrolling to the end until no new content loads."},
+                "min_items": {"type": "integer", "minimum": 1, "description": "With load_more: stop once this many entries are on the page."},
+                "max_rounds": {"type": "integer", "minimum": 1, "maximum": 40, "description": "With load_more: most scrolls to the end. Default 12."}
             },
             "additionalProperties": false
         })
@@ -1038,6 +1171,9 @@ impl Tool for Scroll {
         Effect::Read
     }
     fn describe_call(&self, input: &Value) -> String {
+        if input["load_more"].as_bool().unwrap_or(false) || input["min_items"].is_u64() {
+            return "Scroll to load more".into();
+        }
         match (input["ref"].as_str(), input["to"].as_str()) {
             (Some(r), _) => format!("Scroll to {r}"),
             (_, Some(t)) => format!("Scroll to the {t}"),
@@ -1047,10 +1183,14 @@ impl Tool for Scroll {
     fn call(&self, input: Value) -> BoxFuture<'static, ToolResult> {
         let b = self.0.clone();
         Box::pin(async move {
-            check_keys(&input, &["direction", "pages", "ref", "to"])?;
+            check_keys(&input, &["direction", "pages", "ref", "to", "load_more", "min_items", "max_rounds"])?;
             let st = b.state().await?;
             let what;
-            if let Some(r) = input["ref"].as_str() {
+            if input["load_more"].as_bool().unwrap_or(false) || input["min_items"].is_u64() {
+                let rounds = input["max_rounds"].as_u64().unwrap_or(scrolling::LOAD_ROUNDS).clamp(1, scrolling::MAX_LOAD_ROUNDS);
+                let report = b.load_more(input["min_items"].as_u64(), rounds).await;
+                return b.after_action(report, "scrolled to load more".into()).await;
+            } else if let Some(r) = input["ref"].as_str() {
                 let el = b.element(r).await?;
                 let rect = b.rect(&el).await?;
                 b.bridge.highlight(rect, el.label());
@@ -1278,6 +1418,9 @@ impl Tool for Dialog {
     fn effect(&self) -> Effect {
         Effect::Stage
     }
+    fn site_acted_on(&self, _: &Value) -> BoxFuture<'static, Option<String>> {
+        scope::current_site(&self.0)
+    }
     fn describe_call(&self, input: &Value) -> String {
         if input["accept"].as_bool().unwrap_or(false) { "Answer dialog: OK".into() } else { "Answer dialog: Cancel".into() }
     }
@@ -1337,6 +1480,9 @@ impl Tool for Select {
     }
     fn effect(&self) -> Effect {
         Effect::Stage
+    }
+    fn site_acted_on(&self, _: &Value) -> BoxFuture<'static, Option<String>> {
+        scope::current_site(&self.0)
     }
     fn describe_call(&self, input: &Value) -> String {
         format!("Select “{}” in {}", input["option"].as_str().unwrap_or(""), input["ref"].as_str().unwrap_or(""))
@@ -1687,6 +1833,9 @@ impl Tool for Upload {
     fn effect(&self) -> Effect {
         Effect::Stage
     }
+    fn site_acted_on(&self, _: &Value) -> BoxFuture<'static, Option<String>> {
+        scope::current_site(&self.0)
+    }
     fn describe_call(&self, input: &Value) -> String {
         format!("Upload {}", input["path"].as_str().unwrap_or(""))
     }
@@ -1710,8 +1859,14 @@ impl Tool for Upload {
             if path.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.')) {
                 return Err("Files in hidden folders (like ~/.ssh or ~/.config) can't be uploaded.".into());
             }
+            let mut field: Option<Element> = None;
             let backend_id = match input["ref"].as_str() {
-                Some(r) => parse_ref(r).ok_or_else(|| format!("`{r}` isn't a ref."))?,
+                Some(r) => {
+                    let el = b.element(r).await?;
+                    let id = el.backend_id;
+                    field = Some(el);
+                    id
+                }
                 None => {
                     let doc = b.bridge.cdp("DOM.getDocument", json!({"depth": 0})).await?;
                     let root = doc["root"]["nodeId"].as_i64().ok_or("no document")?;
@@ -1740,12 +1895,11 @@ impl Tool for Upload {
             if !ok {
                 return Err(format!("The user declined uploading {}.", path.display()));
             }
-            b.bridge
-                .cdp(
-                    "DOM.setFileInputFiles",
-                    json!({"files": [path.to_string_lossy()], "backendNodeId": backend_id}),
-                )
-                .await
+            let params = json!({"files": [path.to_string_lossy()], "backendNodeId": backend_id});
+            match &field {
+                Some(el) => b.cdp_el(el, "DOM.setFileInputFiles", params).await,
+                None => b.bridge.cdp("DOM.setFileInputFiles", params).await,
+            }
                 .map_err(|e| format!("Couldn't attach the file: {e}"))?;
             b.after_action(
                 format!("Attached {}.", path.display()),
@@ -1829,7 +1983,7 @@ impl Browser {
     /// Used for vault values: the text goes to Chromium, never to a model.
     async fn fill(&self, backend_id: i64, text: &str) -> Result<(), String> {
         self.bridge.cdp("DOM.focus", json!({"backendNodeId": backend_id})).await?;
-        let el = Element { backend_id, role: String::new(), name: String::new() };
+        let el = Element { backend_id, role: String::new(), name: String::new(), frame: None };
         let _ = self
             .call_on(&el, "function(){ if (typeof this.select === 'function') this.select(); }")
             .await;
@@ -1856,6 +2010,9 @@ impl Tool for SignIn {
     }
     fn effect(&self) -> Effect {
         Effect::Stage
+    }
+    fn site_acted_on(&self, _: &Value) -> BoxFuture<'static, Option<String>> {
+        scope::current_site(&self.0)
     }
     fn describe_call(&self, _: &Value) -> String {
         "Fill a saved login".into()
@@ -1973,6 +2130,40 @@ mod tests {
         assert_eq!((k.key.as_str(), m), ("Tab", MOD_SHIFT));
         assert!(parse_keys("Hyper+x").is_err());
         assert!(parse_keys("Bogus").is_err());
+    }
+
+    #[test]
+    fn system_clipboard_shortcuts_are_caught() {
+        let blocked = |combo: &str| {
+            let (k, m) = parse_keys(combo).unwrap();
+            clipboard::clipboard_shortcut(&k.key, m)
+        };
+        assert!(blocked("Control+v"));
+        assert!(blocked("Control+Shift+V"));
+        assert!(blocked("Meta+c"));
+        assert!(blocked("Control+x"));
+        assert!(!blocked("Control+a"));
+        assert!(!blocked("v"));
+        assert!(!blocked("Shift+V"));
+    }
+
+    #[test]
+    fn changes_section_reports_url_and_lines() {
+        let snap = |url: &str, lines: &[&str]| Snapshot {
+            url: url.into(),
+            title: "Shop".into(),
+            lines: lines.iter().map(|s| s.to_string()).collect(),
+        };
+        let a = snap("https://shop.test/cart", &["[e1] button \"Add\"", "text \"Cart is empty\""]);
+        let b = snap("https://shop.test/cart", &["[e1] button \"Add\"", "text \"1 item\""]);
+        let out = Browser::changes_since(Some(&a), Some(&b));
+        assert!(out.contains("+ text \"1 item\"") && out.contains("- text \"Cart is empty\""), "{out}");
+        let c = snap("https://shop.test/checkout", &["text \"Pay\""]);
+        let out = Browser::changes_since(Some(&a), Some(&c));
+        assert!(out.contains("URL: https://shop.test/cart → https://shop.test/checkout"), "{out}");
+        assert!(out.contains("A different page"), "{out}");
+        assert!(Browser::changes_since(None, Some(&a)).is_empty());
+        assert!(Browser::changes_since(Some(&a), Some(&a)).contains("Nothing on the page changed"));
     }
 
     #[test]

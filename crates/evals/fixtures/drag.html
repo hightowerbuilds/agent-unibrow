@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Unibrow Test Shop – Workbench</title>
+<style>
+  body { font: 16px system-ui, sans-serif; max-width: 720px; margin: 32px auto; padding: 0 16px; color: #1b2733; background: #fff; }
+  .board { display: flex; gap: 16px; }
+  .col { flex: 1; border: 1px solid #d5dce2; border-radius: 8px; padding: 12px; min-height: 180px; }
+  .col.over { background: #eef6ff; }
+  .card { background: #f6f8fa; border: 1px solid #ccd; border-radius: 6px; padding: 8px; margin: 6px 0; cursor: grab; }
+  .slider { position: relative; height: 8px; background: #d5dce2; border-radius: 4px; margin: 24px 0 8px; width: 400px; touch-action: none; }
+  .thumb { position: absolute; top: -8px; width: 24px; height: 24px; margin-left: -12px; border-radius: 50%; background: #2a6df4; cursor: pointer; }
+  output { display: block; margin-top: 8px; font-weight: 600; }
+</style>
+</head>
+<body>
+  <h1>Workbench</h1>
+  <h2>Jobs</h2>
+  <div class="board">
+    <section class="col" id="todo" aria-label="To do column">
+      <h3>To do</h3>
+      <div class="card" draggable="true" id="c1">Restring bass</div>
+      <div class="card" draggable="true" id="c2">Order nuts</div>
+      <div class="card" draggable="true" id="c3">Clean frets</div>
+    </section>
+    <section class="col" id="done" aria-label="Done column">
+      <h3>Done</h3>
+    </section>
+  </div>
+  <output id="board-out"></output>
+
+  <h2>Shop radio volume</h2>
+  <div class="slider" id="vol" role="slider" aria-label="Volume" aria-valuemin="0" aria-valuemax="100" aria-valuenow="20" tabindex="0">
+    <div class="thumb" id="thumb" aria-hidden="true"></div>
+  </div>
+  <output id="vol-out">Volume: 20</output>
+
+  <script>
+    // HTML5 drag and drop between columns.
+    let dragged = null;
+    document.querySelectorAll('.card').forEach(c => {
+      c.addEventListener('dragstart', e => { dragged = c; e.dataTransfer.setData('text/plain', c.id); e.dataTransfer.effectAllowed = 'move'; });
+      c.addEventListener('dragend', () => { dragged = null; });
+    });
+    document.querySelectorAll('.col').forEach(col => {
+      col.addEventListener('dragover', e => { e.preventDefault(); col.classList.add('over'); });
+      col.addEventListener('dragleave', () => col.classList.remove('over'));
+      col.addEventListener('drop', e => {
+        e.preventDefault(); col.classList.remove('over');
+        const id = e.dataTransfer.getData('text/plain');
+        const card = document.getElementById(id) || dragged;
+        if (!card) return;
+        col.appendChild(card);
+        const where = col.id === 'done' ? 'Done' : 'To do';
+        document.getElementById('board-out').textContent = `Moved “${card.textContent}” to ${where} (log JOB-${card.id.toUpperCase()}-${where === 'Done' ? 'D' : 'T'})`;
+      });
+    });
+
+    // A custom slider driven by pointer events (no <input type=range>).
+    const vol = document.getElementById('vol'), thumb = document.getElementById('thumb'), out = document.getElementById('vol-out');
+    const set = (v) => {
+      v = Math.max(0, Math.min(100, Math.round(v)));
+      thumb.style.left = v + '%'; vol.setAttribute('aria-valuenow', v);
+      out.textContent = `Volume: ${v}` + (v >= 70 && v <= 90 ? ' (sweet spot, code VOL-SWEET)' : '');
+    };
+    set(20);
+    let held = false;
+    const at = (e) => { const r = vol.getBoundingClientRect(); return (e.clientX - r.left) / r.width * 100; };
+    vol.addEventListener('pointerdown', e => { held = true; vol.setPointerCapture(e.pointerId); set(at(e)); e.preventDefault(); });
+    vol.addEventListener('pointermove', e => { if (held) set(at(e)); });
+    vol.addEventListener('pointerup', e => { if (held) { set(at(e)); held = false; } });
+  </script>
+</body>
+</html>

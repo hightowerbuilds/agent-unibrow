@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Unibrow Test Shop – Parts feed</title>
+<style>
+  body { font: 16px system-ui, sans-serif; max-width: 640px; margin: 32px auto; padding: 0 16px; color: #1b2733; background: #fff; }
+  .item { border-bottom: 1px solid #e3e8ec; padding: 18px 4px; }
+  #sentinel { height: 40px; color: #6b7a88; }
+</style>
+</head>
+<body>
+  <h1>New parts</h1>
+  <p>More parts load as you scroll.</p>
+  <div id="feed"></div>
+  <div id="sentinel">Loading more…</div>
+  <script>
+    const TOTAL = 90, PAGE = 15;
+    const names = ['Bone nut', 'Brass saddle', 'Tusq nut', 'Steel string set', 'Tuning peg', 'Strap button', 'Pickguard', 'Truss rod key', 'Fret wire', 'Bridge pin'];
+    const feed = document.getElementById('feed'), sentinel = document.getElementById('sentinel');
+    let shown = 0, loading = false;
+    const more = () => {
+      if (loading || shown >= TOTAL) return;
+      loading = true;
+      // Like a real feed: the next page arrives a little later.
+      setTimeout(() => {
+        for (let i = 0; i < PAGE && shown < TOTAL; i++) {
+          shown++;
+          const d = document.createElement('article');
+          d.className = 'item';
+          d.textContent = shown === 77 ? 'Part 77: Brass saddle, limited run (catalog SADDLE-77X)' : `Part ${shown}: ${names[shown % names.length]}`;
+          feed.appendChild(d);
+        }
+        loading = false;
+        if (shown >= TOTAL) sentinel.textContent = `That's everything: ${TOTAL} parts.`;
+        else if (sentinel.getBoundingClientRect().top < innerHeight) more();
+      }, 700);
+    };
+    new IntersectionObserver(es => { if (es.some(e => e.isIntersecting)) more(); }).observe(sentinel);
+  </script>
+</body>
+</html>

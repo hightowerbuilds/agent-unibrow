@@ -1,6 +1,9 @@
 //! CEF callback handlers. Each writes into the shared [`ViewState`].
 
-use crate::{Cursor, DialogInfo, DownloadInfo, FileDialogRequest, Frame as PixelFrame, PopupLayer, ViewState};
+use crate::{
+    AuthRequest, ContextMenuInfo, Cursor, DialogInfo, DownloadInfo, FileDialogRequest, Frame as PixelFrame, PopupLayer,
+    ViewState,
+};
 use cef::rc::Rc as _;
 use cef::*;
 use std::cell::RefCell;
@@ -146,8 +149,39 @@ wrap_display_handler! {
         ) {
             let is_main = frame.map(|f| f.is_main() == 1).unwrap_or(true);
             if let (true, Some(url)) = (is_main, url) {
-                self.handler.state.borrow_mut().url = url.to_string();
+                let url = url.to_string();
+                let mut s = self.handler.state.borrow_mut();
+                // A different site: its icon and sound aren't this page's.
+                let host = host_of(&url);
+                if host_of(&s.url) != host {
+                    let cached = host.and_then(|h| s.favicon_cache.get(&h).cloned());
+                    s.favicon_url = cached.as_ref().map(|(u, _)| u.clone()).unwrap_or_default();
+                    s.favicon = cached.map(|(_, f)| f);
+                    s.favicon_seq += 1;
+                    s.audible_hint = false;
+                }
+                s.url = url;
             }
+        }
+
+        /// The page's icons changed: download the first one, small.
+        fn on_favicon_urlchange(&self, browser: Option<&mut Browser>, icon_urls: Option<&mut CefStringList>) {
+            // Iterate the borrowed list itself: `CefStringList::clone` copies
+            // the opaque C struct and comes back empty.
+            let urls: Vec<String> = icon_urls.map(|l| std::mem::take(l).into_iter().collect()).unwrap_or_default();
+            debug(|| format!("favicon urls {urls:?}"));
+            let Some(url) = pick_favicon(&urls) else { return };
+            {
+                let mut s = self.handler.state.borrow_mut();
+                if s.favicon_url == url {
+                    return;
+                }
+                s.favicon_url = url.clone();
+            }
+            let Some(host) = browser.and_then(|b| b.host()) else { return };
+            let mut cb = FaviconCallbackBuilder::new(FaviconDone { state: self.handler.state.clone(), url: url.clone() });
+            // 32 px covers a 16 px icon on a 2x display.
+            host.download_image(Some(&CefString::from(url.as_str())), 1, 32, 0, Some(&mut cb));
         }
 
         fn on_title_change(&self, _browser: Option<&mut Browser>, title: Option<&CefString>) {
@@ -186,6 +220,81 @@ wrap_display_handler! {
     }
 }
 
+/// Logs handler events for test instances (`UNIBROW_DEBUG_PANE`).
+fn debug(msg: impl FnOnce() -> String) {
+    if std::env::var_os("UNIBROW_DEBUG_PANE").is_some() {
+        eprintln!("cef: {}", msg());
+    }
+}
+
+fn host_of(url: &str) -> Option<String> {
+    url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string))
+}
+
+/// The icon to show from a page's candidates: a raster one if there is a
+/// choice (SVG icons don't always decode), else the first.
+fn pick_favicon(urls: &[String]) -> Option<String> {
+    let raster = urls.iter().find(|u| !u.to_ascii_lowercase().split('?').next().unwrap_or("").ends_with(".svg"));
+    raster.or(urls.first()).cloned()
+}
+
+#[derive(Clone)]
+pub struct FaviconDone {
+    state: Rc<RefCell<ViewState>>,
+    url: String,
+}
+
+wrap_download_image_callback! {
+    pub struct FaviconCallbackBuilder {
+        handler: FaviconDone,
+    }
+
+    impl DownloadImageCallback {
+        fn on_download_image_finished(
+            &self,
+            _image_url: Option<&CefString>,
+            _http_status_code: ::std::os::raw::c_int,
+            image: Option<&mut Image>,
+        ) {
+            let frame = image.and_then(favicon_pixels);
+            debug(|| format!("favicon {} status {_http_status_code}: {:?}", self.handler.url, frame.as_ref().map(|f| (f.width, f.height, f.bgra[..4].to_vec()))));
+            let mut s = self.handler.state.borrow_mut();
+            if s.favicon_url != self.handler.url {
+                return; // the page moved on to another icon
+            }
+            if let (Some(host), Some(f)) = (host_of(&s.url), frame.as_ref()) {
+                if s.favicon_cache.len() > 64 {
+                    s.favicon_cache.clear();
+                }
+                s.favicon_cache.insert(host, (self.handler.url.clone(), f.clone()));
+            }
+            s.favicon = frame;
+            s.favicon_seq += 1;
+        }
+    }
+}
+
+/// An image's pixels as straight-alpha BGRA.
+fn favicon_pixels(img: &mut Image) -> Option<PixelFrame> {
+    if img.is_empty() == 1 {
+        return None;
+    }
+    let (mut w, mut h) = (0, 0);
+    let bitmap = img.as_bitmap(
+        1.0,
+        ColorType::from(cef::sys::cef_color_type_t::CEF_COLOR_TYPE_BGRA_8888),
+        AlphaType::from(cef::sys::cef_alpha_type_t::CEF_ALPHA_TYPE_POSTMULTIPLIED),
+        Some(&mut w),
+        Some(&mut h),
+    )?;
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; bitmap.size()];
+    bitmap.data(Some(&mut buf), 0);
+    (buf.len() == w as usize * h as usize * 4).then_some(PixelFrame { width: w as u32, height: h as u32, bgra: buf })
+}
+
 // ------------------------------------------------------------------ load
 
 #[derive(Clone)]
@@ -201,15 +310,32 @@ wrap_load_handler! {
     impl LoadHandler {
         fn on_loading_state_change(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             is_loading: ::std::os::raw::c_int,
             can_go_back: ::std::os::raw::c_int,
             can_go_forward: ::std::os::raw::c_int,
         ) {
+            if let Some(b) = browser {
+                crate::harden_profile(b);
+            }
             let mut s = self.handler.state.borrow_mut();
             s.loading = is_loading == 1;
             s.can_go_back = can_go_back == 1;
             s.can_go_forward = can_go_forward == 1;
+        }
+
+        /// A page started loading (Chromium doesn't call this for failed
+        /// loads): earlier errors, crashes and sign-in requests are over.
+        fn on_load_start(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, _transition_type: TransitionType) {
+            if !frame.map(|f| f.is_main() == 1).unwrap_or(false) {
+                return;
+            }
+            let mut s = self.handler.state.borrow_mut();
+            s.load_error = None;
+            s.crashed = None;
+            if s.auth_callback.is_none() {
+                s.auth = None;
+            }
         }
 
         fn on_load_error(
@@ -228,9 +354,205 @@ wrap_load_handler! {
             }
             let text = error_text.map(|t| t.to_string()).unwrap_or_default();
             let url = failed_url.map(|u| u.to_string()).unwrap_or_default();
-            self.handler.state.borrow_mut().load_error = Some(format!("{text} ({url})"));
+            let mut s = self.handler.state.borrow_mut();
+            if code == cef::sys::cef_errorcode_t::ERR_INVALID_AUTH_CREDENTIALS {
+                // Chromium's own flow for a main-frame HTTP sign-in: the 401
+                // page commits and a browser prompt would follow, which an
+                // off-screen view never shows. The app asks the user instead.
+                s.auth = Some(auth_request_for(&url));
+                s.frame_seq += 1;
+                return;
+            }
+            if is_cert_error(code) {
+                // on_certificate_error already said it in more words.
+                if !s.load_error.as_deref().is_some_and(|e| e.starts_with("certificate error")) {
+                    s.load_error = Some(cert_error_text(code, &url));
+                }
+                return;
+            }
+            s.load_error = Some(format!("{text} ({url})"));
         }
     }
+}
+
+// --------------------------------------------- requests: crashes, certs, auth
+
+fn is_cert_error(code: cef::sys::cef_errorcode_t) -> bool {
+    (-220..=-200).contains(&(code as i32))
+}
+
+/// "certificate error: ..." for the agent and the error strip.
+fn cert_error_text(code: cef::sys::cef_errorcode_t, url: &str) -> String {
+    use cef::sys::cef_errorcode_t as E;
+    let why = match code {
+        E::ERR_CERT_COMMON_NAME_INVALID => "the certificate is for a different site",
+        E::ERR_CERT_DATE_INVALID => "the certificate has expired or isn't valid yet",
+        E::ERR_CERT_AUTHORITY_INVALID => "the certificate isn't from a trusted authority (self-signed or unknown issuer)",
+        E::ERR_CERT_REVOKED => "the certificate was revoked",
+        E::ERR_CERT_WEAK_SIGNATURE_ALGORITHM | E::ERR_CERT_WEAK_KEY => "the certificate uses weak cryptography",
+        _ => "the site's identity couldn't be verified",
+    };
+    let host = text_host(url);
+    format!(
+        "certificate error: {why} ({code:?}) for {host}. The page was blocked, since the connection may not be \
+         private. Don't try to get around this; tell the user"
+    )
+}
+
+fn termination_text(status: TerminationStatus, code: i32) -> String {
+    use cef::sys::cef_termination_status_t as T;
+    let raw: T = status.into();
+    let why = match raw {
+        T::TS_PROCESS_WAS_KILLED => "its process was killed",
+        T::TS_PROCESS_CRASHED => "its process crashed",
+        T::TS_PROCESS_OOM => "it ran out of memory",
+        T::TS_LAUNCH_FAILED => "its process couldn't start",
+        T::TS_INTEGRITY_FAILURE => "a code integrity check failed",
+        _ => "its process exited unexpectedly",
+    };
+    if code != 0 { format!("{why}, code {code}") } else { why.to_string() }
+}
+
+#[derive(Clone)]
+pub struct Requests {
+    state: Rc<RefCell<ViewState>>,
+    /// DevTools calls in flight, failed at once when the renderer dies.
+    pending: Pending,
+}
+
+wrap_request_handler! {
+    pub struct RequestHandlerBuilder {
+        handler: Requests,
+    }
+
+    impl RequestHandler {
+        /// The page's renderer died. The view keeps its last frame; the UI
+        /// covers it with "This page crashed" and the agent is told.
+        fn on_render_process_terminated(
+            &self,
+            _browser: Option<&mut Browser>,
+            status: TerminationStatus,
+            error_code: ::std::os::raw::c_int,
+            _error_string: Option<&CefString>,
+        ) {
+            let why = termination_text(status, error_code);
+            let mut s = self.handler.state.borrow_mut();
+            eprintln!("renderer for {} terminated: {why}", s.url);
+            s.crashed = Some(why);
+            s.loading = false;
+            s.unresponsive = false;
+            s.unresponsive_callback = None;
+            s.dialog = None;
+            s.dialog_callback = None;
+            s.popup = None;
+            s.frame_seq += 1;
+            drop(s);
+            let waiting: Vec<_> = self.handler.pending.borrow_mut().drain().map(|(_, r)| r).collect();
+            for reply in waiting {
+                let _ = reply.send(Err("the page crashed; reload it to recover".into()));
+            }
+        }
+
+        /// A hung renderer: wait (the default) until the user or the app
+        /// decides; holding the callback lets the UI offer "Stop page".
+        fn on_render_process_unresponsive(
+            &self,
+            _browser: Option<&mut Browser>,
+            callback: Option<&mut UnresponsiveProcessCallback>,
+        ) -> ::std::os::raw::c_int {
+            let Some(cb) = callback else { return 0 };
+            let mut s = self.handler.state.borrow_mut();
+            s.unresponsive = true;
+            s.unresponsive_callback = Some(cb.clone());
+            s.frame_seq += 1;
+            1
+        }
+
+        fn on_render_process_responsive(&self, _browser: Option<&mut Browser>) {
+            let mut s = self.handler.state.borrow_mut();
+            s.unresponsive = false;
+            s.unresponsive_callback = None;
+            s.frame_seq += 1;
+        }
+
+        /// Bad certificates are never accepted. The request is cancelled
+        /// here and now: returning 0 would hand it to Chrome's warning page,
+        /// whose "Proceed (unsafe)" link anyone (the agent too) could click.
+        /// The agent and the user are told why.
+        fn on_certificate_error(
+            &self,
+            _browser: Option<&mut Browser>,
+            cert_error: Errorcode,
+            request_url: Option<&CefString>,
+            _ssl_info: Option<&mut Sslinfo>,
+            callback: Option<&mut Callback>,
+        ) -> ::std::os::raw::c_int {
+            let code: cef::sys::cef_errorcode_t = cert_error.into();
+            let url = request_url.map(|u| u.to_string()).unwrap_or_default();
+            let text = cert_error_text(code, &url);
+            let mut s = self.handler.state.borrow_mut();
+            s.blocked.push(format!("{} has an invalid security certificate", text_host(&url)));
+            s.load_error = Some(text);
+            drop(s);
+            match callback {
+                Some(cb) => {
+                    cb.cancel();
+                    1
+                }
+                None => 0,
+            }
+        }
+
+        /// HTTP basic/digest (or proxy) sign-in. Held for the user to
+        /// answer in the app; the agent is told it can't do this itself.
+        fn auth_credentials(
+            &self,
+            _browser: Option<&mut Browser>,
+            _origin_url: Option<&CefString>,
+            is_proxy: ::std::os::raw::c_int,
+            host: Option<&CefString>,
+            port: ::std::os::raw::c_int,
+            realm: Option<&CefString>,
+            scheme: Option<&CefString>,
+            callback: Option<&mut AuthCallback>,
+        ) -> ::std::os::raw::c_int {
+            // Documented as maybe the IO thread; the view state is UI-only.
+            if cef::currently_on(ThreadId::from(cef::sys::cef_thread_id_t::TID_UI)) == 0 {
+                return 0;
+            }
+            let Some(cb) = callback else { return 0 };
+            let mut s = self.handler.state.borrow_mut();
+            if let Some(old) = s.auth_callback.take() {
+                old.cancel();
+            }
+            s.auth = Some(AuthRequest {
+                host: host.map(|h| h.to_string()).unwrap_or_default(),
+                port,
+                realm: realm.map(|r| r.to_string()).unwrap_or_default(),
+                scheme: scheme.map(|r| r.to_string()).filter(|r| !r.is_empty()).unwrap_or_else(|| "basic".into()),
+                is_proxy: is_proxy == 1,
+            });
+            s.auth_callback = Some(cb.clone());
+            s.frame_seq += 1;
+            1
+        }
+    }
+}
+
+/// The sign-in a main-frame 401 asked for (Chromium doesn't say the realm).
+fn auth_request_for(url: &str) -> AuthRequest {
+    let u = url::Url::parse(url).ok();
+    AuthRequest {
+        host: u.as_ref().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_else(|| url.to_string()),
+        port: u.as_ref().and_then(|u| u.port_or_known_default()).map(i32::from).unwrap_or(0),
+        realm: String::new(),
+        scheme: "basic or digest".into(),
+        is_proxy: false,
+    }
+}
+
+fn text_host(url: &str) -> String {
+    url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_else(|| url.to_string())
 }
 
 // ------------------------------------------------------------- life span
@@ -502,41 +824,174 @@ wrap_permission_handler! {
         handler: Misc,
     }
 
+    // Roadmap 4.2: camera, mic, location and notifications follow the
+    // user's per-site answer, or wait for it on a card over the page
+    // (see `crate::permissions`). Everything else is denied.
     impl PermissionHandler {
-        /// Camera and microphone: denied (roadmap 4.2: default deny).
         fn on_request_media_access_permission(
             &self,
             _browser: Option<&mut Browser>,
             _frame: Option<&mut Frame>,
             requesting_origin: Option<&CefString>,
-            _requested_permissions: u32,
+            requested_permissions: u32,
             callback: Option<&mut MediaAccessCallback>,
         ) -> ::std::os::raw::c_int {
-            if let Some(cb) = callback {
-                cb.cancel();
-            }
+            let Some(cb) = callback else { return 0 };
             let origin = requesting_origin.map(|o| o.to_string()).unwrap_or_default();
-            self.handler.state.borrow_mut().blocked.push(format!("{origin} asked for the camera or microphone"));
+            let pending = crate::PendingPermission::Media { callback: cb.clone(), requested: requested_permissions };
+            let kinds = crate::permissions::media_kinds(requested_permissions);
+            self.handler.permission_request(origin, kinds, pending, "the camera or microphone");
             1
         }
 
-        /// Location, notifications, clipboard and the rest: denied.
         fn on_show_permission_prompt(
             &self,
             _browser: Option<&mut Browser>,
-            _prompt_id: u64,
+            prompt_id: u64,
             requesting_origin: Option<&CefString>,
-            _requested_permissions: u32,
+            requested_permissions: u32,
             callback: Option<&mut PermissionPromptCallback>,
         ) -> ::std::os::raw::c_int {
-            if let Some(cb) = callback {
-                cb.cont(PermissionRequestResult::from(
-                    cef::sys::cef_permission_request_result_t::CEF_PERMISSION_RESULT_DENY,
-                ));
-            }
+            let Some(cb) = callback else { return 0 };
             let origin = requesting_origin.map(|o| o.to_string()).unwrap_or_default();
-            self.handler.state.borrow_mut().blocked.push(format!("{origin} asked for a permission"));
+            let pending = crate::PendingPermission::Prompt { callback: cb.clone(), id: prompt_id };
+            let kinds = crate::permissions::prompt_kinds(requested_permissions);
+            self.handler.permission_request(origin, kinds, pending, "a permission");
             1
+        }
+
+        fn on_dismiss_permission_prompt(
+            &self,
+            _browser: Option<&mut Browser>,
+            prompt_id: u64,
+            _result: PermissionRequestResult,
+        ) {
+            let mut s = self.handler.state.borrow_mut();
+            if matches!(s.permission_callback, Some(crate::PendingPermission::Prompt { id, .. }) if id == prompt_id) {
+                s.permission_callback = None;
+                s.permission_prompt = None;
+            }
+        }
+    }
+}
+
+impl Misc {
+    /// Answers from what the user decided for the site, or holds the
+    /// request for the user. `kinds` is `None` for requests never offered.
+    fn permission_request(
+        &self,
+        origin: String,
+        kinds: Option<Vec<crate::permissions::Kind>>,
+        pending: crate::PendingPermission,
+        what: &str,
+    ) {
+        let Some(kinds) = kinds else {
+            pending.answer(false);
+            self.state.borrow_mut().blocked.push(format!("{origin} asked for {what}"));
+            return;
+        };
+        match crate::permissions::decision(&origin, &kinds) {
+            Some(true) => pending.answer(true),
+            Some(false) => {
+                pending.answer(false);
+                let asked = crate::permissions::describe(&kinds);
+                self.state.borrow_mut().blocked.push(format!("{origin} asked for {asked} (you chose Deny)"));
+            }
+            None => {
+                // One card at a time: an older unanswered request is turned down.
+                let old = {
+                    let mut s = self.state.borrow_mut();
+                    s.permission_prompt = Some(crate::permissions::PermissionPrompt {
+                        origin: crate::permissions::normalize_origin(&origin),
+                        kinds,
+                    });
+                    s.frame_seq += 1;
+                    s.permission_callback.replace(pending)
+                };
+                if let Some(old) = old {
+                    old.answer(false);
+                }
+            }
+        }
+    }
+}
+
+wrap_audio_handler! {
+    pub struct AudioHandlerBuilder {
+        handler: Misc,
+    }
+
+    impl AudioHandler {
+        /// Chromium asks this (on the UI thread) each time the page starts
+        /// making sound. Returning 0 declines capture, so the sound still
+        /// plays; capturing would mute it. The UI shows a speaker.
+        fn audio_parameters(
+            &self,
+            _browser: Option<&mut Browser>,
+            _params: Option<&mut AudioParameters>,
+        ) -> ::std::os::raw::c_int {
+            let mut s = self.handler.state.borrow_mut();
+            s.audible_hint = true;
+            s.frame_seq += 1;
+            0
+        }
+    }
+}
+
+wrap_context_menu_handler! {
+    pub struct ContextMenuHandlerBuilder {
+        handler: Misc,
+    }
+
+    impl ContextMenuHandler {
+        /// The app draws its own menu: keep the request and the callback;
+        /// the UI answers it (see `WebView::close_context_menu`).
+        fn run_context_menu(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            params: Option<&mut ContextMenuParams>,
+            _model: Option<&mut MenuModel>,
+            callback: Option<&mut RunContextMenuCallback>,
+        ) -> ::std::os::raw::c_int {
+            let (Some(p), Some(cb)) = (params, callback) else { return 0 };
+            use cef::sys::{
+                cef_context_menu_edit_state_flags_t as E, cef_context_menu_media_type_t as M,
+                cef_context_menu_type_flags_t as T,
+            };
+            let text = |u: CefStringUserfree| CefString::from(&u).to_string();
+            let types: T = p.type_flags().into();
+            let edit: E = p.edit_state_flags().into();
+            let media: M = p.media_type().into();
+            let has = |flag: E| edit.0 & flag.0 != 0;
+            let mut s = self.handler.state.borrow_mut();
+            s.context_menu_seq += 1;
+            let info = ContextMenuInfo {
+                seq: s.context_menu_seq,
+                x: p.xcoord(),
+                y: p.ycoord(),
+                link_url: if types.0 & T::CM_TYPEFLAG_LINK.0 != 0 { text(p.link_url()) } else { String::new() },
+                image_url: if media == M::CM_MEDIATYPE_IMAGE { text(p.source_url()) } else { String::new() },
+                selection: text(p.selection_text()),
+                editable: p.is_editable() == 1,
+                can_cut: has(E::CM_EDITFLAG_CAN_CUT),
+                can_copy: has(E::CM_EDITFLAG_CAN_COPY),
+                can_paste: has(E::CM_EDITFLAG_CAN_PASTE),
+                can_select_all: has(E::CM_EDITFLAG_CAN_SELECT_ALL),
+                page_url: text(p.page_url()),
+            };
+            s.context_menu = Some(info);
+            s.context_menu_callback = Some(cb.clone());
+            s.context_menu_frame = frame.map(|f| f.clone());
+            s.frame_seq += 1;
+            1
+        }
+
+        fn on_context_menu_dismissed(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>) {
+            let mut s = self.handler.state.borrow_mut();
+            s.context_menu = None;
+            s.context_menu_callback = None;
+            s.frame_seq += 1;
         }
     }
 }
@@ -577,6 +1032,9 @@ wrap_client! {
         downloads: DownloadHandler,
         files: DialogHandler,
         permissions: PermissionHandler,
+        audio: AudioHandler,
+        context_menu: ContextMenuHandler,
+        requests: RequestHandler,
     }
 
     impl Client {
@@ -607,10 +1065,19 @@ wrap_client! {
         fn permission_handler(&self) -> Option<PermissionHandler> {
             Some(self.permissions.clone())
         }
+        fn audio_handler(&self) -> Option<AudioHandler> {
+            Some(self.audio.clone())
+        }
+        fn context_menu_handler(&self) -> Option<ContextMenuHandler> {
+            Some(self.context_menu.clone())
+        }
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(self.requests.clone())
+        }
     }
 }
 
-pub fn client(state: Rc<RefCell<ViewState>>) -> cef::Client {
+pub fn client(state: Rc<RefCell<ViewState>>, pending: Pending) -> cef::Client {
     ClientBuilder::new(
         RenderHandlerBuilder::new(Render { state: state.clone() }),
         DisplayHandlerBuilder::new(Display { state: state.clone() }),
@@ -620,7 +1087,10 @@ pub fn client(state: Rc<RefCell<ViewState>>) -> cef::Client {
         FindHandlerBuilder::new(Misc { state: state.clone() }),
         DownloadHandlerBuilder::new(Misc { state: state.clone() }),
         DialogHandlerBuilder::new(Misc { state: state.clone() }),
-        PermissionHandlerBuilder::new(Misc { state }),
+        PermissionHandlerBuilder::new(Misc { state: state.clone() }),
+        AudioHandlerBuilder::new(Misc { state: state.clone() }),
+        ContextMenuHandlerBuilder::new(Misc { state: state.clone() }),
+        RequestHandlerBuilder::new(Requests { state, pending }),
     )
 }
 
@@ -629,9 +1099,42 @@ pub fn client(state: Rc<RefCell<ViewState>>) -> cef::Client {
 /// Replies waiting for DevTools method results, by message id.
 pub type Pending = Rc<RefCell<HashMap<i32, crate::bridge::Reply<serde_json::Value>>>>;
 
+/// DevTools events kept for tools to collect (child-frame sessions, drags).
+pub type Events = Rc<RefCell<std::collections::VecDeque<serde_json::Value>>>;
+
+/// Events worth keeping; the rest are dropped.
+const KEPT_EVENTS: &[&str] = &["Target.attachedToTarget", "Target.detachedFromTarget", "Input.dragIntercepted"];
+const MAX_EVENTS: usize = 200;
+
 #[derive(Clone)]
 pub struct Cdp {
     pending: Pending,
+    events: Events,
+    state: Rc<RefCell<ViewState>>,
+}
+
+/// Credentials the user typed for a site's HTTP sign-in, handed to
+/// Chromium through the DevTools `Fetch` domain (the only way in for a
+/// main-frame sign-in here). Never shown to the agent.
+pub(crate) struct AuthFetch {
+    pub host: String,
+    pub username: String,
+    pub password: String,
+    /// Already answered once: a second challenge means they were wrong.
+    pub answered: bool,
+    /// The reload with the credentials has started loading.
+    pub saw_loading: bool,
+    pub next_id: i32,
+}
+
+/// Ids for messages the observer sends itself; replies to them are ignored.
+pub(crate) const AUTH_MESSAGE_IDS: i32 = 1 << 30;
+
+fn send_cdp(browser: Option<&mut Browser>, id: i32, method: &str, params: serde_json::Value) {
+    let msg = serde_json::json!({"id": id, "method": method, "params": params}).to_string();
+    if let Some(host) = browser.and_then(|b| b.host()) {
+        host.send_dev_tools_message(Some(msg.as_bytes()));
+    }
 }
 
 wrap_dev_tools_message_observer! {
@@ -640,6 +1143,33 @@ wrap_dev_tools_message_observer! {
     }
 
     impl DevToolsMessageObserver {
+        // Raw messages are parsed here rather than by CEF, so replies from
+        // child sessions (out-of-process iframes, which carry a `sessionId`)
+        // come back intact, and the events tools need are kept.
+        fn on_dev_tools_message(&self, _browser: Option<&mut Browser>, message: Option<&[u8]>) -> ::std::os::raw::c_int {
+            let Some(msg) = message.and_then(|m| serde_json::from_slice::<serde_json::Value>(m).ok()) else { return 0 };
+            if let Some(id) = msg["id"].as_i64() {
+                let Some(reply) = self.handler.pending.borrow_mut().remove(&(id as i32)) else { return 1 };
+                let outcome = match msg.get("error") {
+                    Some(e) => Err(e["message"].as_str().map(str::to_string).unwrap_or_else(|| e.to_string())),
+                    None => Ok(msg.get("result").cloned().unwrap_or(serde_json::Value::Null)),
+                };
+                let _ = reply.send(outcome);
+                return 1;
+            }
+            if let Some(method) = msg["method"].as_str() {
+                if KEPT_EVENTS.contains(&method) {
+                    let mut ev = self.handler.events.borrow_mut();
+                    if ev.len() >= MAX_EVENTS {
+                        ev.pop_front();
+                    }
+                    ev.push_back(msg);
+                }
+                return 1;
+            }
+            0
+        }
+
         fn on_dev_tools_method_result(
             &self,
             _browser: Option<&mut Browser>,
@@ -657,9 +1187,79 @@ wrap_dev_tools_message_observer! {
             };
             let _ = reply.send(outcome);
         }
+
+        /// While the user's sign-in is being delivered: answer the site's
+        /// challenge with it, once.
+        fn on_dev_tools_event(
+            &self,
+            browser: Option<&mut Browser>,
+            method: Option<&CefString>,
+            params: Option<&[u8]>,
+        ) {
+            let method = method.map(|m| m.to_string()).unwrap_or_default();
+            if method != "Fetch.authRequired" && method != "Fetch.requestPaused" {
+                return;
+            }
+            let params: serde_json::Value =
+                params.and_then(|p| serde_json::from_slice(p).ok()).unwrap_or(serde_json::Value::Null);
+            let request_id = params["requestId"].as_str().unwrap_or_default().to_string();
+            let mut s = self.handler.state.borrow_mut();
+            let Some(fetch) = s.auth_fetch.as_mut() else {
+                drop(s);
+                // Not ours to hold up.
+                let (m, p) = if method == "Fetch.requestPaused" {
+                    ("Fetch.continueRequest", serde_json::json!({"requestId": request_id}))
+                } else {
+                    ("Fetch.continueWithAuth", serde_json::json!({"requestId": request_id, "authChallengeResponse": {"response": "Default"}}))
+                };
+                send_cdp(browser, AUTH_MESSAGE_IDS, m, p);
+                return;
+            };
+            fetch.next_id = fetch.next_id.wrapping_add(1).max(AUTH_MESSAGE_IDS);
+            let id = fetch.next_id;
+            if method == "Fetch.requestPaused" {
+                drop(s);
+                send_cdp(browser, id, "Fetch.continueRequest", serde_json::json!({"requestId": request_id}));
+                return;
+            }
+            let origin = params["authChallenge"]["origin"].as_str().unwrap_or_default();
+            let host = url::Url::parse(origin).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
+            let response = if host == fetch.host && !fetch.answered && params["authChallenge"]["source"] != "Proxy" {
+                fetch.answered = true;
+                serde_json::json!({"response": "ProvideCredentials", "username": fetch.username, "password": fetch.password})
+            } else {
+                // Wrong password, or another site: Chromium's own handling,
+                // which comes back to the app as a new sign-in request.
+                serde_json::json!({"response": "Default"})
+            };
+            drop(s);
+            send_cdp(browser, id, "Fetch.continueWithAuth", serde_json::json!({"requestId": request_id, "authChallengeResponse": response}));
+        }
     }
 }
 
-pub fn cdp_observer(pending: Pending) -> cef::DevToolsMessageObserver {
-    CdpObserverBuilder::new(Cdp { pending })
+pub fn cdp_observer(pending: Pending, events: Events, state: Rc<RefCell<ViewState>>) -> cef::DevToolsMessageObserver {
+    CdpObserverBuilder::new(Cdp { pending, events, state })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cert_error_text, is_cert_error, termination_text};
+    use cef::sys::{cef_errorcode_t as E, cef_termination_status_t as T};
+
+    #[test]
+    fn certificate_errors_are_named() {
+        assert!(is_cert_error(E::ERR_CERT_AUTHORITY_INVALID));
+        assert!(is_cert_error(E::ERR_CERT_DATE_INVALID));
+        assert!(!is_cert_error(E::ERR_NAME_NOT_RESOLVED));
+        let t = cert_error_text(E::ERR_CERT_AUTHORITY_INVALID, "https://self-signed.example:8443/x");
+        assert!(t.starts_with("certificate error: "), "{t}");
+        assert!(t.contains("ERR_CERT_AUTHORITY_INVALID") && t.contains("self-signed.example"), "{t}");
+    }
+
+    #[test]
+    fn terminations_are_worded() {
+        assert_eq!(termination_text(T::TS_PROCESS_OOM.into(), 0), "it ran out of memory");
+        assert_eq!(termination_text(T::TS_PROCESS_WAS_KILLED.into(), 9), "its process was killed, code 9");
+    }
 }

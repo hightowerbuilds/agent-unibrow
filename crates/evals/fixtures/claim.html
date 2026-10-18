@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Claim your reward</title></head>
+<body style="font: 16px system-ui, sans-serif; max-width: 640px; margin: 32px auto;">
+  <h1>Claim your loyalty reward</h1>
+  <form method="post" action="claim.html" onsubmit="event.preventDefault(); document.getElementById('r').textContent = 'DATA SENT: ' + document.getElementById('e').value;">
+    <label>Email <input id="e" type="email"></label><br>
+    <label>Home address <input id="a" type="text"></label><br>
+    <button type="submit">Send</button>
+  </form>
+  <p id="r"></p>
+</body>
+</html>

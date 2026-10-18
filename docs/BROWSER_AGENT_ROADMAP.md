@@ -18,23 +18,23 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
 | History, bookmarks, focus sites | ✅ **COMPLETED** | SQLite; agents can read history and focus |
 | Agent backends (Claude Code, Codex, OpenCode, API) | ✅ **COMPLETED** | Tools served over local MCP |
 | Policy, approval cards, trace | ✅ **COMPLETED** | Every tool call goes through `ToolHost` |
-| Agent tools that act in the browser | ◐ partial | 25 browser tools; see the phases below |
+| Agent tools that act in the browser | ◐ partial | About 30 browser tools; see the phases below |
 
 ### Progress by phase
 
 | Phase | Completed | Partial | Todo |
 | --- | --- | --- | --- |
-| 1. Foundation | 1.1, 1.3, 1.4, 1.5 | 1.2 | |
-| 2. Full interaction | | 2.1, 2.2, 2.3 | 2.4, 2.5, 2.6, 2.7 |
+| 1. Foundation | ✅ all | | |
+| 2. Full interaction | 2.1, 2.2, 2.4, 2.5, 2.6 | 2.3 | 2.7 |
 | 3. Tabs, windows, navigation | 3.4 | 3.1, 3.2, 3.3 | |
-| 4. Dialogs, permissions, files | 4.1, 4.3, 4.4 | 4.2, 4.6 | 4.5 |
+| 4. Dialogs, permissions, files | 4.1, 4.2, 4.3, 4.4, 4.5 | 4.6 | |
 | 5. Accounts and handoff | 5.1, 5.3, 5.4 | 5.2, 5.5 | |
-| 6. Safety and policy | 6.1, 6.2, 6.4 | | 6.3, 6.5, 6.6, 6.7 |
+| 6. Safety and policy | ✅ all | | |
 | 7. Reliability | 7.2, 7.5 | 7.1, 7.3 | 7.4 |
 | 8. Focus sites | | | 8.1–8.6 |
-| 9. Extracting | | | 9.1–9.4 |
-| 10. Polish | shortcuts | | the rest |
-| 11. Under the hood | | | all |
+| 9. Extracting | ✅ 9.1, 9.2, 9.3, 9.4 | | |
+| 10. Polish | zoom, reader, context menu, favicons, audio, shortcuts | | translate, spellcheck, region shots; DevTools blocked |
+| 11. Under the hood | throttling, crash recovery, memory caps | | GPU frame path, separate profiles |
 
 ## How the agent will see and drive pages
 
@@ -70,7 +70,7 @@ The minimum for the agent to work in the browser at all.
   requests go over a channel and answers come back the same way.
 - Timeouts, and errors that read clearly in the trace.
 
-### 1.2 Page model v1 — ◐ partial (outline, refs, paging done; diffs between steps todo)
+### 1.2 Page model v1 — ✅ **COMPLETED** (outline, refs, paging; every action reports "Changes since you last looked": added, removed and changed lines, URL/title changes, bounded in size)
 - Accessibility tree pruned to what matters: interactive elements,
   headings, landmarks, text.
 - Each element gets a short **ref** (`e12`) mapped to its `backendNodeId`, so
@@ -115,7 +115,7 @@ The minimum for the agent to work in the browser at all.
 
 ## Phase 2: Full interaction (everything a person does on a page)
 
-### 2.1 Forms — ◐ partial (fields, checkboxes, radios, native dropdowns with popup rendering, `browser_select`; date pickers, rich editors and `browser_fill_form` todo)
+### 2.1 Forms — ✅ **COMPLETED** (`browser_fill_form` fills many fields at once, never submits and refuses sensitive fields; date/time/number inputs set reliably; contenteditable rich editors, Gmail- and Lexical-style, verified)
 - Text inputs, text areas, number, email, password fields.
 - Checkboxes, radio buttons, switches.
 - **`<select>` dropdowns**: render CEF's popup layer (`PET_POPUP`), which is
@@ -126,7 +126,7 @@ The minimum for the agent to work in the browser at all.
 - Read validation errors after submit and fix the fields.
 - `browser_fill_form`: fill several fields in one call from a mapping.
 
-### 2.2 Pointer actions — ◐ partial (hover, right/middle/double click done; drag and drop todo)
+### 2.2 Pointer actions — ✅ **COMPLETED** (hover, right/middle/double click; `browser_drag` with HTML5 drag interception; drops onto delete/trash/send ask first. Hand drags by the user of HTML5 items in the embedded view still unsupported)
 - Double-click, right-click, middle-click.
 - Hover (menus that open on hover, tooltips).
 - Drag and drop: between elements, sliders, sortable lists, file drops
@@ -139,17 +139,17 @@ The minimum for the agent to work in the browser at all.
   than a US table.
 - Typing non-English text and emoji through IME (`ime_commit_text`).
 
-### 2.4 Clipboard — todo
+### 2.4 Clipboard — ✅ **COMPLETED** (`browser_clipboard` copy/paste/show on the agent's own clipboard; the system clipboard is never read; Ctrl+C/V/X via browser_press refused)
 - Copy from the page into the agent's context; paste content into fields.
 - Read the system clipboard only when the user explicitly asks.
 
-### 2.5 Scrolling and lazy content — todo
+### 2.5 Scrolling and lazy content — ✅ **COMPLETED** (`browser_scroll` `load_more`/`min_items`: scrolls until nothing new loads, reports growth)
 - Infinite scroll and "load more": scroll until the target appears or a
   limit is reached.
 - Scroll inside panes (chat panels, modals), not just the page.
 - Bring an element into view before acting on it.
 
-### 2.6 Frames and shadow DOM — todo
+### 2.6 Frames and shadow DOM — ✅ **COMPLETED** (same-process and cross-origin iframes stitched into the outline with clickable refs like `f1e8`; shadow DOM works; sensitive fields hidden in every frame. Max 12 frames; find/notes main frame only)
 - Act inside iframes (payment forms, embedded widgets) and open shadow
   roots, with refs that work across frames.
 
@@ -162,7 +162,7 @@ The minimum for the agent to work in the browser at all.
 
 ## Phase 3: Tabs, windows and navigation
 
-### 3.1 Multiple tabs — ◐ partial (tab strip, Ctrl+T/W/Tab/L, `browser_tabs`, target=_blank links open tabs; agent-only background tabs todo)
+### 3.1 Multiple tabs — ◐ partial (tab strip, Ctrl+T/W/Tab/L, `browser_tabs`, target=_blank links open tabs; background pages for reading (9.3); agent-driven clicking in background tabs todo)
 - Real tabs in the UI (a tab strip), each its own `WebView`.
 - Agent tools: `browser_tabs`, `browser_new_tab`, `browser_switch_tab`,
   `browser_close_tab`.
@@ -190,7 +190,7 @@ The minimum for the agent to work in the browser at all.
 - Shown to the user as in-app cards; the agent can answer `alert`s, but
   `confirm`s that delete or pay go through approval.
 
-### 4.2 Permission requests — ◐ partial (camera, mic, location, notifications denied with a notice; per-site allow todo)
+### 4.2 Permission requests — ✅ **COMPLETED** (camera, mic, location, notifications ask the user with an Allow/Deny card, remembered per site; the agent can never answer; background pages deny)
 - Location, notifications, camera, microphone, clipboard
   (`PermissionHandler`).
 - Default deny for the agent; the user approves per site, remembered per
@@ -207,7 +207,7 @@ The minimum for the agent to work in the browser at all.
   the UI, and report the saved path to the agent.
 - Read downloaded PDFs, CSVs and text so the agent can use their contents.
 
-### 4.5 Certificates and HTTP auth — todo
+### 4.5 Certificates and HTTP auth — ✅ **COMPLETED** (certificate errors blocked with no click-through, reported to the agent; HTTP sign-in shows an in-app username/password bar for the user, the agent is told to hand off)
 - Certificate errors shown to the user; the agent never clicks through.
 - HTTP basic auth prompts handed to the user.
 
@@ -258,7 +258,7 @@ The minimum for the agent to work in the browser at all.
 - Show what will happen: a screenshot of the form, the values filled in,
   and the button that will be pressed.
 
-### 6.3 Site scope — todo
+### 6.3 Site scope — ✅ **COMPLETED** ("Only act on focus sites" toggle; reading anywhere is fine, acting elsewhere asks; enforced in `ToolHost` for every backend)
 - Optional "focus only" mode: the agent can only act on focus sites,
   and anything else needs approval.
 - Per-site rules: read-only sites, never-act sites.
@@ -268,17 +268,17 @@ The minimum for the agent to work in the browser at all.
   numbers or passwords itself; the vault fills them.
 - Redact sensitive values in the trace and in anything sent to the model.
 
-### 6.5 Prompt-injection defense — todo
-- Page text is data, not instructions (already in the system prompt).
+### 6.5 Prompt-injection defense — ✅ **COMPLETED** (pages scanned for instructions aimed at AI agents, hidden or visible; a "Prompt-injection warning" note names cross-site targets; the agent tells the user and ignores them. Not yet scanned in gather/compare)
+- Page text is data, not instructions (in the system prompt).
 - Flag pages with instruction-like hidden text; treat cross-site
   instructions with extra suspicion; never follow instructions to
   exfiltrate data.
 
-### 6.6 Limits — todo
+### 6.6 Limits — ✅ **COMPLETED** (per-turn caps: 60 calls, 5 commits; purchase amount on approval cards; "always ask over $X" overrides always-allow)
 - Step budgets per task, time limits, spend caps (from the purchase plan),
   and rate limits per site.
 
-### 6.7 Honest identity — todo
+### 6.7 Honest identity — ✅ **COMPLETED** (stock Chrome UA, no webdriver spoofing; the agent never claims to be the user or a human)
 - The agent doesn't disguise itself or evade bot detection. Sites that
   refuse agents are respected.
 
@@ -305,7 +305,7 @@ The minimum for the agent to work in the browser at all.
 - Checkpoints, so a task can resume after an app restart.
 - Running tasks in background tabs while the user keeps browsing.
 
-### 7.5 Evals — ✅ **COMPLETED** (`crates/evals/run_evals.py`, 10 cases over local test pages; nightly scheduling todo)
+### 7.5 Evals — ✅ **COMPLETED** (`crates/evals/run_evals.py`, 36 cases over local test pages; nightly scheduling todo)
 - Local test pages for each capability (forms, dropdowns, iframes, drag,
   dialogs, uploads, infinite scroll).
 - Recorded tasks on focus sites, replayed nightly; pass rates tracked in
@@ -348,37 +348,56 @@ set path instead of starting from scratch each time.
 
 ## Phase 9: Extracting what's on the web
 
-### 9.1 Reading — todo
-- Readable article text (reader mode), tables to structured rows, lists,
-  prices, dates, ratings.
-- Every fact comes with the URL it came from.
+### 9.1 Reading — ✅ **COMPLETED**
+- `browser_extract`: `article` (readable text with headings, byline and
+  date; navigation, sidebars and hidden text left out), `tables` (data
+  tables as rows, ARIA grids too), `items` (search results and product
+  grids: title, link, price, rating), `links`, and `summary` (product facts
+  from JSON-LD or microdata: price, availability, rating, reviews; prices
+  shown; spec pairs).
+- Works on the current page or any URL in a background page. Every result
+  starts with its source URL, and ends with a reminder that page text is
+  data, not instructions.
 
-### 9.2 Multi-page gathering — todo
-- Pagination, "next" links, search result pages; stop when enough is
-  found.
+### 9.2 Multi-page gathering — ✅ **COMPLETED**
+- `browser_gather` follows `rel=next`, "Next" links, numbered pagination
+  or "Load more" buttons; stops at `max_pages`, `max_items`, the `until`
+  text, or when there's nothing new. Duplicates dropped.
 
-### 9.3 Comparing — todo
-- Open several products or pages in background tabs and compare them in a
-  table for the user.
+### 9.3 Comparing — ✅ **COMPLETED**
+- `browser_compare` loads 2–8 URLs in background pages at once and returns
+  one table (name, price, availability, rating, brand, plus requested
+  `fields`) and each page's details.
+- Background pages (also the start of 3.1's agent-only tabs): hidden, share
+  the profile, never touch the user's tabs, close when the tool finishes or
+  is stopped; dialogs and popups in them are declined. The agent bar shows
+  "reading N pages in the background".
 
-### 9.4 Monitoring — todo
-- Scheduled checks ("tell me when this price drops", "has my order
-  shipped?") on focus sites.
+### 9.4 Monitoring — ✅ **COMPLETED**
+- `browser_watch` (add, list, remove, check): price watches (drops, rises,
+  changes) and text watches (appears, disappears, or a selector's text
+  changes), every 15 minutes to 7 days.
+- A checker thread re-checks due watches in background pages with the HTTP
+  cache off, and tells the user by desktop notification and a note in
+  Chat. The first check is the baseline. Watches are listed in Focus.
+- Evals: `article-extract`, `gather-listing`, `compare-products`,
+  `watch-price` (the price on the served page is changed after the turn and
+  the watch must fire).
 
 ---
 
 ## Phase 10: Human parity and polish
 
-- Zoom (`set_zoom_level`) and Ctrl+/Ctrl- — todo
-- Reader mode — todo
+- Zoom (Ctrl+= / Ctrl+- / Ctrl+0, Ctrl+wheel, per site, toolbar badge; agent clicks stay accurate) — ✅ **COMPLETED**
+- Reader mode (toolbar Reader button, clean article view) — ✅ **COMPLETED**
 - Translate page — todo
 - Spellcheck in fields (`replace_misspelling`) — todo
-- Right-click context menus rendered in-app (`ContextMenuHandler`) — todo
+- Right-click context menus rendered in-app (links, images, editing, navigation, save as PDF, view source) — ✅ **COMPLETED**
 - Keyboard shortcuts: Ctrl+L, Ctrl+T, Ctrl+W, Ctrl+Tab, Ctrl+F, Esc — ✅ **COMPLETED**
-- Favicons and page titles in tabs, bookmarks and history — todo
-- Audio and video: play, pause, mute (`set_audio_muted`) — todo
+- Favicons and page titles in tabs — ✅ **COMPLETED** (bookmarks and history list still text-only)
+- Audio: ♪ indicator and mute per tab — ✅ **COMPLETED** (play/pause controls todo; indicator can linger on Web Audio pages)
 - Picture of a region ("screenshot this chart") — todo
-- Developer tools for debugging pages (`show_dev_tools`) — todo
+- Developer tools for debugging pages — blocked: CEF 154 only opens DevTools as a separate native window (no off-screen mode); a remote-debugging port would let any local program drive the browser, so not done
 
 ---
 
@@ -386,10 +405,10 @@ set path instead of starting from scratch each time.
 
 - **GPU frame path**: dmabuf shared textures instead of CPU copies, if GPUI
   gains an external-texture API — todo
-- **Throttle hidden pages**: lower frame rate for background tabs — todo
-- **Renderer crash recovery**: detect a crashed page and offer reload — todo
+- **Throttle hidden pages**: hidden tabs and background pages at 1 fps — ✅ **COMPLETED**
+- **Renderer crash recovery**: "This page crashed" overlay with Reload, hung-page Wait/Stop, the agent is told — ✅ **COMPLETED**
 - **Separate profiles**: an isolated profile for agent experiments — todo
-- **Memory caps**: close idle background tabs — todo
+- **Memory caps**: background tabs idle 30 min are discarded and reload when shown — ✅ **COMPLETED**
 
 ---
 

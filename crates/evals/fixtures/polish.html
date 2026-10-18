@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Polish test page – Unibrow Test Journal</title>
+<link rel="icon" type="image/png" href="polish-icon.png">
+<meta name="author" content="Tomas Ferreira">
+<meta property="article:published_time" content="2026-05-02">
+<style>
+  body { font: 16px system-ui, sans-serif; margin: 0; background: #fff; color: #1b2733; }
+  #tools { position: relative; height: 230px; border-bottom: 1px solid #d5dce2; }
+  #tools > * { position: absolute; }
+  #guide { left: 20px; top: 20px; width: 180px; height: 24px; line-height: 24px; }
+  #logo { left: 240px; top: 10px; width: 60px; height: 60px; }
+  #note { left: 20px; top: 90px; width: 200px; height: 24px; }
+  #tone { left: 20px; top: 140px; width: 120px; height: 30px; }
+  #count { left: 160px; top: 140px; width: 120px; height: 30px; }
+  #status { left: 20px; top: 190px; font-size: 14px; color: #456; }
+  nav, footer, aside { color: #667; font-size: 14px; }
+  article { max-width: 720px; margin: 24px auto; padding: 0 16px; }
+</style>
+</head>
+<body>
+  <div id="tools">
+    <a id="guide" href="article.html">Read the setup guide</a>
+    <img id="logo" src="polish-icon.png" alt="Journal logo">
+    <input id="note" type="text" aria-label="Note" placeholder="Note">
+    <button id="tone">Play tone</button>
+    <button id="count">Count</button>
+    <div id="status">Right clicks: <b id="rc">0</b> · Count: <b id="cc">0</b> · Tone: <b id="ts">stopped</b></div>
+  </div>
+  <audio id="audio" src="polish-tone.wav" preload="auto"></audio>
+  <nav><a href="/">Home</a> · <a href="/gear">Gear</a> · <a href="/setup">Setup</a></nav>
+  <main>
+    <article>
+      <h1>Choosing strings for an old bass</h1>
+      <p class="byline">By Tomas Ferreira · May 2, 2026</p>
+      <p>An old bass often arrives with strings that have been on it for years, and the first question most new owners ask is what to put on next. The answer depends on the neck, the frets, the pickups and the music, and it is worth thinking about each of them before buying a set.</p>
+      <h2>Start with the neck</h2>
+      <p>Older necks were built for heavier strings, so a light set can leave the relief too flat and the strings buzzing against the frets. If the truss rod is stiff or near the end of its travel, stay close to the gauge the bass was set up for, and adjust the rod a quarter turn at a time, letting the wood settle overnight.</p>
+      <p>Flatwound strings put a little more tension on the neck than roundwounds of the same gauge, which some players find helps an old neck that has drifted forward. Measure relief at the eighth fret with a capo at the first and a finger at the last, and write it down before you change anything.</p>
+      <h2>Then the frets</h2>
+      <p>Worn frets wear faster under roundwounds, and stainless steel strings are harder still. On a bass with original frets that you would rather not replace, nickel roundwounds or flatwounds are kinder, and they sound closer to what the instrument was built to do anyway.</p>
+      <blockquote>Write down the relief, the action and the gauge before changing anything; the numbers tell you what changed.</blockquote>
+      <h2>A short checklist</h2>
+      <ul>
+        <li>Check relief and action, and note both.</li>
+        <li>Pick a gauge close to the old set.</li>
+        <li>Prefer nickel or flatwound on original frets.</li>
+        <li>Stretch new strings, retune, and check intonation.</li>
+      </ul>
+      <p>Finally, give the new set a week. Strings settle, the neck responds to the new tension, and the bass will often need one more small adjustment before it plays its best. The setup code for this article is LARK-58.</p>
+    </article>
+  </main>
+  <aside>Related: <a href="/a">Ten tone tips</a> · <a href="/b">Pickup heights</a></aside>
+  <footer>© Unibrow Test Journal</footer>
+<script>
+  const $ = (id) => document.getElementById(id);
+  document.addEventListener('contextmenu', () => { $('rc').textContent = String(+$('rc').textContent + 1); });
+  $('count').addEventListener('click', () => { $('cc').textContent = String(+$('cc').textContent + 1); });
+  const audio = $('audio');
+  $('tone').addEventListener('click', () => { audio.currentTime = 0; audio.play().catch((e) => { $('ts').textContent = 'blocked: ' + e.name; }); });
+  audio.addEventListener('playing', () => { $('ts').textContent = 'playing'; });
+  audio.addEventListener('ended', () => { $('ts').textContent = 'ended'; });
+</script>
+</body>
+</html>

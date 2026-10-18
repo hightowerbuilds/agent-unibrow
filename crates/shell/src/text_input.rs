@@ -105,6 +105,7 @@ impl TextInput {
         cx.notify();
     }
 
+    #[allow(dead_code)] // the chat box stays enabled now; other inputs may use it
     pub fn set_disabled(&mut self, disabled: bool, cx: &mut Context<Self>) {
         self.disabled = disabled;
         cx.notify();

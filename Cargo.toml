@@ -9,6 +9,7 @@ members = [
     "crates/page-model",
     "crates/evals",
     "crates/browsing",
+    "crates/chats",
     "crates/rails/rail-api",
     "crates/rails/rail-commerce",
     "crates/rails/rail-aggregator",
@@ -47,4 +48,11 @@ policy = { path = "crates/policy" }
 agent-core = { path = "crates/agent-core" }
 rail-api = { path = "crates/rails/rail-api" }
 browsing = { path = "crates/browsing" }
+chats = { path = "crates/chats" }
 page-model = { path = "crates/page-model" }
+
+# Dependencies (GPUI, its layout engine, image decoding) are built optimized
+# even in dev builds; unoptimized they make the UI sluggish. Our own crates
+# stay quick to compile.
+[profile.dev.package."*"]
+opt-level = 2

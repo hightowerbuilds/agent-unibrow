@@ -56,7 +56,7 @@ fn main() {
     let mut registry = Registry::new();
     registry.add_rail(&ClockOnly);
     let api_key = std::env::var("ANTHROPIC_API_KEY").ok();
-    let (handle, events) = agent_core::spawn(settings, api_key, registry, Arc::new(Mutex::new(Policy::in_memory())));
+    let (handle, events) = agent_core::spawn(settings, api_key, registry, Arc::new(Mutex::new(Policy::in_memory())), None);
     futures::executor::block_on(async move {
       for message in messages {
         println!("\n>>> {message}");
@@ -75,6 +75,8 @@ fn main() {
                     let _ = respond.send(Approval::Deny);
                 }
                 AgentEvent::ApprovalDecided { .. } => {}
+                AgentEvent::Resume(_) | AgentEvent::ResumeFailed => {}
+                AgentEvent::Steered { count } => println!("[steered] {count} message(s) delivered"),
                 AgentEvent::Done { stop_reason, model, usage } => {
                     println!("\n[done] {stop_reason} model={model:?} usage={usage}");
                     break;

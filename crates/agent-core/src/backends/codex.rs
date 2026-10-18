@@ -23,8 +23,13 @@ pub struct Codex {
 }
 
 impl Codex {
-    pub fn new(settings: &Settings, mcp: McpServer, events: async_channel::Sender<AgentEvent>) -> Self {
-        Self { model: settings.codex_model.clone(), mcp, thread_id: None, events }
+    pub fn new(
+        settings: &Settings,
+        mcp: McpServer,
+        events: async_channel::Sender<AgentEvent>,
+        thread_id: Option<String>,
+    ) -> Self {
+        Self { model: settings.codex_model.clone(), mcp, thread_id, events }
     }
 
     fn emit(&self, ev: AgentEvent) {
@@ -90,6 +95,9 @@ impl Codex {
                             self.emit(AgentEvent::Info(format!(
                                 "Codex session started via your ChatGPT sign-in (thread {id})"
                             )));
+                        }
+                        if self.thread_id.as_deref() != Some(id) {
+                            self.emit(AgentEvent::Resume(serde_json::json!({"codex_thread": id})));
                         }
                         self.thread_id = Some(id.to_string());
                     }

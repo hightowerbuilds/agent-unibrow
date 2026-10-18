@@ -33,13 +33,18 @@ pub struct ClaudeCode {
 }
 
 impl ClaudeCode {
-    pub fn new(settings: &Settings, mcp: McpServer, events: async_channel::Sender<AgentEvent>) -> Self {
+    pub fn new(
+        settings: &Settings,
+        mcp: McpServer,
+        events: async_channel::Sender<AgentEvent>,
+        session_id: Option<String>,
+    ) -> Self {
         Self {
             model: settings.claude_model.clone(),
             effort: settings.claude_effort.clone(),
             mcp,
             running: None,
-            session_id: None,
+            session_id,
             announced: false,
             events,
         }
@@ -129,6 +134,9 @@ impl ClaudeCode {
             match ev["type"].as_str().unwrap_or("") {
                 "system" if ev["subtype"] == "init" => {
                     if let Some(id) = ev["session_id"].as_str() {
+                        if self.session_id.as_deref() != Some(id) {
+                            self.emit(AgentEvent::Resume(json!({"claude_session": id})));
+                        }
                         self.session_id = Some(id.to_string());
                     }
                     model = ev["model"].as_str().map(str::to_string);
@@ -224,6 +232,13 @@ impl ClaudeCode {
             }
             None => "Claude Code isn't running.".into(),
         };
+        if msg.contains("No conversation found") {
+            // The saved session is gone; start fresh next time.
+            self.session_id = None;
+            self.emit(AgentEvent::Info("The saved Claude Code session couldn't be resumed; starting a new one.".into()));
+            self.emit(AgentEvent::ResumeFailed);
+            return;
+        }
         let hint = if msg.contains("login") || msg.contains("auth") {
             "\nRun `claude` in a terminal and sign in, then try again."
         } else {
