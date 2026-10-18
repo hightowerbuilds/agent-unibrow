@@ -1,0 +1,13 @@
+[package]
+name = "rail-files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+router.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+tokio.workspace = true
+dirs.workspace = true
+chrono.workspace = true

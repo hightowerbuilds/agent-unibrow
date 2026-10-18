@@ -41,6 +41,10 @@ fixtures over HTTPS with a self-signed certificate, and `/auth/<page>`
 answers 401 (HTTP Basic, user `ada`, password `lovelace`) until signed in.
 A `page` of `home` starts on the app's home page, as a real launch does;
 `home_layout` seeds its home.json and `home_files` its home/ folder.
+`sandbox_files` seeds the file tools' sandbox (`files/` in the instance's
+data folder, which is `~` to them), and `expect.files` ({path: text it
+must contain, or ""}) and `expect.files_absent` check paths in the data
+folder afterwards (`files/…`, or `Trash/files/…` for deleted items).
 A case without a `task` runs no agent turn (no quota used): the instance
 runs its `UNIBROW_TEST_PANE` steps for `secs` seconds and only the log is
 checked (`log_contains`, `log_not_contains`); the media cases work this way.
@@ -235,6 +239,13 @@ def run_case(case, port, workdir: Path, site: Path, tls_port=None):
         (data / "home").mkdir(parents=True, exist_ok=True)
         for name, text in case["home_files"].items():
             (data / "home" / name).write_text(text)
+    if "sandbox_files" in case:
+        # The user's own files, as the file tools see them (the sandbox
+        # home, $UNIBROW_DATA_DIR/files).
+        for name, text in case["sandbox_files"].items():
+            f = data / "files" / name
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(text)
     if "focus" in case:
         env["UNIBROW_TEST_FOCUS"] = case["focus"]
     if "autostop_secs" in case:
@@ -360,6 +371,15 @@ def check(case, trace, data: Path, seconds, log_path=None):
         failures.append(f"the agent was used ({', '.join(calls)}) but Jev should have handled it")
     if exp.get("approval_requested") and not any(e.get("kind") == "approval_requested" for e in trace):
         failures.append("no approval was requested")
+    for name, want in exp.get("files", {}).items():
+        f = data / name
+        if not f.exists():
+            failures.append(f"{name} doesn't exist")
+        elif want and want not in f.read_text(errors="replace"):
+            failures.append(f"{name} is missing “{want}”")
+    for name in exp.get("files_absent", []):
+        if (data / name).exists():
+            failures.append(f"{name} exists but shouldn't")
     for secret in exp.get("never_seen", []):
         if secret in raw:
             failures.append(f"secret “{secret}” appears in the trace")

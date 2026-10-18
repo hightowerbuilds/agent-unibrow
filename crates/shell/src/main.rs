@@ -680,6 +680,8 @@ impl Shell {
         for tool in rail_browser::tools::tools(self.bridge.clone(), self.store.clone(), codes) {
             registry.add_tool(tool);
         }
+        // Files on the user's computer (a sandbox folder in test instances).
+        registry.add_rail(&rail_files::FilesRail::new(rail_files::paths::Config::from_env(rail_browser::downloads_dir())));
         registry.add_tool(chats::TaskProgress::new(self.chats.clone(), self.chat_id));
         registry.add_tool(Arc::new(home::Customize));
         for n in &notes {
