@@ -60,6 +60,12 @@ pub enum AgentControl {
     TookOver,
 }
 
+/// The agent asked the user to do something on the page (browser_handoff).
+struct Handoff {
+    message: String,
+    reply: Option<rail_browser::bridge::Reply<bool>>,
+}
+
 /// One open tab: its own Chromium page and toolbar state.
 struct Tab {
     id: u32,
@@ -103,6 +109,7 @@ pub struct BrowserPane {
     downloads_open: bool,
     /// A short notice over the page (blocked permission requests).
     notice: Option<(String, Instant)>,
+    handoff: Option<Handoff>,
     page_focus: FocusHandle,
     _pump: Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -195,6 +202,7 @@ impl BrowserPane {
             file_prompt_open: false,
             downloads_open: false,
             notice: None,
+            handoff: None,
             page_focus,
             _pump: pump,
             _subscriptions: subscriptions,
@@ -278,6 +286,19 @@ impl BrowserPane {
                     let _ = reply.send(Ok(all));
                 }
                 Request::SavePdf { path, done } => view.print_to_pdf(&path, done),
+                Request::Handoff { message, reply } => {
+                    // Test hook: finish handoffs automatically.
+                    let auto = std::env::var("UNIBROW_AUTOHANDOFF").ok();
+                    if let Some(answer) = auto.as_deref().filter(|a| *a == "done" || *a == "later") {
+                        let _ = reply.send(Ok(answer == "done"));
+                    } else {
+                        if let Some(old) = self.handoff.take().and_then(|h| h.reply) {
+                            let _ = old.send(Ok(false));
+                        }
+                        self.handoff = Some(Handoff { message, reply: Some(reply) });
+                        changed = true;
+                    }
+                }
             }
         }
         for (op, reply) in tab_ops {
@@ -629,13 +650,17 @@ impl BrowserPane {
         if !busy {
             self.agent_driving = false;
             self.highlight = None;
+            if let Some(reply) = self.handoff.take().and_then(|h| h.reply) {
+                let _ = reply.send(Ok(false));
+            }
         }
         cx.notify();
     }
 
-    /// The user is acting on the page while the agent drives it.
+    /// The user is acting on the page while the agent drives it. (Not
+    /// during a handoff: then the agent is waiting for exactly that.)
     fn user_took_over(&mut self, cx: &mut Context<Self>) {
-        if self.agent_busy && self.agent_driving {
+        if self.agent_busy && self.agent_driving && self.handoff.is_none() {
             cx.emit(AgentControl::TookOver);
         }
     }
@@ -984,7 +1009,7 @@ impl BrowserPane {
                     .into_any_element(),
             ]
         });
-        let agent_bar = (self.agent_busy && self.agent_driving).then(|| {
+        let agent_bar = (self.agent_busy && self.agent_driving && self.handoff.is_none()).then(|| {
             div()
                 .absolute()
                 .top(px(8.))
@@ -1008,6 +1033,21 @@ impl BrowserPane {
                         .text_color(rgb(theme::FG))
                         .child(div().text_color(rgb(theme::ACCENT)).child("●"))
                         .child("Agent is using the browser")
+                        .child(
+                            div()
+                                .id("agent-takeover")
+                                .px_2()
+                                .py(px(2.))
+                                .rounded_full()
+                                .border_1()
+                                .border_color(rgb(theme::RULE))
+                                .text_color(rgb(theme::FG))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(theme::RAISED)))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(|_, _, _, cx| cx.emit(AgentControl::TookOver)))
+                                .child("Take over"),
+                        )
                         .child(
                             div()
                                 .id("agent-stop")
@@ -1072,6 +1112,7 @@ impl BrowserPane {
             .children(highlight.into_iter().flatten())
             .children(agent_bar)
             .children(self.dialog_card(cx))
+            .children(self.handoff_banner(cx))
             .children(self.notice.as_ref().map(|(text, _)| {
                 div()
                     .absolute()
@@ -1097,6 +1138,73 @@ impl BrowserPane {
 }
 
 impl BrowserPane {
+    fn finish_handoff(&mut self, done: bool, cx: &mut Context<Self>) {
+        if let Some(reply) = self.handoff.take().and_then(|h| h.reply) {
+            let _ = reply.send(Ok(done));
+        }
+        cx.notify();
+    }
+
+    /// "Your turn": the agent is waiting for the user to do something.
+    fn handoff_banner(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let h = self.handoff.as_ref()?;
+        Some(
+            div()
+                .absolute()
+                .top(px(8.))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .max_w(px(560.))
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .pl_3()
+                        .pr_1()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgb(theme::PANE))
+                        .border_1()
+                        .border_color(rgb(theme::WARN))
+                        .shadow_lg()
+                        .child(div().text_xs().text_color(rgb(theme::WARN)).child("Your turn"))
+                        .child(div().flex_1().text_sm().text_color(rgb(theme::FG)).child(SharedString::from(h.message.clone())))
+                        .child(
+                            div()
+                                .id("handoff-later")
+                                .px_2()
+                                .py(px(2.))
+                                .rounded_md()
+                                .text_xs()
+                                .text_color(rgb(theme::MUTED))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(theme::RAISED)))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(|this, _, _, cx| this.finish_handoff(false, cx)))
+                                .child("Not now"),
+                        )
+                        .child(
+                            div()
+                                .id("handoff-done")
+                                .px_3()
+                                .py(px(2.))
+                                .rounded_md()
+                                .text_xs()
+                                .bg(rgb(theme::ACCENT))
+                                .text_color(rgb(theme::BG))
+                                .cursor_pointer()
+                                .hover(|s| s.opacity(0.85))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(|this, _, _, cx| this.finish_handoff(true, cx)))
+                                .child("Done"),
+                        ),
+                ),
+        )
+    }
+
     /// The page's JavaScript dialog, shown to the user as a card.
     fn dialog_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let d = self.chrome.dialog.clone()?;

@@ -14,6 +14,7 @@ pub mod bridge;
 mod handlers;
 pub mod keys;
 pub mod tools;
+pub mod vault;
 
 use cef::args::Args;
 use cef::{CefString, ImplBrowser, ImplBrowserHost, ImplCommandLine, ImplFrame};

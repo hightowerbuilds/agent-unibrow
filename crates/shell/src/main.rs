@@ -78,6 +78,14 @@ struct Shell {
     bridge: BrowserBridge,
     store: Arc<Browsing>,
     history_filter: Entity<TextInput>,
+    /// The user took over the page; offer to hand it back.
+    can_continue: bool,
+    /// Saved-login form in the Focus tab.
+    login_form_open: bool,
+    login_site: Entity<TextInput>,
+    login_user: Entity<TextInput>,
+    login_pass: Entity<TextInput>,
+    login_error: Option<String>,
     items: Vec<Item>,
     /// Index of the assistant item currently receiving streamed text.
     streaming: Option<usize>,
@@ -106,9 +114,19 @@ impl Shell {
         let browser = cx.new(|cx| BrowserPane::new(cef, store.clone(), requests, window, cx));
         let control_sub = cx.subscribe(&browser, |this: &mut Self, _, ev: &AgentControl, cx| match ev {
             AgentControl::Stop => this.stop_agent("Stopped.", cx),
-            AgentControl::TookOver => this.stop_agent("You took over the page, so I stopped.", cx),
+            AgentControl::TookOver => {
+                this.stop_agent("You took over the page. Press Continue when you want the agent to pick up from there.", cx);
+                this.can_continue = true;
+            }
         });
         let history_filter = cx.new(|cx| TextInput::new("Search history", cx));
+        let login_site = cx.new(|cx| TextInput::new("Site, e.g. sweetwater.com", cx));
+        let login_user = cx.new(|cx| TextInput::new("Username or email", cx));
+        let login_pass = cx.new(|cx| {
+            let mut t = TextInput::new("Password", cx);
+            t.set_masked(true, cx);
+            t
+        });
         let subscription = cx.subscribe(&input, |this: &mut Self, _, ev: &Submit, cx| this.submit(ev.0.clone(), cx));
         let browsing_sub = cx.subscribe(&browser, |this: &mut Self, _, _: &BrowsingChanged, cx| {
             if matches!(this.tab, SidebarTab::History | SidebarTab::Focus) {
@@ -125,6 +143,12 @@ impl Shell {
             bridge,
             store,
             history_filter,
+            can_continue: false,
+            login_form_open: false,
+            login_site,
+            login_user,
+            login_pass,
+            login_error: None,
             items: Vec::new(),
             streaming: None,
             trace: Trace::open_session(),
@@ -284,6 +308,7 @@ impl Shell {
         if self.busy {
             return;
         }
+        self.can_continue = false;
         self.items.push(Item { kind: ItemKind::User, text: text.clone() });
         self.trace.push(Kind::User, first_line(&text), Some(text.clone()));
         // The agent always knows which sites are in focus.
@@ -622,7 +647,37 @@ impl Shell {
                     .children(self.items.iter().map(Self::render_item))
                     .children(approvals),
             )
-            .child(div().p_3().border_t_1().border_color(rgb(theme::RULE)).child(self.input.clone()))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_3()
+                    .border_t_1()
+                    .border_color(rgb(theme::RULE))
+                    .when(self.can_continue && !self.busy, |d| {
+                        d.child(
+                            div()
+                                .id("continue-agent")
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(theme::ACCENT))
+                                .text_sm()
+                                .text_color(rgb(theme::BG))
+                                .cursor_pointer()
+                                .hover(|s| s.opacity(0.85))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.submit(
+                                        "I've done my part on the page. Carry on from where the page is now.".into(),
+                                        cx,
+                                    )
+                                }))
+                                .child("Continue: hand the page back to the agent"),
+                        )
+                    })
+                    .child(self.input.clone()),
+            )
     }
 
     fn open_url(&mut self, url: String, cx: &mut Context<Self>) {
@@ -865,6 +920,7 @@ impl Shell {
         let current_site = site_of(&current_url);
         let current_in_focus = current_site.as_deref().is_some_and(|s| self.store.is_focused(s));
 
+        let logins = self.render_logins(cx).into_any_element();
         let rows = sites.into_iter().map(|f| {
             let site = f.site.clone();
             div()
@@ -942,6 +998,7 @@ impl Shell {
                         }))
                     })),
             )
+            .child(logins)
             .child(
                 div()
                     .id("focus-list")
@@ -957,6 +1014,106 @@ impl Shell {
                         ))
                     }),
             )
+    }
+
+    fn save_login(&mut self, cx: &mut Context<Self>) {
+        let site = self.login_site.read(cx).text().to_string();
+        let user = self.login_user.read(cx).text().to_string();
+        let pass = self.login_pass.read(cx).text().to_string();
+        match rail_browser::vault::save(&site, &user, &pass) {
+            Ok(()) => {
+                self.login_error = None;
+                self.login_form_open = false;
+                for input in [&self.login_site, &self.login_user, &self.login_pass] {
+                    input.update(cx, |i, cx| i.set_text("", cx));
+                }
+                self.trace.push(Kind::Info, format!("Saved a login for {}", rail_browser::vault::normalize_site(&site)), None);
+            }
+            Err(e) => self.login_error = Some(e),
+        }
+        cx.notify();
+    }
+
+    /// Saved logins (roadmap 5.1): the agent can fill these with
+    /// browser_sign_in but never sees the passwords.
+    fn render_logins(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let logins = rail_browser::vault::list();
+        let form = self.login_form_open.then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(self.login_site.clone())
+                .child(self.login_user.clone())
+                .child(self.login_pass.clone())
+                .children(self.login_error.clone().map(|e| div().text_xs().text_color(rgb(theme::ERROR)).child(e)))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            Self::small_button("login-save".into(), "Save", true)
+                                .on_click(cx.listener(|this, _, _, cx| this.save_login(cx))),
+                        )
+                        .child(Self::small_button("login-cancel".into(), "Cancel", false).on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.login_form_open = false;
+                                this.login_error = None;
+                                this.login_pass.update(cx, |i, cx| i.set_text("", cx));
+                                cx.notify();
+                            },
+                        ))),
+                )
+                .child(div().text_xs().text_color(rgb(theme::MUTED)).child(
+                    "The password goes into your keyring. The agent can fill it on this site with browser_sign_in, but never sees it.",
+                ))
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .border_b_1()
+            .border_color(rgb(theme::RULE))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(div().flex_1().text_xs().text_color(rgb(theme::ACCENT)).child("SAVED LOGINS"))
+                    .when(!self.login_form_open, |d| {
+                        d.child(Self::small_button("login-add".into(), "Add login", false).on_click(cx.listener(
+                            |this, _, window, cx| {
+                                let (url, _) = this.browser.read(cx).location();
+                                let site = site_of(&url).unwrap_or_default();
+                                this.login_site.update(cx, |i, cx| i.set_text(&site, cx));
+                                this.login_form_open = true;
+                                window.focus(&this.login_user.focus_handle(cx));
+                                cx.notify();
+                            },
+                        )))
+                    }),
+            )
+            .when(logins.is_empty() && !self.login_form_open, |d| {
+                d.child(div().text_xs().text_color(rgb(theme::MUTED)).child("None yet. Add one to let the agent sign in for you."))
+            })
+            .children(logins.into_iter().enumerate().map(|(i, l)| {
+                let (site, user) = (l.site.clone(), l.username.clone());
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_sm()
+                    .child(div().flex_1().min_w(px(0.)).truncate().text_color(rgb(theme::FG)).child(format!("{} · {}", l.site, l.username)))
+                    .child(div().text_xs().text_color(rgb(theme::MUTED)).child("••••••"))
+                    .child(Self::small_button(SharedString::from(format!("login-remove-{i}")), "Remove", false).on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            let _ = rail_browser::vault::remove(&site, &user);
+                            this.trace.push(Kind::Info, format!("Removed the saved login for {site}"), None);
+                            cx.notify();
+                        }),
+                    ))
+            }))
+            .children(form)
     }
 
     fn render_trace(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1305,6 +1462,17 @@ fn main() -> std::process::ExitCode {
         eprintln!("agent-unibrow: history unavailable ({e}); using a temporary store");
         Browsing::in_memory()
     }));
+    // Test hook (isolated test instances only): pre-save a login, "site|user|password".
+    if std::env::var_os("UNIBROW_DATA_DIR").is_some() {
+        if let Ok(spec) = std::env::var("UNIBROW_TEST_LOGIN") {
+            let parts: Vec<&str> = spec.splitn(3, '|').collect();
+            if let [site, user, pass] = parts[..] {
+                if let Err(e) = rail_browser::vault::save(site, user, pass) {
+                    eprintln!("agent-unibrow: test login not saved: {e}");
+                }
+            }
+        }
+    }
     let cef = rail_browser::initialize();
     if let Err(e) = &cef {
         eprintln!("agent-unibrow: browser unavailable: {e}");

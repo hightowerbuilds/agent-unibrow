@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Unibrow Test Shop – Verify</title>
+<style>body { font: 16px system-ui, sans-serif; max-width: 520px; margin: 32px auto; padding: 0 16px; background: #fff; color: #1b2733; } input, button { font: inherit; padding: 8px; } output { display: block; font-weight: 600; margin-top: 10px; }</style>
+</head>
+<body>
+  <h1>Verify it's you</h1>
+  <p>We sent a 6-digit verification code to your phone. Enter it below.</p>
+  <label for="code">Verification code</label>
+  <input id="code" name="otp" autocomplete="one-time-code" inputmode="numeric">
+  <button onclick="document.getElementById('out').textContent = document.getElementById('code').value.length === 6 ? 'VERIFIED' : 'Code needed'">Verify</button>
+  <output id="out"></output>
+</body>
+</html>

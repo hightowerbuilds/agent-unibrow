@@ -5,20 +5,36 @@ embedded browser: see the page, act on it, move between pages and tabs,
 handle logins, files and dialogs, recover when things go wrong, and know
 when to stop and hand control back.
 
-Status: **done** (built and tested) · **partial** (started) · **todo**.
+Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is left is noted) · todo.
 
 ## Where things stand
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Chromium embedded in the app (CEF 154, off-screen) | done | Frames painted in GPUI; one window |
-| User input to the page (mouse, wheel, keyboard) | done | Key events carry X11 keycodes (US layout) |
-| Toolbar: back, forward, reload, address bar | done | |
-| Persistent profile (cookies, logins) | done | `~/.local/share/agent-unibrow/browser` |
-| History, bookmarks, focus sites | done | SQLite; agents can read history and focus |
-| Agent backends (Claude Code, Codex, OpenCode, API) | done | Tools served over local MCP |
-| Policy, approval cards, trace | done | Every tool call goes through `ToolHost` |
-| Agent tools that act in the browser | **partial** | Phase 1 built and tested on a local checkout page |
+| Chromium embedded in the app (CEF 154, off-screen) | ✅ **COMPLETED** | Frames painted in GPUI; one window |
+| User input to the page (mouse, wheel, keyboard) | ✅ **COMPLETED** | Key events carry X11 keycodes (US layout) |
+| Toolbar: back, forward, reload, address bar | ✅ **COMPLETED** | |
+| Persistent profile (cookies, logins) | ✅ **COMPLETED** | `~/.local/share/agent-unibrow/browser` |
+| History, bookmarks, focus sites | ✅ **COMPLETED** | SQLite; agents can read history and focus |
+| Agent backends (Claude Code, Codex, OpenCode, API) | ✅ **COMPLETED** | Tools served over local MCP |
+| Policy, approval cards, trace | ✅ **COMPLETED** | Every tool call goes through `ToolHost` |
+| Agent tools that act in the browser | ◐ partial | 25 browser tools; see the phases below |
+
+### Progress by phase
+
+| Phase | Completed | Partial | Todo |
+| --- | --- | --- | --- |
+| 1. Foundation | 1.1, 1.3, 1.4, 1.5 | 1.2 | |
+| 2. Full interaction | | 2.1, 2.2, 2.3 | 2.4, 2.5, 2.6, 2.7 |
+| 3. Tabs, windows, navigation | 3.4 | 3.1, 3.2, 3.3 | |
+| 4. Dialogs, permissions, files | 4.1, 4.3, 4.4 | 4.2, 4.6 | 4.5 |
+| 5. Accounts and handoff | 5.1, 5.3, 5.4 | 5.2, 5.5 | |
+| 6. Safety and policy | 6.1, 6.2, 6.4 | | 6.3, 6.5, 6.6, 6.7 |
+| 7. Reliability | 7.2, 7.5 | 7.1, 7.3 | 7.4 |
+| 8. Focus sites | | | 8.1–8.6 |
+| 9. Extracting | | | 9.1–9.4 |
+| 10. Polish | shortcuts | | the rest |
+| 11. Under the hood | | | all |
 
 ## How the agent will see and drive pages
 
@@ -48,13 +64,13 @@ that every agent backend receives the same way.
 
 The minimum for the agent to work in the browser at all.
 
-### 1.1 CDP bridge — done
+### 1.1 CDP bridge — ✅ **COMPLETED**
 - Send CDP commands and receive results and events from `rail-browser`.
 - CEF runs on the UI thread and tools run on the agent thread, so
   requests go over a channel and answers come back the same way.
 - Timeouts, and errors that read clearly in the trace.
 
-### 1.2 Page model v1 — partial (outline, refs, paging done; diffs between steps todo)
+### 1.2 Page model v1 — ◐ partial (outline, refs, paging done; diffs between steps todo)
 - Accessibility tree pruned to what matters: interactive elements,
   headings, landmarks, text.
 - Each element gets a short **ref** (`e12`) mapped to its `backendNodeId`, so
@@ -65,7 +81,7 @@ The minimum for the agent to work in the browser at all.
 - A screenshot of the viewport, attached when the model can use images.
 - Diffs between steps: what changed after the last action.
 
-### 1.3 Core browser tools — done
+### 1.3 Core browser tools — ✅ **COMPLETED**
 
 | Tool | Does | Effect |
 | --- | --- | --- |
@@ -82,7 +98,7 @@ The minimum for the agent to work in the browser at all.
 \* Clicks are classed by what they hit: a link or tab is Read, a submit,
 "Buy", "Send" or "Delete" button is Commit (see 6.1).
 
-### 1.4 Shared page between you and the agent — done (highlight and agent bar not yet seen on screen)
+### 1.4 Shared page between you and the agent — ✅ **COMPLETED** (highlight and agent bar not yet seen on screen)
 - The agent drives the page you're looking at, so you see every step.
 - **Agent overlay**: highlight the element about to be clicked or typed
   into, and show a small "agent is working" bar with **Stop**.
@@ -90,7 +106,7 @@ The minimum for the agent to work in the browser at all.
 - While the agent is driving, your own clicks pause it rather than racing
   it.
 
-### 1.5 Trace with evidence — done (after-action screenshots; before-shots todo)
+### 1.5 Trace with evidence — ✅ **COMPLETED** (after-action screenshots; before-shots todo)
 - Every browser action logged with the element, the URL, and a small
   before/after screenshot.
 - Click a trace row to see the page as the agent saw it.
@@ -99,7 +115,7 @@ The minimum for the agent to work in the browser at all.
 
 ## Phase 2: Full interaction (everything a person does on a page)
 
-### 2.1 Forms — partial (fields, checkboxes, radios, native dropdowns with popup rendering, `browser_select`; date pickers, rich editors and `browser_fill_form` todo)
+### 2.1 Forms — ◐ partial (fields, checkboxes, radios, native dropdowns with popup rendering, `browser_select`; date pickers, rich editors and `browser_fill_form` todo)
 - Text inputs, text areas, number, email, password fields.
 - Checkboxes, radio buttons, switches.
 - **`<select>` dropdowns**: render CEF's popup layer (`PET_POPUP`), which is
@@ -110,14 +126,14 @@ The minimum for the agent to work in the browser at all.
 - Read validation errors after submit and fix the fields.
 - `browser_fill_form`: fill several fields in one call from a mapping.
 
-### 2.2 Pointer actions — partial (hover, right/middle/double click done; drag and drop todo)
+### 2.2 Pointer actions — ◐ partial (hover, right/middle/double click done; drag and drop todo)
 - Double-click, right-click, middle-click.
 - Hover (menus that open on hover, tooltips).
 - Drag and drop: between elements, sliders, sortable lists, file drops
   (CEF `DragHandler` plus `drag_target_*`).
 - Click-and-hold.
 
-### 2.3 Keyboard — partial
+### 2.3 Keyboard — ◐ partial
 - Shortcuts inside pages (Ctrl+C/V/X/Z/A, Tab navigation).
 - Non-US layouts: derive physical key codes from the active layout rather
   than a US table.
@@ -146,7 +162,7 @@ The minimum for the agent to work in the browser at all.
 
 ## Phase 3: Tabs, windows and navigation
 
-### 3.1 Multiple tabs — partial (tab strip, Ctrl+T/W/Tab/L, `browser_tabs`, target=_blank links open tabs; agent-only background tabs todo)
+### 3.1 Multiple tabs — ◐ partial (tab strip, Ctrl+T/W/Tab/L, `browser_tabs`, target=_blank links open tabs; agent-only background tabs todo)
 - Real tabs in the UI (a tab strip), each its own `WebView`.
 - Agent tools: `browser_tabs`, `browser_new_tab`, `browser_switch_tab`,
   `browser_close_tab`.
@@ -154,39 +170,39 @@ The minimum for the agent to work in the browser at all.
 - Background tabs, so the agent can compare several pages without taking
   over the one you're on.
 
-### 3.2 Popups — partial (`window.open` opens a tab; opener link for OAuth popups todo)
+### 3.2 Popups — ◐ partial (`window.open` opens a tab; opener link for OAuth popups todo)
 - OAuth and payment popups (`window.open`) open as real popup views and
   close themselves back into the opener, instead of replacing the page.
 
-### 3.3 Navigation state — partial (load failures reported to the agent; per-tab history list todo)
+### 3.3 Navigation state — ◐ partial (load failures reported to the agent; per-tab history list todo)
 - Session history list per tab (`navigation_entries`).
 - Detect error pages, 404s, offline, and redirects to login.
 
-### 3.4 Find in page — done (Ctrl+F bar with match count; `browser_find`)
+### 3.4 Find in page — ✅ **COMPLETED** (Ctrl+F bar with match count; `browser_find`)
 - Ctrl+F for people; `browser_find` for the agent (CEF `find` / `FindHandler`).
 
 ---
 
 ## Phase 4: Dialogs, permissions, files and downloads
 
-### 4.1 JavaScript dialogs — done
+### 4.1 JavaScript dialogs — ✅ **COMPLETED**
 - `alert`, `confirm`, `prompt`, and "leave site?" (`JsdialogHandler`).
 - Shown to the user as in-app cards; the agent can answer `alert`s, but
   `confirm`s that delete or pay go through approval.
 
-### 4.2 Permission requests — partial (camera, mic, location, notifications denied with a notice; per-site allow todo)
+### 4.2 Permission requests — ◐ partial (camera, mic, location, notifications denied with a notice; per-site allow todo)
 - Location, notifications, camera, microphone, clipboard
   (`PermissionHandler`).
 - Default deny for the agent; the user approves per site, remembered per
   site.
 
-### 4.3 File uploads — done (desktop file picker for people; `browser_upload` with approval, hidden folders refused)
+### 4.3 File uploads — ✅ **COMPLETED** (desktop file picker for people; `browser_upload` with approval, hidden folders refused)
 - File chooser (`DialogHandler`): the user picks files, or the agent
   attaches a file the user has explicitly allowed (e.g. a résumé in a
   known folder).
 - Never browse the user's disk on its own.
 
-### 4.4 Downloads — done (auto-save, toolbar list, `browser_downloads`, `browser_read_download` incl. PDF via pdftotext)
+### 4.4 Downloads — ✅ **COMPLETED** (auto-save, toolbar list, `browser_downloads`, `browser_read_download` incl. PDF via pdftotext)
 - `DownloadHandler`: save to `~/Downloads/agent-unibrow`, show progress in
   the UI, and report the saved path to the agent.
 - Read downloaded PDFs, CSVs and text so the agent can use their contents.
@@ -195,34 +211,34 @@ The minimum for the agent to work in the browser at all.
 - Certificate errors shown to the user; the agent never clicks through.
 - HTTP basic auth prompts handed to the user.
 
-### 4.6 Print and PDF — partial (`browser_save_pdf`; system print dialog todo)
+### 4.6 Print and PDF — ◐ partial (`browser_save_pdf`; system print dialog todo)
 - Save page as PDF (`print_to_pdf`); print through the system dialog.
 
 ---
 
 ## Phase 5: Accounts, logins and handing control back
 
-### 5.1 Password vault — todo
+### 5.1 Password vault — ✅ **COMPLETED** (keyring-backed; `browser_sign_in` fills on the saved site only; Focus tab UI)
 - Saved logins stored encrypted (keyring-backed).
 - The agent can ask to "sign in to X"; the app fills the fields itself, so
   **the model never sees the password**.
 
-### 5.2 Two-factor and verification — todo
+### 5.2 Two-factor and verification — ◐ partial (code fields detected and refused; `browser_handoff`; reading email codes todo)
 - Detect 2FA, email or SMS codes, and device checks.
 - Hand off: pause, highlight the field, tell the user what's needed, then
   resume once the page moves on.
 - For email codes, the agent may read the code from Gmail with the
   user's approval.
 
-### 5.3 CAPTCHAs and bot checks — todo
+### 5.3 CAPTCHAs and bot checks — ✅ **COMPLETED** (detected and handed to the user)
 - Always hand to the user. No solving services, no evasion. If a site
   blocks the agent, say so and stop.
 
-### 5.4 Take-over mode — todo
+### 5.4 Take-over mode — ✅ **COMPLETED** (Take over button, Continue to hand back)
 - One button: "I'll do this part". The agent pauses, the user acts, then
   hits "Continue" and the agent re-reads the page.
 
-### 5.5 Session awareness — todo
+### 5.5 Session awareness — ◐ partial (sign-in pages flagged with whether a saved login exists)
 - Notice when the user is logged out or a session expired, and say so
   instead of failing confusingly.
 
@@ -230,7 +246,7 @@ The minimum for the agent to work in the browser at all.
 
 ## Phase 6: Safety and policy for browser actions
 
-### 6.1 Classifying actions by effect — done (button wording, form submits that post or carry sensitive fields, Enter in such forms, risky confirm dialogs)
+### 6.1 Classifying actions by effect — ✅ **COMPLETED** (button wording, form submits that post or carry sensitive fields, Enter in such forms, risky confirm dialogs)
 - **Read**: navigate, read, scroll, search.
 - **Stage**: type into fields, add to cart, save a draft.
 - **Commit**: submit forms that send, pay, post, delete, book, sign up,
@@ -238,7 +254,7 @@ The minimum for the agent to work in the browser at all.
 - Classified from the element (role, button text, form action) and the
   page (checkout, payment fields), with a cautious default.
 
-### 6.2 Approval cards for browser actions — done
+### 6.2 Approval cards for browser actions — ✅ **COMPLETED**
 - Show what will happen: a screenshot of the form, the values filled in,
   and the button that will be pressed.
 
@@ -247,7 +263,7 @@ The minimum for the agent to work in the browser at all.
   and anything else needs approval.
 - Per-site rules: read-only sites, never-act sites.
 
-### 6.4 Sensitive data — done (no typing into password/card/code fields; values hidden from page reads; masked in screenshots)
+### 6.4 Sensitive data — ✅ **COMPLETED** (no typing into password/card/code fields; values hidden from page reads; masked in screenshots)
 - Detect payment, password and ID fields. The agent never types card
   numbers or passwords itself; the vault fills them.
 - Redact sensitive values in the trace and in anything sent to the model.
@@ -270,15 +286,15 @@ The minimum for the agent to work in the browser at all.
 
 ## Phase 7: Reliability (finishing tasks, not just starting them)
 
-### 7.1 Act, then verify — todo
+### 7.1 Act, then verify — ◐ partial (actions return the page afterwards; optional `expect` text checked on click/type/press)
 - Every action declares what should change (URL, element, text), and the
   agent checks that it did before moving on.
 
-### 7.2 Waiting correctly — todo
+### 7.2 Waiting correctly — ✅ **COMPLETED** (load state, document ready, then network quiet; `browser_wait` for text)
 - Wait on real signals (load, network idle, element visible, spinner
   gone), never fixed sleeps.
 
-### 7.3 Recovering — todo
+### 7.3 Recovering — ◐ partial (stale refs reported clearly; cookie banners flagged, not auto-accepted; retries todo)
 - Stale refs after re-render: re-read and re-find the element by role and
   name.
 - Unexpected modals (cookie banners, newsletter popups): recognize and
@@ -289,7 +305,7 @@ The minimum for the agent to work in the browser at all.
 - Checkpoints, so a task can resume after an app restart.
 - Running tasks in background tabs while the user keeps browsing.
 
-### 7.5 Evals — todo
+### 7.5 Evals — ✅ **COMPLETED** (`crates/evals/run_evals.py`, 10 cases over local test pages; nightly scheduling todo)
 - Local test pages for each capability (forms, dropdowns, iframes, drag,
   dialogs, uploads, infinite scroll).
 - Recorded tasks on focus sites, replayed nightly; pass rates tracked in
@@ -358,7 +374,7 @@ set path instead of starting from scratch each time.
 - Translate page — todo
 - Spellcheck in fields (`replace_misspelling`) — todo
 - Right-click context menus rendered in-app (`ContextMenuHandler`) — todo
-- Keyboard shortcuts: Ctrl+L, Ctrl+T, Ctrl+W, Ctrl+Tab — todo
+- Keyboard shortcuts: Ctrl+L, Ctrl+T, Ctrl+W, Ctrl+Tab, Ctrl+F, Esc — ✅ **COMPLETED**
 - Favicons and page titles in tabs, bookmarks and history — todo
 - Audio and video: play, pause, mute (`set_audio_muted`) — todo
 - Picture of a region ("screenshot this chart") — todo

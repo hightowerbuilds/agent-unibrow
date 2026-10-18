@@ -74,6 +74,9 @@ pub enum Request {
     Downloads { reply: Reply<Vec<crate::DownloadInfo>> },
     /// Save the active page as a PDF; `done` gets whether it worked.
     SavePdf { path: String, done: oneshot::Sender<bool> },
+    /// Hand the page to the user ("enter the code, then click Done").
+    /// Replies true when they click Done, false for "Not now".
+    Handoff { message: String, reply: Reply<bool> },
     /// Answer the open JavaScript dialog.
     Dialog { accept: bool, text: Option<String>, reply: Reply<()> },
 }
@@ -135,6 +138,20 @@ impl BrowserBridge {
             Ok(Ok(ok)) => Ok(ok),
             Ok(Err(_)) => Err("The page closed before the PDF was saved.".into()),
             Err(_) => Err("Saving the PDF took longer than a minute.".into()),
+        }
+    }
+
+    /// Waits (up to `timeout`) for the user to finish a handoff.
+    pub async fn handoff(&self, message: String, timeout: Duration) -> Result<bool, String> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Request::Handoff { message, reply: tx })
+            .await
+            .map_err(|_| "The browser isn't running.".to_string())?;
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => Err("The handoff was closed.".into()),
+            Err(_) => Err(format!("The user didn't finish within {} minutes.", timeout.as_secs() / 60)),
         }
     }
 

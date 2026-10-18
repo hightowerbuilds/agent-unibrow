@@ -148,6 +148,8 @@ pub fn tools(bridge: BrowserBridge) -> Vec<Arc<dyn Tool>> {
         Arc::new(ReadDownload),
         Arc::new(Upload(b.clone())),
         Arc::new(SavePdf(b.clone())),
+        Arc::new(SignIn(b.clone())),
+        Arc::new(Handoff(b.clone())),
         Arc::new(History(b.clone(), NavAction::Back)),
         Arc::new(History(b.clone(), NavAction::Forward)),
         Arc::new(History(b, NavAction::Reload)),
@@ -218,12 +220,14 @@ impl Browser {
         let hidden = self.sensitive_ids().await;
         let model = from_ax_tree_hiding(&nodes, &hidden);
         let st = self.state().await?;
+        let notes = self.page_notes(&st.url).await;
         let mut out = format!(
-            "Page: {}\nURL: {}\n{}{}{} actionable elements. Refs like [e123] can be passed to browser_click / browser_type.\n\n",
+            "Page: {}\nURL: {}\n{}{}{}{} actionable elements. Refs like [e123] can be passed to browser_click / browser_type.\n\n",
             if st.title.is_empty() { "(untitled)" } else { &st.title },
             st.url,
             if st.loading { "Still loading.\n" } else { "" },
             st.load_error.as_ref().map(|e| format!("The page failed to load: {e}\n")).unwrap_or_default(),
+            notes,
             model.interactive,
         );
         if model.lines.is_empty() {
@@ -251,9 +255,36 @@ impl Browser {
                 .ok()
                 .and_then(|r| r["result"]["value"].as_str().map(str::to_string));
             if !loading && ready.as_deref() == Some("complete") {
+                self.network_quiet(timeout.saturating_sub(start.elapsed())).await;
                 return;
             }
             tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }
+
+    /// After load, waits until the page stops fetching (no new resource
+    /// entries across two checks), so content loaded by scripts is there
+    /// before the agent reads the page. (Roadmap 7.2.)
+    async fn network_quiet(&self, budget: Duration) {
+        let start = Instant::now();
+        let budget = budget.min(Duration::from_secs(4));
+        let count = || async {
+            self.bridge
+                .cdp(
+                    "Runtime.evaluate",
+                    json!({"expression": "performance.getEntriesByType('resource').length", "returnByValue": true}),
+                )
+                .await
+                .ok()
+                .and_then(|r| r["result"]["value"].as_i64())
+        };
+        let mut last = count().await;
+        let mut stable = 0;
+        while start.elapsed() < budget && stable < 2 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let now = count().await;
+            if now == last { stable += 1 } else { stable = 0 }
+            last = now;
         }
     }
 
@@ -285,7 +316,17 @@ impl Browser {
 
     /// The page after an action: outline for the model, thumbnail for the trace.
     async fn after_action(&self, what: String, summary: String) -> ToolResult {
+        self.after_action_expecting(what, summary, None).await
+    }
+
+    /// Like [`Browser::after_action`], also checking that `expect` text
+    /// appeared (roadmap 7.1: act, then verify).
+    async fn after_action_expecting(&self, what: String, summary: String, expect: Option<String>) -> ToolResult {
         self.settle(Duration::from_secs(10)).await;
+        let what = match expect.filter(|e| !e.trim().is_empty()) {
+            Some(e) => format!("{what}\n{}", self.check_expect(&e).await),
+            None => what,
+        };
         let page = self.outline(0, AFTER_ACTION_CHARS).await.unwrap_or_else(|e| format!("(couldn't read the page: {e})"));
         let dialog_open = self.state().await.map(|s| s.dialog.is_some()).unwrap_or(false);
         // A frozen page can't produce a screenshot.
@@ -384,6 +425,81 @@ impl Browser {
             )
             .await?;
         Ok(r["result"]["value"].clone())
+    }
+
+    /// Things the agent should know before acting: a sign-in form (and
+    /// whether a saved login exists), a verification-code field, a CAPTCHA.
+    async fn page_notes(&self, url: &str) -> String {
+        let probe = r#"(() => {
+  const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const pw = Array.from(document.querySelectorAll('input[type=password]')).some(vis);
+  const otp = Array.from(document.querySelectorAll('input[autocomplete="one-time-code" i], input[name*="otp" i], input[id*="otp" i]')).some(vis)
+    || /verification code|security code|enter the code|2-step|two-factor|authenticator/i.test(document.body ? document.body.innerText.slice(0, 5000) : '');
+  const captcha = !!document.querySelector('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="challenges.cloudflare"], .g-recaptcha, .h-captcha, .cf-turnstile')
+    || /verify you are (a )?human|i'm not a robot|are you a robot/i.test(document.body ? document.body.innerText.slice(0, 5000) : '');
+  const cookie = Array.from(document.querySelectorAll('[id*="cookie" i], [class*="cookie" i], [id*="consent" i], [class*="consent" i], [aria-label*="cookie" i]'))
+    .some(e => vis(e) && e.querySelector('button, a[role="button"]') && /accept|reject|agree|allow|necessary/i.test(e.innerText || ''));
+  return JSON.stringify({pw, otp, captcha, cookie});
+})()"#;
+        let v: Value = self
+            .bridge
+            .cdp("Runtime.evaluate", json!({"expression": probe, "returnByValue": true}))
+            .await
+            .ok()
+            .and_then(|r| r["result"]["value"].as_str().and_then(|s| serde_json::from_str(s).ok()))
+            .unwrap_or(Value::Null);
+        let mut notes = String::new();
+        if v["cookie"].as_bool().unwrap_or(false) {
+            notes.push_str("A cookie consent banner is showing. If it's in the way, prefer “Reject” or “Necessary only”; don't accept tracking for the user.\n");
+        }
+        if v["captcha"].as_bool().unwrap_or(false) {
+            notes.push_str("This page shows a CAPTCHA or bot check. Don't try to solve it: use browser_handoff to ask the user.\n");
+        }
+        if v["otp"].as_bool().unwrap_or(false) {
+            notes.push_str("This page asks for a verification code. Use browser_handoff so the user can enter it.\n");
+        }
+        if v["pw"].as_bool().unwrap_or(false) {
+            let host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
+            let saved = crate::vault::for_host(&host);
+            if saved.is_empty() {
+                notes.push_str("This is a sign-in form and there's no saved login for this site: use browser_handoff to let the user sign in.\n");
+            } else {
+                let users: Vec<&str> = saved.iter().map(|l| l.username.as_str()).collect();
+                notes.push_str(&format!(
+                    "This is a sign-in form. Saved login(s) for this site: {}. Use browser_sign_in to fill it.\n",
+                    users.join(", ")
+                ));
+            }
+        }
+        notes
+    }
+
+    /// Waits up to 5 s for `text` to be on the page and says whether it is.
+    async fn check_expect(&self, text: &str) -> String {
+        let expr = format!(
+            "(document.body ? document.body.innerText : '').toLowerCase().includes({})",
+            serde_json::to_string(&text.to_lowercase()).unwrap_or_default()
+        );
+        let start = Instant::now();
+        loop {
+            if self.state().await.map(|s| s.dialog.is_some()).unwrap_or(false) {
+                return format!("Expected “{text}”: can't check while a dialog is open.");
+            }
+            let found = self
+                .bridge
+                .cdp("Runtime.evaluate", json!({"expression": expr, "returnByValue": true}))
+                .await
+                .ok()
+                .and_then(|r| r["result"]["value"].as_bool())
+                .unwrap_or(false);
+            if found {
+                return format!("Expected “{text}”: found on the page.");
+            }
+            if start.elapsed() > Duration::from_secs(5) {
+                return format!("Expected “{text}”: NOT on the page. The action may not have worked; check before going on.");
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 
     /// Backend ids of every sensitive field on the page.
@@ -577,6 +693,8 @@ browser_tool!(Downloads);
 pub struct ReadDownload;
 browser_tool!(Upload);
 browser_tool!(SavePdf);
+browser_tool!(SignIn);
+browser_tool!(Handoff);
 pub struct History(Arc<Browser>, NavAction);
 
 impl Tool for Open {
@@ -701,7 +819,8 @@ impl Tool for Click {
             "properties": {
                 "ref": {"type": "string", "description": "Element ref from browser_read, like e123."},
                 "button": {"type": "string", "enum": ["left", "right", "middle"], "description": "Default left."},
-                "double": {"type": "boolean", "description": "Double-click. Default false."}
+                "double": {"type": "boolean", "description": "Double-click. Default false."},
+                "expect": {"type": "string", "description": "Optional: text that should appear if this worked; it's checked and reported."}
             },
             "required": ["ref"],
             "additionalProperties": false
@@ -720,7 +839,7 @@ impl Tool for Click {
     fn call_with(&self, input: Value, ctx: ToolContext) -> BoxFuture<'static, ToolResult> {
         let b = self.0.clone();
         Box::pin(async move {
-            check_keys(&input, &["ref", "button", "double"])?;
+            check_keys(&input, &["ref", "button", "double", "expect"])?;
             let r = arg_str(&input, "ref")?;
             let button = input["button"].as_str().unwrap_or("left");
             if !["left", "right", "middle"].contains(&button) {
@@ -752,7 +871,9 @@ impl Tool for Click {
             tokio::time::sleep(Duration::from_millis(350)).await;
             let (x, y) = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
             b.click_at(x, y, button, clicks).await?;
-            b.after_action(format!("Clicked [{r}] {}.", el.label()), format!("clicked {}", el.label())).await
+            let expect = input["expect"].as_str().map(str::to_string);
+            b.after_action_expecting(format!("Clicked [{r}] {}.", el.label()), format!("clicked {}", el.label()), expect)
+                .await
         })
     }
 }
@@ -773,7 +894,8 @@ impl Tool for Type {
                 "ref": {"type": "string", "description": "Field ref from browser_read, like e123."},
                 "text": {"type": "string"},
                 "clear": {"type": "boolean", "description": "Replace existing text. Default true."},
-                "submit": {"type": "boolean", "description": "Press Enter after typing. Default false."}
+                "submit": {"type": "boolean", "description": "Press Enter after typing. Default false."},
+                "expect": {"type": "string", "description": "Optional: text that should appear if this worked; it's checked and reported."}
             },
             "required": ["ref", "text"],
             "additionalProperties": false
@@ -791,7 +913,7 @@ impl Tool for Type {
     fn call_with(&self, input: Value, ctx: ToolContext) -> BoxFuture<'static, ToolResult> {
         let b = self.0.clone();
         Box::pin(async move {
-            check_keys(&input, &["ref", "text", "clear", "submit"])?;
+            check_keys(&input, &["ref", "text", "clear", "submit", "expect"])?;
             let r = arg_str(&input, "ref")?;
             let text = input["text"].as_str().ok_or("Invalid input: `text` is required")?.to_string();
             let clear = input["clear"].as_bool().unwrap_or(true);
@@ -831,9 +953,10 @@ impl Tool for Type {
                 b.key(&parse_keys("Enter")?.0, 0).await?;
             }
             let shown: String = text.chars().take(60).collect();
-            b.after_action(
+            b.after_action_expecting(
                 format!("Typed \"{shown}\" into [{r}] {}{}.", el.label(), if submit { " and pressed Enter" } else { "" }),
                 format!("typed into {}", el.label()),
+                input["expect"].as_str().map(str::to_string),
             )
             .await
         })
@@ -853,7 +976,8 @@ impl Tool for Press {
             "type": "object",
             "properties": {
                 "keys": {"type": "string", "description": "Key name or combination, e.g. Enter or Control+a."},
-                "times": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Repeat count. Default 1."}
+                "times": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Repeat count. Default 1."},
+                "expect": {"type": "string", "description": "Optional: text that should appear if this worked; it's checked and reported."}
             },
             "required": ["keys"],
             "additionalProperties": false
@@ -871,7 +995,7 @@ impl Tool for Press {
     fn call_with(&self, input: Value, ctx: ToolContext) -> BoxFuture<'static, ToolResult> {
         let b = self.0.clone();
         Box::pin(async move {
-            check_keys(&input, &["keys", "times"])?;
+            check_keys(&input, &["keys", "times", "expect"])?;
             let combo = arg_str(&input, "keys")?.to_string();
             let times = input["times"].as_u64().unwrap_or(1).clamp(1, 50);
             let (key, mods) = parse_keys(&combo)?;
@@ -885,7 +1009,7 @@ impl Tool for Press {
                 b.key(&key, mods).await?;
             }
             let what = if times > 1 { format!("Pressed {combo} {times} times.") } else { format!("Pressed {combo}.") };
-            b.after_action(what, format!("pressed {combo}")).await
+            b.after_action_expecting(what, format!("pressed {combo}"), input["expect"].as_str().map(str::to_string)).await
         })
     }
 }
@@ -1675,6 +1799,157 @@ impl Tool for SavePdf {
                 return Err("Chromium couldn't save this page as a PDF.".into());
             }
             Ok(ToolOutput::text(format!("Saved the page as {}.", path.display()), "saved PDF"))
+        })
+    }
+}
+
+/// Finds the visible username (`kind` = "user") or password field.
+const LOGIN_FIELD_JS: &str = r#"(kind) => {
+  const vis = e => { const r = e.getBoundingClientRect(); const s = getComputedStyle(e); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && !e.disabled; };
+  const pw = Array.from(document.querySelectorAll('input[type=password]')).find(vis) || null;
+  if (kind === 'pw') return pw;
+  const sel = 'input[autocomplete~="username" i], input[autocomplete~="email" i], input[type=email], input[name*="user" i], input[name*="login" i], input[name*="email" i], input[id*="user" i], input[id*="email" i], input[id*="login" i]';
+  const ok = e => vis(e) && !['password', 'hidden', 'submit', 'checkbox', 'radio'].includes((e.type || '').toLowerCase());
+  let user = Array.from(document.querySelectorAll(sel)).find(ok) || null;
+  if (!user && pw && pw.form) user = Array.from(pw.form.querySelectorAll('input[type=text], input:not([type])')).find(ok) || null;
+  return user;
+}"#;
+
+impl Browser {
+    /// Backend id of the visible username or password field, if any.
+    async fn login_field(&self, kind: &str) -> Option<i64> {
+        let expr = format!("({LOGIN_FIELD_JS})({})", serde_json::to_string(kind).ok()?);
+        let r = self.bridge.cdp("Runtime.evaluate", json!({"expression": expr})).await.ok()?;
+        let object_id = r["result"]["objectId"].as_str()?.to_string();
+        let d = self.bridge.cdp("DOM.describeNode", json!({"objectId": object_id})).await.ok()?;
+        d["node"]["backendNodeId"].as_i64()
+    }
+
+    /// Focuses a field, selects what's in it, and types `text` over it.
+    /// Used for vault values: the text goes to Chromium, never to a model.
+    async fn fill(&self, backend_id: i64, text: &str) -> Result<(), String> {
+        self.bridge.cdp("DOM.focus", json!({"backendNodeId": backend_id})).await?;
+        let el = Element { backend_id, role: String::new(), name: String::new() };
+        let _ = self
+            .call_on(&el, "function(){ if (typeof this.select === 'function') this.select(); }")
+            .await;
+        self.bridge.cdp("Input.insertText", json!({"text": text})).await.map(|_| ())
+    }
+}
+
+impl Tool for SignIn {
+    fn name(&self) -> &'static str {
+        "browser_sign_in"
+    }
+    fn description(&self) -> &'static str {
+        "Fill the sign-in form on the current page with a login the user saved in the app. You never see the \
+         password; the app types it. Only works on the site the login was saved for. Pass username when the \
+         site has more than one saved login. Then click the page's sign-in button (that asks the user first). \
+         For two-step sign-ins, call it again on the password page."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {"username": {"type": "string", "description": "Which saved login, if there are several."}},
+            "additionalProperties": false
+        })
+    }
+    fn effect(&self) -> Effect {
+        Effect::Stage
+    }
+    fn describe_call(&self, _: &Value) -> String {
+        "Fill a saved login".into()
+    }
+    fn call(&self, input: Value) -> BoxFuture<'static, ToolResult> {
+        let b = self.0.clone();
+        Box::pin(async move {
+            check_keys(&input, &["username"])?;
+            let st = b.state().await?;
+            let host = url::Url::parse(&st.url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
+            let saved = crate::vault::for_host(&host);
+            let login = match (input["username"].as_str(), saved.len()) {
+                (_, 0) => {
+                    return Err(format!(
+                        "There's no saved login for {}. Ask the user to sign in (browser_handoff), or to save a login in the Focus tab.",
+                        site(&st.url)
+                    ))
+                }
+                (Some(u), _) => saved
+                    .iter()
+                    .find(|l| l.username.eq_ignore_ascii_case(u))
+                    .cloned()
+                    .ok_or_else(|| format!("No saved login “{u}” for this site."))?,
+                (None, 1) => saved[0].clone(),
+                (None, _) => {
+                    let names: Vec<&str> = saved.iter().map(|l| l.username.as_str()).collect();
+                    return Err(format!("Several saved logins for this site: {}. Say which username.", names.join(", ")));
+                }
+            };
+            let user_field = b.login_field("user").await;
+            let pw_field = b.login_field("pw").await;
+            if user_field.is_none() && pw_field.is_none() {
+                return Err("There's no sign-in form on this page.".into());
+            }
+            let mut filled = Vec::new();
+            if let Some(id) = user_field {
+                b.fill(id, &login.username).await?;
+                filled.push(format!("username ({})", login.username));
+            }
+            if let Some(id) = pw_field {
+                let login2 = login.clone();
+                let password = tokio::task::spawn_blocking(move || crate::vault::password(&login2))
+                    .await
+                    .map_err(|e| e.to_string())??;
+                b.fill(id, &password).await?;
+                filled.push("password".to_string());
+            }
+            let next = if pw_field.is_none() {
+                " There's no password field yet: continue to the next step, then call browser_sign_in again."
+            } else {
+                " Now click the sign-in button."
+            };
+            b.after_action(
+                format!("Filled the saved {} for {}.{next}", filled.join(" and "), login.site),
+                format!("filled saved login for {}", login.site),
+            )
+            .await
+        })
+    }
+}
+
+impl Tool for Handoff {
+    fn name(&self) -> &'static str {
+        "browser_handoff"
+    }
+    fn description(&self) -> &'static str {
+        "Hand the page to the user for something only they should do: sign in without a saved login, enter a \
+         verification or two-factor code, solve a CAPTCHA, or make a choice. Shows them your message and waits \
+         until they click Done (up to 15 minutes), then returns the page as it is."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {"message": {"type": "string", "description": "What you need them to do, in one sentence."}},
+            "required": ["message"],
+            "additionalProperties": false
+        })
+    }
+    fn effect(&self) -> Effect {
+        Effect::Read
+    }
+    fn describe_call(&self, input: &Value) -> String {
+        format!("Ask the user: {}", input["message"].as_str().unwrap_or(""))
+    }
+    fn call(&self, input: Value) -> BoxFuture<'static, ToolResult> {
+        let b = self.0.clone();
+        Box::pin(async move {
+            check_keys(&input, &["message"])?;
+            let message = arg_str(&input, "message")?.to_string();
+            let done = b.bridge.handoff(message.clone(), Duration::from_secs(15 * 60)).await?;
+            if !done {
+                return Err(format!("The user chose not to do this now: {message}"));
+            }
+            b.after_action("The user says they're done.".into(), "user finished handoff".into()).await
         })
     }
 }

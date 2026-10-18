@@ -81,6 +81,14 @@ requests that don't come from OpenCode's own app.
 - **API key agent only**: set `ANTHROPIC_API_KEY`, or paste a key into the app
   when it asks (saved to the GNOME keyring).
 
+Run the browser-agent eval suite (real agent turns on hidden, isolated
+instances against the local test pages in `crates/evals/fixtures`):
+
+```
+cargo build -p shell
+python3 crates/evals/run_evals.py          # or name cases: ... tabs widgets
+```
+
 Smoke-test an agent without the UI (clock tool plus a fake send that waits for
 approval and is denied):
 
