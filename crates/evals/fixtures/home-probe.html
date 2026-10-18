@@ -1,0 +1,25 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Home probe</title></head><body>
+<h1>Home probe</h1>
+<p>Tries every way a web page could reach the app's home page. None should work.</p>
+<a id="link" href="unibrow://home/">home</a>
+<form id="post" method="post" action="unibrow://home/api/cmd"><input name="cmd" value="set_focus_only"></form>
+<pre id="out"></pre>
+<script>
+  const out = document.getElementById('out');
+  const note = (k, v) => { out.textContent += k + ':' + v + '\n'; };
+  fetch('unibrow://home/').then(r => r.text()).then(t => note('fetch', 'READ ' + t.length)).catch(() => note('fetch', 'blocked'));
+  const f = document.createElement('iframe');
+  f.src = 'unibrow://home/';
+  document.body.appendChild(f);
+  setTimeout(() => {
+    let read = 'blocked';
+    try { read = f.contentDocument && f.contentDocument.title ? 'READ ' + f.contentDocument.title : 'blocked'; } catch (e) {}
+    note('iframe', read);
+  }, 1500);
+  setTimeout(() => { const w = window.open('unibrow://home/'); note('open', w ? 'window' : 'blocked'); }, 600);
+  setTimeout(() => document.getElementById('link').click(), 2000);
+  setTimeout(() => document.getElementById('post').submit(), 3500);
+  setTimeout(() => { location.href = 'unibrow://home/'; }, 5000);
+  setTimeout(() => note('still', 'here'), 7000);
+</script>
+</body></html>

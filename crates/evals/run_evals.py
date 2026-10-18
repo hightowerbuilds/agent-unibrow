@@ -39,6 +39,7 @@ many seconds in; `log_contains` checks the instance's stderr log (and
 is the fixture server under 127.0.0.1 (another site), `{tls}` the same
 fixtures over HTTPS with a self-signed certificate, and `/auth/<page>`
 answers 401 (HTTP Basic, user `ada`, password `lovelace`) until signed in.
+A `page` of `home` starts on the app's home page, as a real launch does.
 A case without a `task` runs no agent turn (no quota used): the instance
 runs its `UNIBROW_TEST_PANE` steps for `secs` seconds and only the log is
 checked (`log_contains`, `log_not_contains`); the media cases work this way.
@@ -215,6 +216,9 @@ def run_case(case, port, workdir: Path, site: Path, tls_port=None):
         UNIBROW_START_URL=fill(case["page"]) if "://" in fill(case["page"]) else f"http://localhost:{port}/{case['page']}",
         UNIBROW_AUTOAPPROVE=case.get("approve", "deny"),
     )
+    if case["page"] == "home":
+        # The app's own start page, as on a real launch.
+        env.pop("UNIBROW_START_URL")
     if case.get("task"):
         env["UNIBROW_AUTOSEND"] = fill(case["task"])
     env.update({k: fill(str(v)) for k, v in case.get("env", {}).items()})

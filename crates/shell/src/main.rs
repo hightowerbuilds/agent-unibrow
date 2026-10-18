@@ -7,6 +7,7 @@
 mod browser_pane;
 mod chat_tools;
 mod explained;
+mod home;
 mod jev_worker;
 mod safety;
 mod site_icons;
@@ -2783,8 +2784,13 @@ fn main() -> std::process::ExitCode {
         }
     }
     let cef = rail_browser::initialize();
-    if let Err(e) = &cef {
-        eprintln!("agent-unibrow: browser unavailable: {e}");
+    match &cef {
+        Err(e) => eprintln!("agent-unibrow: browser unavailable: {e}"),
+        Ok(()) => {
+            if let Err(e) = rail_browser::app_pages::serve(Arc::new(home::Home)) {
+                eprintln!("agent-unibrow: {e}");
+            }
+        }
     }
     Application::new().run(move |cx: &mut App| {
         text_input::bind_keys(cx);

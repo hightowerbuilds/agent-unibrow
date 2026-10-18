@@ -26,7 +26,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-const HOME: &str = "https://duckduckgo.com/";
+/// The app's home page (homepage roadmap H1), on launch and in new tabs.
+const HOME: &str = rail_browser::app_pages::HOME_URL;
 /// Reader views are `data:` pages starting with this.
 const READER_PREFIX: &str = "data:text/html;charset=utf-8;base64,";
 /// How long the agent's highlight box stays on screen.
@@ -108,7 +109,12 @@ struct Chrome {
 
 impl Chrome {
     /// The address to show: the article's own for a reader view.
+    /// What the address bar shows: the article's address in reader view,
+    /// and nothing on the home page (like a new tab in Chrome).
     fn shown_url(&self) -> String {
+        if rail_browser::app_pages::route(&self.url).is_some_and(|(host, _)| host == "home") {
+            return String::new();
+        }
         self.reader_of.clone().unwrap_or_else(|| self.url.clone())
     }
 }
@@ -1363,7 +1369,8 @@ impl BrowserPane {
         let r = match op {
             TabOp::List => Ok(()),
             TabOp::New { url, background } => {
-                let url = url.map(|u| normalize_address(&u)).unwrap_or_else(|| HOME.to_string());
+                // The agent's own blank tab: it has nothing to do on home.
+                let url = url.map(|u| normalize_address(&u)).unwrap_or_else(|| "about:blank".to_string());
                 let (w, h, scale) = self.size.ok_or("The browser isn't laid out yet.")?;
                 let view = WebView::create(&url, w, h, scale)?;
                 // A background tab is the agent's own; a shown one is
@@ -2013,8 +2020,10 @@ impl BrowserPane {
             .child(div().flex_1().min_w(px(0.)).child(self.address.clone()))
             .children(self.zoom_badge(cx))
             .child(self.reader_button(cx))
-            .child(self.bookmark_button(cx))
-            .child(self.focus_button(cx))
+            // Nothing to bookmark or focus on the app's own pages.
+            .when(!rail_browser::app_pages::is_app_page(&self.chrome.url), |d| {
+                d.child(self.bookmark_button(cx)).child(self.focus_button(cx))
+            })
             .children(self.downloads_button(cx))
     }
 
@@ -2911,7 +2920,8 @@ impl BrowserPane {
     /// do it, with the outcome logged to stderr. Steps: `zoom+`, `zoom-`,
     /// `zoom0`, `zoom:<percent>`, `click:X:Y`, `rclick:X:Y` (page pixels), `type:<text>`, `userclick:X:Y`
     /// (a click that counts as the user taking over), `menu:<label>`,
-    /// `reader`, `mute`, `tab:<n>`, `wait`, `log`, `histmenu:back|forward` (the
+    /// `reader`, `mute`, `tab:<n>`, `wait`, `log`, `newtab` (Ctrl+T), `open:<address>`
+    /// (typed in the address bar), `visits` (the history's URLs), `histmenu:back|forward` (the
     /// Back/Forward history list), `histpick:<n>` (its nth entry, nearest
     /// first), `shot:<name>`, `agentshot:<name>` (a frame of the agent's tab
     /// while it's in the background).
@@ -2999,6 +3009,22 @@ impl BrowserPane {
                 if let Some(v) = self.view() {
                     v.insert_text(arg);
                 }
+            }
+            "newtab" => {
+                // What Ctrl+T does, without the window focus.
+                if self.open_tab(HOME, true, cx).is_ok() {
+                    self.address.update(cx, |a, cx| a.set_text("", cx));
+                }
+                eprintln!("pane test: new tab, address bar {:?}", self.address.read(cx).text());
+            }
+            "open" => {
+                // What typing an address and Enter does.
+                self.navigate(arg, cx);
+            }
+            "visits" => {
+                let q = browsing::HistoryQuery { text: None, site: None, since_days: None, limit: 50 };
+                let urls: Vec<String> = self.store.history(&q).into_iter().map(|v| v.url).collect();
+                eprintln!("pane test: visits={} {urls:?}", urls.len());
             }
             // Waits for a code card, then presses Fill.
             "fillcode" => {

@@ -11,18 +11,18 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| First page on launch | todo | `HOME = "https://duckduckgo.com/"` in `crates/shell/src/browser_pane.rs`; `UNIBROW_START_URL` overrides it (evals use this) |
-| New tab (Ctrl+T, + button) | todo | `BrowserPane::new_tab` opens `HOME` and focuses an empty address bar |
-| Last tab closed | todo | `close_tab` reopens `HOME` |
-| Agent's new tab with no URL | todo | `TabOp::New` in `browser_pane.rs` falls back to `HOME` too |
-| App-served pages | todo | Only reader mode, as a `data:` URL (`rail-browser/src/reader.rs`) |
+| First page on launch | ✅ | `unibrow://home/` (`HOME` in `crates/shell/src/browser_pane.rs`); `UNIBROW_START_URL` still overrides it (evals use this) |
+| New tab (Ctrl+T, + button) | ✅ | Opens home with an empty address bar |
+| Last tab closed | ✅ | Reopens home |
+| Agent's new tab with no URL | ✅ | `about:blank`: the agent has nothing to do on home |
+| App-served pages | ✅ H1 | `unibrow://` scheme (`rail-browser/src/app_pages.rs`), home page in `crates/shell/home/` |
 | Places to tinker | ✅ in the sidebar | History (History/Bookmarks/Trace), Focus (sites, Learn with Jev, per-site View, watches, logins, safety), Explained (Alt+5), Model menu |
 
 ### Progress by phase
 
 | Phase | Completed | Partial | Todo |
 | --- | --- | --- | --- |
-| H1. A local home page | | | H1.1–H1.5 |
+| H1. A local home page | H1.2–H1.5 | H1.1 | |
 | H2. Live data | | | H2.1–H2.4 |
 | H3. Acting from the page | | | H3.1–H3.5 |
 | H4. The tinkering hub | | | H4.1–H4.4 |
@@ -97,16 +97,24 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
 
 ## Phase H1: A local home page (opens on launch and in new tabs)
 
-### H1.1 The `unibrow://` scheme — todo
-- Register the scheme and its handler factory as described above. Static
-  assets are served with the right MIME types, plus a 404 for anything
-  else. Paths with `..` or `%2e` are refused.
-- Home tabs are created with a background color from `theme::BG`, so they
-  don't flash white (`settings.background_color` is `0xFFFFFFFF` today).
-- Unit tests in `app_pages.rs`: path routing, traversal refused, the CSP
-  header on every response.
+### H1.1 The `unibrow://` scheme — ◐ partial
+- Done: `rail_browser::app_pages` registers the scheme (standard, secure,
+  display-isolated, fetch-enabled; not CORS-enabled) in every process
+  through `App::on_register_custom_schemes`, and `app_pages::serve` adds the
+  handler factory after `initialize`. The shell's `home::Home` implements
+  `AppPages` (`get(host, path) -> Page`) with the files built in by
+  `include_str!`. Every response carries the CSP above plus `nosniff` and
+  `no-store`; unknown paths are a 404; paths with `..`, `%2e` or
+  backslashes are refused.
+- Unit tests: `app_pages` (routing, traversal, the CSP, which navigations
+  may open the app's pages) and `home` (files served, nothing loaded from
+  the web, no scripts).
+- Left: a dark background for home tabs. A browser's background color is
+  fixed when it's created, and the tab goes on to websites that expect
+  white behind them, so this needs a per-navigation approach. The page
+  loads from memory, so the white flash is very short.
 
-### H1.2 Home on launch, new tab and last-tab-closed — todo
+### H1.2 Home on launch, new tab and last-tab-closed — ✅ **COMPLETED**
 - `HOME` in `browser_pane.rs` becomes `unibrow://home/`.
   `UNIBROW_START_URL` still wins, so every existing eval keeps its start
   page.
@@ -114,49 +122,52 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
   `about:blank` instead. The agent has nothing to do on the home page.
 - `normalize_address` (`rail-browser/src/lib.rs`) already passes
   `unibrow://…` through unchanged. Typing `home` alone stays a search.
-- Eval: `home-launch` (no task, `page: "unibrow://home/"`, steps
-  `wait;log;js:document.title` → `log_contains` `url=unibrow://home/` and
-  `js => Home`).
-- Eval: `home-newtab` needs a new `newtab` pane step in
-  `run_test_step` (the Ctrl+T path) → the new tab's URL is home.
-- Harness: let a case leave `UNIBROW_START_URL` unset (e.g.
-  `"page": "home"`), so the real launch path gets tested.
+- Eval: `home-launch` (`"page": "home"` leaves `UNIBROW_START_URL` unset,
+  so it's the real launch path; title "Home", the dark background, the
+  search box, and no DuckDuckGo).
+- Eval: `home-newtab` (the new `newtab` pane step, the Ctrl+T path: a
+  second tab on home with an empty address bar).
 
-### H1.3 Browser chrome on internal pages — todo
-- On home, the address bar is empty and focused (`new_tab` already does
-  this), the tab is titled "Home" with the app icon (`/favicon.png`), and
-  the ◎ Focus and bookmark toolbar buttons are hidden.
+### H1.3 Browser chrome on internal pages — ✅ **COMPLETED**
+- On home, the address bar is empty (`Chrome::shown_url`), the tab is
+  titled "Home" with the app icon (`/favicon.svg`), and the ◎ Focus and
+  bookmark toolbar buttons are hidden on every `unibrow://` page.
 - Not recorded in history: `browsing::site_of` already returns `None` for
   anything other than http(s). Zoom is keyed by scheme (`zoom_key`).
-- Eval: `home-not-history` (open home, then a fixture page; the History
-  count is 1 and `log_not_contains` `unibrow://`).
+- Eval: `home-not-history` (home, then a fixture page typed in the
+  address bar with the new `open:` step, then a new tab; the new `visits`
+  step lists exactly that one page).
 
-### H1.4 Lockdown — todo
-- `on_before_browse` and the popup handler in `handlers.rs` refuse
-  web-initiated navigations and new tabs to `unibrow://`.
-- Browser tools (`rail-browser/src/tools.rs`, next to
-  `scope::current_site`) refuse click, type, press, drag, fill, upload and
-  select on a `unibrow://` page: "This is the app's home page; open a site
-  first." `browser_read` and `browser_screenshot` return that same short
-  note instead of the page, so the agent uses `history_search` and the
-  focus tools rather than scraping the home page.
-- Eval: `home-isolation`. A fixture `home-probe.html` on `{base}` tries
-  `fetch('unibrow://home/api/state')`, an iframe, `window.open`, a link
-  click, and a form POST to `/api/cmd`. A `js:` step logs each outcome;
-  every one must be blocked, and no tab ends up on home.
-- Eval: `home-agent-refuses` (task on `page: "unibrow://home/"`: "type
-  hello into the search box"; `trace_contains` the refusal and
-  `reply_any` mentions opening a site).
+### H1.4 Lockdown — ✅ **COMPLETED**
+- `on_before_browse` (`handlers.rs`) lets a main frame go to `unibrow://`
+  only on the app's own loads (address bar, new tab: explicit), reloads,
+  Back/Forward, or from an app page; never a subframe
+  (`app_pages::may_open`). The popup handler refuses new tabs to
+  `unibrow://` unless an app page opens them.
+- Every browser tool is wrapped (`NotOnAppPages` in
+  `rail-browser/src/tools.rs`): no tool takes a `unibrow://` address, and
+  tools that act on or read the open page (everything but open, tabs,
+  back/forward/reload, wait, history list, downloads, compare, playbooks,
+  and extract/gather given a URL) refuse there: "This tab is the app's
+  home page, which is the user's, not a website. Open a site first…"
+- Eval: `home-isolation`. A fixture `home-probe.html` tries a `fetch`, an
+  iframe, `window.open`, a link click, a form POST to `/api/cmd` and
+  `location.href`; all are blocked (Chromium's display isolation stops
+  them before `on_before_browse` is reached) and the page stays put.
+- Eval: `home-agent-refuses` ("type hello into the search box" on home:
+  the tools refuse and the agent tells the user to type it or open a
+  site).
 
-### H1.5 First content — todo
-- A static page in the app's palette:
-  - A search box: a plain `<form>` to DuckDuckGo, so no bridge is needed
-    yet.
-  - Four starter requests as text.
-  - The main shortcuts (Ctrl+L, Ctrl+T, Alt+1–5, Esc to stop).
-  - A line pointing to Explained (Alt+5).
-- Eval: `home-search` (no task; steps `clicksel:#q;type:bass nut` plus
-  Enter; `log` shows the tab on `duckduckgo.com/?q=bass+nut`).
+### H1.5 First content — ✅ **COMPLETED**
+- A static page in the app's palette, with no scripts (`crates/shell/home/`):
+  - A search box: a plain `<form>` to DuckDuckGo (the CSP's only outside
+    address, as `form-action`).
+  - Four starter requests to type in the chat.
+  - "Make it yours" cards: Model, Focus sites and Jev, History and Trace,
+    Explained.
+  - The main shortcuts (Ctrl+L, Ctrl+T, Ctrl+W, Ctrl+B, Alt+1–5, Esc).
+- Eval: `home-search` (fills the box and clicks Search; the tab lands on
+  `duckduckgo.com/?q=bass+nut`).
 
 ---
 

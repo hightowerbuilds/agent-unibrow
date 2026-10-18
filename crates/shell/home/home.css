@@ -1,0 +1,41 @@
+:root {
+  --bg: #111a21;
+  --pane: #18232b;
+  --raised: #1f2c36;
+  --rule: #2b3942;
+  --fg: #e6ecf0;
+  --muted: #9aa9b6;
+  --accent: #5fc8c0;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--fg); }
+body { font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 760px; margin: 0 auto; padding: 56px 16px 64px; }
+header { text-align: center; margin-bottom: 28px; }
+.mark { width: 48px; height: 48px; }
+h1 { font-size: 26px; font-weight: 600; margin: 8px 0 2px; letter-spacing: 0.01em; }
+.tagline { color: var(--muted); margin: 0; }
+h2 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 10px; }
+section { margin-top: 34px; }
+#search { display: flex; gap: 8px; }
+#search input {
+  flex: 1; min-width: 0; font: inherit; color: var(--fg); background: var(--pane);
+  border: 1px solid var(--rule); border-radius: 10px; padding: 11px 14px; outline: none;
+}
+#search input:focus { border-color: var(--accent); }
+#search button {
+  font: inherit; color: var(--bg); background: var(--accent); border: 0; border-radius: 10px;
+  padding: 0 18px; cursor: pointer; font-weight: 600;
+}
+.hint { color: var(--muted); margin: 0 0 8px; }
+.starters { list-style: none; padding: 0; margin: 0; display: grid; gap: 6px; }
+.starters li { background: var(--pane); border: 1px solid var(--rule); border-radius: 8px; padding: 8px 12px; }
+.cards { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+.cards li { background: var(--raised); border-radius: 10px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+.cards b { color: var(--accent); font-weight: 600; }
+.cards span { color: var(--muted); font-size: 14px; }
+.shortcuts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 0; }
+.shortcuts dt { font-family: ui-monospace, monospace; color: var(--accent); }
+.shortcuts dd { margin: 0; color: var(--muted); }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }

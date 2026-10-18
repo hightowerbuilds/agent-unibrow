@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Home</title>
+  <link rel="icon" href="/favicon.svg">
+  <link rel="stylesheet" href="/home.css">
+</head>
+<body>
+  <main>
+    <header>
+      <img class="mark" src="/favicon.svg" alt="">
+      <h1>agent-unibrow</h1>
+      <p class="tagline">A browser you can ask to do things.</p>
+    </header>
+
+    <form id="search" action="https://duckduckgo.com/" method="get" role="search">
+      <label for="q" class="visually-hidden">Search the web</label>
+      <input id="q" name="q" type="search" placeholder="Search the web" autocomplete="off">
+      <button type="submit">Search</button>
+    </form>
+
+    <section id="ask">
+      <h2>Ask the agent</h2>
+      <p class="hint">Type in the chat on the right (Alt+1). Some things to try:</p>
+      <ul class="starters">
+        <li>“Find a bone jazz bass nut under $15 and show me the best rated one.”</li>
+        <li>“Watch this page and tell me when the price drops.”</li>
+        <li>“Summarize the article I have open in three bullets.”</li>
+        <li>“What did I look at on sweetwater last week?”</li>
+      </ul>
+    </section>
+
+    <section id="tinker">
+      <h2>Make it yours</h2>
+      <ul class="cards">
+        <li><b>Model</b><span>Pick the agent and model with the Model button at the bottom of the sidebar.</span></li>
+        <li><b>Focus sites</b><span>◎ Focus in the toolbar marks a site. Focus (Alt+3) lists them, and Learn with Jev answers questions about them without Claude.</span></li>
+        <li><b>History and Trace</b><span>Alt+2 shows what you visited, your bookmarks, and every step the agent took.</span></li>
+        <li><b>Explained</b><span>Alt+5 is the guide to everything in the app.</span></li>
+      </ul>
+    </section>
+
+    <section id="keys">
+      <h2>Shortcuts</h2>
+      <dl class="shortcuts">
+        <dt>Ctrl+L</dt><dd>Address bar</dd>
+        <dt>Ctrl+T</dt><dd>New tab</dd>
+        <dt>Ctrl+W</dt><dd>Close tab</dd>
+        <dt>Ctrl+B</dt><dd>Show or hide the sidebar</dd>
+        <dt>Alt+1–5</dt><dd>Chat, History, Focus, Trace, Explained</dd>
+        <dt>Esc</dt><dd>Stop the agent</dd>
+      </dl>
+    </section>
+  </main>
+</body>
+</html>

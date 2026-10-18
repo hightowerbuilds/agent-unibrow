@@ -10,6 +10,7 @@
 //! every [`pump`] call happen on the main thread (the GPUI thread), so all
 //! CEF callbacks arrive there too and the view state needs no locking.
 
+pub mod app_pages;
 pub mod bridge;
 pub mod jev;
 mod handlers;

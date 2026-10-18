@@ -196,9 +196,93 @@ pub fn tools(
         Arc::new(codes::EmailCode(b.clone(), codes)),
         rec(Arc::new(History(b.clone(), NavAction::Back))),
         Arc::new(History(b.clone(), NavAction::Forward)),
-        Arc::new(History(b, NavAction::Reload)),
+        Arc::new(History(b.clone(), NavAction::Reload)),
     ]);
-    all
+    all.into_iter().map(|t| NotOnAppPages::wrap(t, b.clone())).collect()
+}
+
+// ------------------------------------------------ the app's own pages (H1.4)
+
+/// Keeps the agent off the app's own pages (`unibrow://home/`): they're
+/// the user's controls, and a page can't tell the agent's clicks from the
+/// user's, so the check is here. Tools that act on the page that's open
+/// refuse there, and no tool opens one.
+struct NotOnAppPages {
+    inner: Arc<dyn Tool>,
+    b: Arc<Browser>,
+}
+
+const ON_APP_PAGE: &str = "This tab is the app's home page, which is the user's, not a website. Open a site first \
+                           (browser_open), or use history_search and the focus tools to see where the user has been.";
+
+impl NotOnAppPages {
+    fn wrap(inner: Arc<dyn Tool>, b: Arc<Browser>) -> Arc<dyn Tool> {
+        Arc::new(Self { inner, b })
+    }
+}
+
+/// Whether `tool` called with `input` acts on (or reads) the page that's
+/// open, rather than opening another one or working elsewhere.
+fn acts_on_open_page(tool: &str, input: &Value) -> bool {
+    match tool {
+        "browser_open" | "browser_tabs" | "browser_back" | "browser_forward" | "browser_reload" | "browser_wait"
+        | "browser_history_list" | "browser_downloads" | "browser_read_download" | "browser_compare" | "playbook_run"
+        | "playbook_save" => false,
+        "browser_extract" | "browser_gather" => input["url"].as_str().is_none_or(|u| u.trim().is_empty()),
+        _ => true,
+    }
+}
+
+/// Whether `input` names one of the app's pages as an address.
+fn names_app_page(input: &Value) -> bool {
+    match input {
+        Value::String(s) => crate::app_pages::is_app_page(s.trim()),
+        Value::Array(a) => a.iter().any(names_app_page),
+        Value::Object(o) => o.values().any(names_app_page),
+        _ => false,
+    }
+}
+
+impl Tool for NotOnAppPages {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn description(&self) -> &'static str {
+        self.inner.description()
+    }
+    fn input_schema(&self) -> Value {
+        self.inner.input_schema()
+    }
+    fn effect(&self) -> Effect {
+        self.inner.effect()
+    }
+    fn describe_call(&self, input: &Value) -> String {
+        self.inner.describe_call(input)
+    }
+    fn counterparties(&self, input: &Value) -> Vec<String> {
+        self.inner.counterparties(input)
+    }
+    fn site_acted_on(&self, input: &Value) -> BoxFuture<'static, Option<String>> {
+        self.inner.site_acted_on(input)
+    }
+    fn call(&self, input: Value) -> BoxFuture<'static, ToolResult> {
+        self.inner.call(input)
+    }
+    fn call_with(&self, input: Value, ctx: ToolContext) -> BoxFuture<'static, ToolResult> {
+        let (inner, b) = (self.inner.clone(), self.b.clone());
+        Box::pin(async move {
+            if names_app_page(&input) {
+                return Err("The app's own pages (unibrow://) are the user's; the agent doesn't open them.".into());
+            }
+            if acts_on_open_page(inner.name(), &input) {
+                let url = b.state().await.map(|s| s.url).unwrap_or_default();
+                if crate::app_pages::is_app_page(&url) {
+                    return Err(ON_APP_PAGE.into());
+                }
+            }
+            inner.call_with(input, ctx).await
+        })
+    }
 }
 
 // ------------------------------------------------------------- helpers
@@ -2177,6 +2261,20 @@ pub fn decode_image(img: &ToolImage) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn app_pages_are_off_limits() {
+        assert!(names_app_page(&json!({"url": "unibrow://home/"})));
+        assert!(names_app_page(&json!({"urls": ["https://a.com", " UNIBROW://home"]})));
+        assert!(!names_app_page(&json!({"url": "https://unibrow.example/"})));
+        assert!(acts_on_open_page("browser_click", &json!({"ref": "e1"})));
+        assert!(acts_on_open_page("browser_read", &json!({})));
+        assert!(acts_on_open_page("browser_extract", &json!({"what": "links"})));
+        assert!(!acts_on_open_page("browser_extract", &json!({"url": "https://a.com"})));
+        assert!(!acts_on_open_page("browser_open", &json!({"url": "https://a.com"})));
+        assert!(!acts_on_open_page("browser_back", &json!({})));
+    }
+
     use super::*;
 
     #[test]

@@ -1177,5 +1177,110 @@
       ],
       "no_tool_calls": true
     }
+  },
+  {
+    "name": "home-launch",
+    "page": "home",
+    "secs": 14,
+    "env": {
+      "UNIBROW_TEST_PANE": "wait;wait;log;js:document.title;js:getComputedStyle(document.body).backgroundColor;js:document.querySelector('#q').placeholder"
+    },
+    "expect": {
+      "log_contains": [
+        "url=unibrow://home/",
+        "title=\"Home\"",
+        "js => Home",
+        "js => rgb(17, 26, 33)",
+        "js => Search the web"
+      ],
+      "log_not_contains": [
+        "duckduckgo.com"
+      ]
+    }
+  },
+  {
+    "name": "home-newtab",
+    "page": "hist-a.html",
+    "secs": 14,
+    "env": {
+      "UNIBROW_TEST_PANE": "wait;newtab;wait;wait;log"
+    },
+    "expect": {
+      "log_contains": [
+        "new tab, address bar \"\"",
+        "tab 1 id=",
+        "url=unibrow://home/"
+      ]
+    }
+  },
+  {
+    "name": "home-not-history",
+    "page": "home",
+    "secs": 16,
+    "env": {
+      "UNIBROW_TEST_PANE": "wait;open:{base}/hist-a.html;wait;wait;newtab;wait;wait;visits;log"
+    },
+    "expect": {
+      "log_contains": [
+        "visits=1 ",
+        "hist-a.html",
+        "tab 1 id=",
+        "url=unibrow://home/"
+      ],
+      "log_not_contains": [
+        "visits=0",
+        "\"unibrow://"
+      ]
+    }
+  },
+  {
+    "name": "home-isolation",
+    "page": "home-probe.html",
+    "secs": 20,
+    "env": {
+      "UNIBROW_TEST_PANE": "wait;wait;wait;wait;wait;wait;wait;wait;js:document.getElementById('out').textContent;js:location.href;log"
+    },
+    "expect": {
+      "log_contains": [
+        "fetch:blocked",
+        "iframe:blocked",
+        "still:here",
+        "home-probe.html"
+      ],
+      "log_not_contains": [
+        "url=unibrow://home/",
+        "READ "
+      ]
+    }
+  },
+  {
+    "name": "home-search",
+    "page": "home",
+    "secs": 16,
+    "env": {
+      "UNIBROW_TEST_PANE": "wait;js:document.getElementById('q').value='bass nut';clicksel:#search button;wait;wait;wait;log"
+    },
+    "expect": {
+      "log_contains": [
+        "duckduckgo.com/?q=bass+nut"
+      ]
+    }
+  },
+  {
+    "name": "home-agent-refuses",
+    "page": "home",
+    "approve": "deny",
+    "task": "Type hello into the search box on the page that's open.",
+    "expect": {
+      "trace_contains": [
+        "which is the user's, not a website"
+      ],
+      "reply_any": [
+        [
+          "home page",
+          "home"
+        ]
+      ]
+    }
   }
 ]

@@ -21,6 +21,12 @@ wrap_app! {
     }
 
     impl App {
+        fn on_register_custom_schemes(&self, registrar: Option<&mut SchemeRegistrar>) {
+            if let Some(r) = registrar {
+                crate::app_pages::register_scheme(r);
+            }
+        }
+
         fn on_before_command_line_processing(
             &self,
             process_type: Option<&CefStringUtf16>,
@@ -477,6 +483,29 @@ wrap_request_handler! {
     }
 
     impl RequestHandler {
+        /// Web pages can't navigate to the app's own pages (homepage H1.4);
+        /// see [`crate::app_pages::may_open`].
+        fn on_before_browse(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+            _user_gesture: ::std::os::raw::c_int,
+            _is_redirect: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            let Some(request) = request else { return 0 };
+            let url = CefString::from(&request.url()).to_string();
+            if !crate::app_pages::is_app_page(&url) {
+                return 0;
+            }
+            let (from, main) = frame.map(|f| (CefString::from(&f.url()).to_string(), f.is_main() == 1)).unwrap_or_default();
+            if crate::app_pages::may_open(&from, main, request.transition_type().get_raw()) {
+                return 0;
+            }
+            eprintln!("agent-unibrow: refused a page's navigation from {from:?} to {url}");
+            1
+        }
+
         /// The page's renderer died. The view keeps its last frame; the UI
         /// covers it with "This page crashed" and the agent is told.
         fn on_render_process_terminated(
@@ -668,6 +697,12 @@ wrap_life_span_handler! {
             let raw: D = target_disposition.into();
             let scriptable = no_javascript_access.as_deref().is_some_and(|v| *v == 0);
             let refused = self.handler.state.borrow().no_popups;
+            // Only the app's own pages may open them in a new tab (H1.4).
+            let opener = _frame.as_deref().map(|f| CefString::from(&f.url()).to_string()).unwrap_or_default();
+            if crate::app_pages::is_app_page(&url) && !crate::app_pages::is_app_page(&opener) {
+                eprintln!("agent-unibrow: refused a page's new tab from {opener:?} to {url}");
+                return 1;
+            }
             debug(|| format!("popup request {url:?} disposition {raw:?} scriptable {scriptable} gesture {user_gesture}"));
             if refused {
                 return 1;
