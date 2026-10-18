@@ -28,6 +28,9 @@ const BULLET: &str = "•";
 /// Emitted when the user presses Enter with non-empty text.
 pub struct Submit(pub String);
 
+/// Emitted whenever the text changes (typing, deleting, pasting).
+pub struct Changed;
+
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, Some("TextInput")),
@@ -62,6 +65,7 @@ pub struct TextInput {
 }
 
 impl EventEmitter<Submit> for TextInput {}
+impl EventEmitter<Changed> for TextInput {}
 
 impl TextInput {
     pub fn new(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
@@ -87,6 +91,17 @@ impl TextInput {
 
     pub fn set_masked(&mut self, masked: bool, cx: &mut Context<Self>) {
         self.masked = masked;
+        cx.notify();
+    }
+
+    pub fn text(&self) -> &str {
+        &self.content
+    }
+
+    /// Replaces the contents (e.g. the address bar following navigation).
+    pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.reset();
+        self.content = text.to_string().into();
         cx.notify();
     }
 
@@ -358,6 +373,7 @@ impl EntityInputHandler for TextInput {
         self.content = (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..]).into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range.take();
+        cx.emit(Changed);
         cx.notify();
     }
 
@@ -595,6 +611,7 @@ impl Render for TextInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .w_full()
+            .overflow_hidden()
             .px_3()
             .py_2()
             .rounded_md()

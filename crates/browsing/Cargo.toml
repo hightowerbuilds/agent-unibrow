@@ -1,0 +1,14 @@
+[package]
+name = "browsing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+router.workspace = true
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde_json.workspace = true
+futures.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+url.workspace = true

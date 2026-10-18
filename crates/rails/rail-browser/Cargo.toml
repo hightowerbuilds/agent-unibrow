@@ -3,5 +3,11 @@ name = "rail-browser"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# Passes the CEF directory on to the shell's build script (rpath).
+links = "unibrow_cef"
 
 [dependencies]
+cef = { version = "=154.5.0", default-features = false }
+cef-dll-sys = "=154.5.0"
+dirs.workspace = true
+url.workspace = true

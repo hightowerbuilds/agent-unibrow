@@ -1,0 +1,4 @@
+[env]
+# CEF binaries (~250 MB) are downloaded once into .cef/ (gitignored) and
+# reused across clean builds. See crates/rails/rail-browser.
+CEF_PATH = { value = ".cef", relative = true }

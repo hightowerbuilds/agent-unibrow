@@ -110,6 +110,22 @@ impl GoogleAuth {
         Ok(token)
     }
 
+    /// Runs the consent flow now, regardless of any saved token, and saves
+    /// the new refresh token. Used by `agent-unibrow --google-signin`.
+    pub async fn sign_in(&self) -> Result<(), String> {
+        let fresh = self.consent().await?;
+        if fresh.refresh_token.is_none() {
+            return Err("Google didn't return a refresh token. Remove agent-unibrow's access at \
+                 https://myaccount.google.com/permissions and sign in again."
+                .into());
+        }
+        *self.access.lock().await = Some(Cached {
+            token: fresh.access_token,
+            expires: Instant::now() + Duration::from_secs(fresh.expires_in.unwrap_or(3600)),
+        });
+        Ok(())
+    }
+
     async fn refresh(&self, refresh_token: &str) -> Result<TokenResponse, String> {
         let resp = self
             .http
@@ -152,7 +168,11 @@ impl GoogleAuth {
             .append_pair("state", &state)
             .append_pair("access_type", "offline")
             .append_pair("prompt", "consent");
-        open::that_detached(url.as_str()).map_err(|e| format!("could not open the browser: {e}. Visit {url}"))?;
+        // Always print the link: the browser may open somewhere unexpected.
+        eprintln!("\nGoogle sign-in for agent-unibrow. If no browser tab opened, visit:\n{url}\n");
+        if let Err(e) = open::that_detached(url.as_str()) {
+            eprintln!("(couldn't open the browser automatically: {e})");
+        }
 
         let code = tokio::time::timeout(CONSENT_TIMEOUT, wait_for_code(&listener, &state))
             .await
