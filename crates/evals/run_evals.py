@@ -28,17 +28,24 @@ message while the agent works; `env` sets extra environment variables
 (such as `UNIBROW_TEST_PANE` steps that zoom or right-click as the user
 would, see browser_pane.rs); `relaunch` kills the instance after the
 first turn (a crash) and starts it again on the same data with a new task
-(optionally on another `page`, after `mutate`-ing served pages);
+(optionally on another `page`, after `mutate`-ing served pages); `inbox`
+is a fake mailbox of `{from, subject, body, seconds_ago}` for codes;
 `tools_any` lists groups of tools where any one being called is enough
 (e.g. browser_type or browser_fill_form), and `reply_any` groups of words
 where any one in the reply is enough; `kill_renderer_secs` kills the
 instance's renderer processes (only ones carrying its data folder) that
-many seconds in; `log_contains` checks the instance's stderr log. `{alt}`
+many seconds in; `log_contains` checks the instance's stderr log (and
+`log_not_contains` that a line never appeared). `{alt}`
 is the fixture server under 127.0.0.1 (another site), `{tls}` the same
 fixtures over HTTPS with a self-signed certificate, and `/auth/<page>`
 answers 401 (HTTP Basic, user `ada`, password `lovelace`) until signed in.
+A case without a `task` runs no agent turn (no quota used): the instance
+runs its `UNIBROW_TEST_PANE` steps for `secs` seconds and only the log is
+checked (`log_contains`, `log_not_contains`); the media cases work this way.
 
 Results are printed and saved to crates/evals/results/<timestamp>.json.
+To run the suite every night, see crates/evals/nightly/ (a systemd user
+timer and the script it starts; nothing installs them for you).
 Each case runs a real agent turn on the configured backend (Claude Code by
 default), which uses your subscription or API quota.
 """
@@ -206,9 +213,10 @@ def run_case(case, port, workdir: Path, site: Path, tls_port=None):
         UNIBROW_DATA_DIR=str(data),
         UNIBROW_APP_ID=TEST_CLASS,
         UNIBROW_START_URL=fill(case["page"]) if "://" in fill(case["page"]) else f"http://localhost:{port}/{case['page']}",
-        UNIBROW_AUTOSEND=fill(case["task"]),
         UNIBROW_AUTOAPPROVE=case.get("approve", "deny"),
     )
+    if case.get("task"):
+        env["UNIBROW_AUTOSEND"] = fill(case["task"])
     env.update({k: str(v) for k, v in case.get("env", {}).items()})
     if "policy" in case:
         data.mkdir(parents=True, exist_ok=True)
@@ -221,6 +229,11 @@ def run_case(case, port, workdir: Path, site: Path, tls_port=None):
         env["UNIBROW_TEST_LOGIN"] = case["test_login"]
     if "autohandoff" in case:
         env["UNIBROW_AUTOHANDOFF"] = case["autohandoff"]
+    if "inbox" in case:
+        # A fake inbox standing in for Gmail (verification codes).
+        inbox = workdir / f"{case['name']}-inbox.json"
+        inbox.write_text(json.dumps(case["inbox"]))
+        env["UNIBROW_TEST_INBOX"] = str(inbox)
     if "autosteer" in case:
         env["UNIBROW_AUTOSTEER"] = case["autosteer"]
     if case.get("watch_fast"):
@@ -253,7 +266,13 @@ def run_case(case, port, workdir: Path, site: Path, tls_port=None):
         threading.Thread(target=killer, daemon=True).start()
     trace = []
     try:
-        trace = wait_turn(data, proc, time.time())
+        if not case.get("task"):
+            # Pane-only case: let the test steps run, then stop.
+            deadline = time.time() + case.get("secs", 30)
+            while time.time() < deadline and proc.poll() is None:
+                time.sleep(1)
+        else:
+            trace = wait_turn(data, proc, time.time())
         if after and proc.poll() is None:
             time.sleep(after.get("delay_secs", 0))
             m = after.get("mutate")
@@ -286,8 +305,11 @@ def check(case, trace, data: Path, seconds, log_path=None):
     for s in exp.get("log_contains", []):
         if s.lower() not in log_text.lower():
             failures.append(f"log is missing “{s}”")
+    for s in exp.get("log_not_contains", []):
+        if s.lower() in log_text.lower():
+            failures.append(f"log contains “{s}”")
     finished = [e for e in trace if e.get("summary", "").startswith("Turn finished")]
-    if not finished:
+    if not finished and case.get("task"):
         failures.append("the turn never finished (timeout or crash)")
     reply = (finished[-1].get("detail") or "").split("\n\nmodel:")[0] if finished else ""
     summaries = "\n".join(e.get("summary", "") for e in trace)
@@ -342,7 +364,7 @@ def main():
     site = workdir / "site"
     server, port = serve_fixtures(site)
     tls_server, tls_port = (None, None)
-    if any("{tls}" in c["task"] or "{tls}" in c["page"] for c in cases):
+    if any("{tls}" in c.get("task", "") or "{tls}" in c["page"] for c in cases):
         tls_server, tls_port = serve_tls(site, workdir)
     hide_eval_windows()
     results = []

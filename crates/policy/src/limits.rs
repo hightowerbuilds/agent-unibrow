@@ -81,8 +81,8 @@ impl TurnBudget {
 /// Starts with "Limit reached" so the trace and evals can spot it.
 pub fn calls_cap_message(limits: &Limits) -> String {
     format!(
-        "Limit reached: this turn has used its {} tool calls (a safety cap). Don't call any more tools. \
-         Stop now and tell the user what you've done, what's left, and that they can say “continue” to go on.",
+        "Limit reached: this turn has used its {} tool calls (a safety cap). Don't call any more tools \
+         (task_progress still works, to note where you stopped). Stop now and tell the user what you've done, what's left, and that they can say “continue” to go on.",
         limits.max_calls_per_turn
     )
 }

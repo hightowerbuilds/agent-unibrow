@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Unibrow Test Shop – Badge</title>
+<style>
+  body { font: 16px system-ui, sans-serif; max-width: 640px; margin: 32px auto; padding: 0 16px; color: #1b2733; }
+  button { padding: 8px 16px; font: inherit; cursor: pointer; }
+  #status { margin-top: 14px; padding: 10px; background: #eef6f5; border-radius: 6px; }
+  canvas { display: block; margin-top: 18px; border: 1px solid #c9d3dc; }
+</style>
+</head>
+<body>
+  <h1>Your badge</h1>
+  <p>Press Count once for each guest. The badge code is printed on the badge picture below.</p>
+  <p><button id="count">Count</button></p>
+  <div id="status" role="status">Count: 0</div>
+  <canvas id="badge" width="420" height="140" aria-label="Badge picture"></canvas>
+  <script>
+    let n = 0;
+    const status = document.getElementById('status');
+    // The status is drawn on the next animation frame: in a tab that the
+    // browser treats as hidden, frames stop and it would never update.
+    document.getElementById('count').addEventListener('click', () => {
+      n += 1;
+      requestAnimationFrame(() => { status.textContent = 'Count: ' + n; });
+    });
+    // The code is only in the picture, not in the page's text.
+    requestAnimationFrame(() => {
+      const c = document.getElementById('badge').getContext('2d');
+      c.fillStyle = '#1b5e57'; c.fillRect(0, 0, 420, 140);
+      c.fillStyle = '#ffffff'; c.font = 'bold 56px sans-serif'; c.textBaseline = 'middle';
+      c.fillText(['K7', 'PLUM'].join('-'), 70, 72);
+    });
+  </script>
+</body>
+</html>

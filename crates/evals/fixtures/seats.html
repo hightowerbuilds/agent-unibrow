@@ -1,0 +1,28 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Seat map – Unibrow Test Theatre</title>
+<style>body { font: 16px system-ui, sans-serif; max-width: 640px; margin: 32px auto; padding: 0 16px; color: #1b2733; } .seat { margin: 6px 0; } button { padding: 6px 12px; font: inherit; } #updated { color: #667; font-size: 14px; }</style></head>
+<body>
+  <h1>Live seat map</h1>
+  <p>Row 14. The map refreshes live as other people pick seats.</p>
+  <div id="map"></div>
+  <p id="note" role="status"></p>
+  <script>
+    // Re-renders the whole map every 2 seconds with new elements, the way
+    // live-updating pages do: refs to the old buttons go stale.
+    const seats = ['14A', '14B', '14C', '14D'];
+    let held = null, tick = 0;
+    function render() {
+      tick++;
+      const map = document.getElementById('map');
+      map.innerHTML = '';
+      for (const s of seats) {
+        const d = document.createElement('div'); d.className = 'seat';
+        const b = document.createElement('button');
+        b.textContent = held === s ? 'Seat ' + s + ' (held for you)' : 'Hold seat ' + s;
+        b.onclick = () => { held = s; document.getElementById('note').textContent = 'Seat ' + s + ' is held for 10 minutes. Hold code: HC-' + (4100 + seats.indexOf(s)) + '.'; render(); };
+        d.appendChild(b); map.appendChild(d);
+      }
+    }
+    render();
+    setInterval(render, 2000);
+  </script>
+</body></html>

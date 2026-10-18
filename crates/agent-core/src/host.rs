@@ -35,6 +35,10 @@ impl Steering {
     }
 }
 
+/// Tools outside the per-turn call cap: they only touch the app's own
+/// bookkeeping, never a site or an account.
+const UNCAPPED: &[&str] = &["task_progress"];
+
 #[derive(Clone)]
 pub struct ToolHost {
     registry: Registry,
@@ -116,9 +120,12 @@ impl ToolHost {
             return fail(format!("No tool named {name}."));
         };
 
-        // Per-turn caps (6.6).
+        // Per-turn caps (6.6). The task checklist stays usable after the
+        // call cap, so the agent can note where it stopped (7.4).
         let limits = self.policy.lock().expect("policy lock").limits();
-        if let Err(msg) = self.budget().start_call(&limits) {
+        if UNCAPPED.contains(&name.as_str()) {
+            // Neither counted nor refused.
+        } else if let Err(msg) = self.budget().start_call(&limits) {
             self.emit(AgentEvent::Info(crate::first_line(&msg)));
             return fail(msg);
         }

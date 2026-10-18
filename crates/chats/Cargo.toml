@@ -9,3 +9,5 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 serde_json.workspace = true
 chrono.workspace = true
 dirs.workspace = true
+router.workspace = true
+futures.workspace = true

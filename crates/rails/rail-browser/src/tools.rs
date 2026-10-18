@@ -5,7 +5,7 @@
 //! its target on screen, waits for the page to settle, and returns the page
 //! as it is afterwards, plus a small screenshot kept for the trace.
 
-use crate::bridge::{BrowserBridge, NavAction, PageState, Rect, TabInfo, TabOp};
+use crate::bridge::{BrowserBridge, NavAction, PageState, Rect};
 use base64::Engine;
 use futures::future::BoxFuture;
 use page_model::describe_single;
@@ -51,7 +51,9 @@ fn has_word(text: &str, words: &[&str]) -> bool {
 const SENSITIVE_SELECTOR: &str = "input[type=password], [autocomplete^='cc-' i], [autocomplete*=' cc-' i], \
     [autocomplete='one-time-code' i], input[name*='card' i][name*='num' i], input[id*='card' i][id*='num' i], \
     input[name*='cvv' i], input[name*='cvc' i], input[id*='cvv' i], input[id*='cvc' i], input[name*='ssn' i], \
-    input[id*='ssn' i], input[name*='iban' i], input[name*='security' i][name*='code' i]";
+    input[id*='ssn' i], input[name*='iban' i], input[name*='security' i][name*='code' i], \
+    input[name*='otp' i], input[id*='otp' i], input[maxlength='1'][inputmode='numeric'], \
+    input[maxlength='1'][type='tel'], input[maxlength='1'][type='number']";
 
 /// Run with an element as `this`: is it sensitive, and what form (if any)
 /// would it submit? Values of sensitive fields come back as `[hidden]`.
@@ -84,6 +86,7 @@ const PROBE_FN: &str = r#"function(sel){
 /// What the probe found out about an element and its form.
 #[derive(Default)]
 struct Probe {
+    tag: String,
     sensitive: bool,
     is_submit: bool,
     in_form: bool,
@@ -96,6 +99,7 @@ struct Probe {
 impl Probe {
     fn from(v: &Value) -> Self {
         Self {
+            tag: v["tag"].as_str().unwrap_or("").to_string(),
             sensitive: v["sensitive"].as_bool().unwrap_or(false),
             is_submit: v["isSubmit"].as_bool().unwrap_or(false),
             in_form: v["inForm"].as_bool().unwrap_or(false),
@@ -132,14 +136,19 @@ impl Probe {
 
 mod extract;
 mod clipboard;
+mod codes;
 mod forms;
 mod frames;
+mod history;
 mod injection;
 mod playbooks;
 mod pointer;
 mod scope;
+mod screenshot;
 mod scrolling;
 mod spend;
+mod tabs;
+mod verify;
 
 pub use extract::watch_value;
 
@@ -147,7 +156,12 @@ pub use playbooks::{Decider, WordMatch};
 
 /// The browser tools. Page-changing ones on focus sites are recorded in
 /// `store` for site maps and playbooks (Phase 8).
-pub fn tools(bridge: BrowserBridge, store: Arc<browsing::Browsing>) -> Vec<Arc<dyn Tool>> {
+/// `codes` is where verification codes can be read (the user's Gmail).
+pub fn tools(
+    bridge: BrowserBridge,
+    store: Arc<browsing::Browsing>,
+    codes: Option<Arc<dyn router::CodeSource>>,
+) -> Vec<Arc<dyn Tool>> {
     let b = Arc::new(Browser::new(bridge));
     let rec = |t: Arc<dyn Tool>| playbooks::Recorded::wrap(t, b.clone(), store.clone());
     let mut all: Vec<Arc<dyn Tool>> = extract::tools(b.clone());
@@ -168,7 +182,8 @@ pub fn tools(bridge: BrowserBridge, store: Arc<browsing::Browsing>) -> Vec<Arc<d
         Arc::new(pointer::Drag(b.clone())),
         Arc::new(clipboard::Clipboard(b.clone())),
         Arc::new(Dialog(b.clone())),
-        Arc::new(Tabs(b.clone())),
+        Arc::new(tabs::Tabs(b.clone())),
+        Arc::new(history::HistoryList(b.clone())),
         Arc::new(Find(b.clone())),
         Arc::new(Downloads(b.clone())),
         Arc::new(ReadDownload),
@@ -176,6 +191,7 @@ pub fn tools(bridge: BrowserBridge, store: Arc<browsing::Browsing>) -> Vec<Arc<d
         Arc::new(SavePdf(b.clone())),
         Arc::new(SignIn(b.clone())),
         Arc::new(Handoff(b.clone())),
+        Arc::new(codes::EmailCode(b.clone(), codes)),
         rec(Arc::new(History(b.clone(), NavAction::Back))),
         Arc::new(History(b.clone(), NavAction::Forward)),
         Arc::new(History(b, NavAction::Reload)),
@@ -195,6 +211,20 @@ struct Browser {
     clipboard: std::sync::Mutex<Option<String>>,
 }
 
+/// Checks to make after an action (7.1), and what the tool already found.
+#[derive(Default)]
+struct Verify {
+    /// Lines already worked out: retries made, a click that did nothing.
+    lines: Vec<String>,
+    /// The tool already waited for the page to settle.
+    settled: bool,
+    /// Fields typed into: (field, its ref, the text), read back afterwards.
+    typed: Vec<(Element, String, String)>,
+    /// A submit happened: from this element (None: the focused one), and
+    /// the URL before it.
+    form: Option<(Option<Element>, String)>,
+}
+
 /// A page outline as the agent saw it.
 #[derive(Clone)]
 struct Snapshot {
@@ -203,6 +233,7 @@ struct Snapshot {
     lines: Vec<String>,
 }
 
+#[derive(Clone)]
 struct Element {
     backend_id: i64,
     role: String,
@@ -285,7 +316,7 @@ impl Browser {
         if let Ok(mut last) = self.last_seen.lock() {
             *last = Some(snap.clone());
         }
-        let notes = self.page_notes(&st.url).await;
+        let notes = format!("{}{}", st.tab_note.as_ref().map(|n| format!("{n}\n")).unwrap_or_default(), self.page_notes(&st.url).await);
         let mut out = format!(
             "Page: {}\nURL: {}\n{}{}{}{} actionable elements. Refs like [e123] can be passed to browser_click / browser_type.\n\n",
             if st.title.is_empty() { "(untitled)" } else { &st.title },
@@ -391,22 +422,8 @@ impl Browser {
         if scale < 1.0 {
             params["clip"] = json!({"x": 0, "y": 0, "width": st.width.max(1), "height": st.height.max(1), "scale": scale});
         }
-        // Mask sensitive fields as dots for the capture, so screenshots never
-        // show card numbers or codes (6.4), then put the page back.
-        let css = format!("{SENSITIVE_SELECTOR} {{ -webkit-text-security: disc !important; }}");
-        let mask = format!(
-            "(() => {{ let s = document.getElementById('__unibrow_mask'); if (!s) {{ s = document.createElement('style'); \
-             s.id = '__unibrow_mask'; (document.head || document.documentElement).appendChild(s); }} s.textContent = {}; }})()",
-            serde_json::to_string(&css).unwrap_or_default()
-        );
-        let _ = self.bridge.cdp("Runtime.evaluate", json!({"expression": mask})).await;
-        let r = self.bridge.cdp("Page.captureScreenshot", params).await;
-        let _ = self
-            .bridge
-            .cdp("Runtime.evaluate", json!({"expression": "document.getElementById('__unibrow_mask')?.remove()"}))
-            .await;
-        let r = r?;
-        let data = r["data"].as_str().ok_or("no screenshot data")?.to_string();
+        // Sensitive fields are masked as dots for the capture (6.4).
+        let data = self.capture_masked(params).await?;
         Ok(ToolImage { mime: "image/jpeg".into(), base64: data })
     }
 
@@ -418,7 +435,24 @@ impl Browser {
     /// Like [`Browser::after_action`], also checking that `expect` text
     /// appeared (roadmap 7.1: act, then verify).
     async fn after_action_expecting(&self, what: String, summary: String, expect: Option<String>) -> ToolResult {
-        self.settle(Duration::from_secs(10)).await;
+        self.after_action_full(what, summary, expect, Verify::default()).await
+    }
+
+    /// The page after an action, with its checks (7.1): `verify` carries
+    /// lines the tool already worked out (retries, a dead click) and what
+    /// to check once the page has settled (fields typed into, a submit).
+    async fn after_action_full(&self, what: String, summary: String, expect: Option<String>, verify: Verify) -> ToolResult {
+        if !verify.settled {
+            self.settle(Duration::from_secs(10)).await;
+        }
+        let mut lines = verify.lines;
+        for (el, r, text) in &verify.typed {
+            lines.extend(self.typed_check(el, r, text).await);
+        }
+        if let Some((el, url_before)) = &verify.form {
+            lines.extend(self.form_check(el.as_ref(), url_before).await);
+        }
+        let what = if lines.is_empty() { what } else { format!("{what}\n{}", lines.join("\n")) };
         let what = match expect.filter(|e| !e.trim().is_empty()) {
             Some(e) => format!("{what}\n{}", self.check_expect(&e).await),
             None => what,
@@ -590,7 +624,10 @@ impl Browser {
             notes.push_str("This page shows a CAPTCHA or bot check. Don't try to solve it: use browser_handoff to ask the user.\n");
         }
         if v["otp"].as_bool().unwrap_or(false) {
-            notes.push_str("This page asks for a verification code. Use browser_handoff so the user can enter it.\n");
+            notes.push_str(
+                "This page asks for a verification code. If the site emailed it, use browser_email_code: it shows the \
+                 code to the user to paste. For codes by text message or an app, use browser_handoff.\n",
+            );
         }
         if v["pw"].as_bool().unwrap_or(false) {
             let host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
@@ -821,7 +858,6 @@ browser_tool!(Wait);
 browser_tool!(Select);
 browser_tool!(Hover);
 browser_tool!(Dialog);
-browser_tool!(Tabs);
 browser_tool!(Find);
 browser_tool!(Downloads);
 /// Reads files from the downloads folder; needs no browser access.
@@ -906,38 +942,7 @@ impl Tool for Read {
     }
 }
 
-impl Tool for Screenshot {
-    fn name(&self) -> &'static str {
-        "browser_screenshot"
-    }
-    fn description(&self) -> &'static str {
-        "Take a screenshot of what's visible in the app's browser. Use it when the outline from browser_read \
-         isn't enough: images, charts, maps, canvas apps, or checking how something looks."
-    }
-    fn input_schema(&self) -> Value {
-        json!({"type": "object", "properties": {}, "additionalProperties": false})
-    }
-    fn effect(&self) -> Effect {
-        Effect::Read
-    }
-    fn describe_call(&self, _: &Value) -> String {
-        "Screenshot the page".into()
-    }
-    fn call(&self, input: Value) -> BoxFuture<'static, ToolResult> {
-        let b = self.0.clone();
-        Box::pin(async move {
-            check_keys(&input, &[])?;
-            let img = b.screenshot(75, 1.0).await?;
-            let st = b.state().await.unwrap_or_default();
-            Ok(ToolOutput {
-                content: format!("Screenshot of {} ({}x{} CSS px).", st.url, st.width, st.height),
-                summary: format!("screenshot of {}", site(&st.url)),
-                images: vec![img],
-                ..Default::default()
-            })
-        })
-    }
-}
+// browser_screenshot is in tools/screenshot.rs.
 
 impl Tool for Click {
     fn name(&self) -> &'static str {
@@ -984,10 +989,18 @@ impl Tool for Click {
                 return Err("Invalid input: `button` must be left, right or middle".into());
             }
             let clicks = if input["double"].as_bool().unwrap_or(false) { 2 } else { 1 };
-            let el = b.element(r).await?;
-            let st = b.state().await?;
+            let (mut el, stale, mut r_now) = b.resolve(r).await?;
+            let mut notes: Vec<String> = stale.into_iter().collect();
+            // A click on a page that's still loading can land on something
+            // that isn't wired up yet, or about to move: wait first (7.3).
+            if b.state().await.map(|s| s.loading).unwrap_or(false) {
+                b.settle(Duration::from_secs(8)).await;
+                notes.push("The page was still loading; waited for it to finish before clicking.".into());
+                let (e, n, rr) = b.resolve(&r_now).await?;
+                (el, r_now) = (e, rr);
+                notes.extend(n);
+            }
 
-            let _ = &st;
             let worded = match el.role.as_str() {
                 "link" => has_word(&el.name, LINK_COMMIT_WORDS),
                 "button" | "menuitem" | "" => has_word(&el.name, COMMIT_WORDS),
@@ -995,6 +1008,17 @@ impl Tool for Click {
             };
             let probe = b.probe(&el).await;
             let submits = probe.is_submit && probe.submit_commits();
+            // Something over the element (a cookie banner, a pop-up) would
+            // take the click: say what, rather than click it (7.3).
+            b.rect(&el).await?; // scrolls it into view first
+            let info = b.target_info(&el).await;
+            if let (true, Some(cover)) = (info.blocking, &info.covered) {
+                return Err(format!(
+                    "Not clicked: [{r_now}] {} is covered by {cover}. Close or answer that first (for a cookie \
+                     banner prefer Reject or Necessary only), then click again.",
+                    el.label()
+                ));
+            }
             if worded || submits {
                 let why = if worded {
                     "This looks like it could buy, send, post, delete or confirm something".to_string()
@@ -1003,14 +1027,90 @@ impl Tool for Click {
                 };
                 b.confirm(&ctx, format!("Click {}", el.label()), why, &probe).await?;
             }
+            if let Some(cover) = info.covered.as_ref() {
+                notes.push(format!("Check: {cover} is on top of {}, so the click went to it.", el.label()));
+            }
 
-            let rect = b.rect(&el).await?;
-            b.bridge.highlight(rect, format!("click {}", el.label()));
-            tokio::time::sleep(Duration::from_millis(350)).await;
-            let (x, y) = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
-            b.click_at(x, y, button, clicks).await?;
+            let url_before = b.state().await.map(|s| s.url).unwrap_or_default();
+            let mut info = info;
+            let mut retried = false;
+            let mut settled = false;
+            let mut attempt = 0;
+            let effect = loop {
+                attempt += 1;
+                let rect = match b.rect(&el).await {
+                    Ok(rect) => rect,
+                    // Re-rendered again since it was found: once more by role and name.
+                    Err(e) => match b.resolve(r).await {
+                        Ok((fresh, Some(n), rr)) => {
+                            let rect = b.rect(&fresh).await.map_err(|_| e)?;
+                            (el, r_now) = (fresh, rr);
+                            if !notes.iter().any(|x| x.starts_with("Retried: [")) {
+                                notes.push(n);
+                            }
+                            rect
+                        }
+                        _ => return Err(e),
+                    },
+                };
+                b.bridge.highlight(rect, format!("click {}", el.label()));
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                // Clicks into text fields only focus them; nothing to watch.
+                let base = if info.field { None } else { Some(b.watch(&el).await) };
+                let (x, y) = (rect.x + rect.width * info.point.0, rect.y + rect.height * info.point.1);
+                if !b.click_at(x, y, button, clicks).await? {
+                    break None; // a dialog opened: its notice says what happened
+                }
+                b.settle(Duration::from_secs(10)).await;
+                settled = true;
+                let Some(base) = base else { break None };
+                let effect = b.click_effect(&el, &base).await;
+                // Once, and only for clicks that can't do anything twice.
+                let again = attempt == 1
+                    && effect == verify::ClickEffect::Nothing
+                    && info.young
+                    && !info.disabled
+                    && button == "left"
+                    && clicks == 1
+                    && verify::safe_to_retry(&el.role, &el.name, worded || submits, probe.is_submit, probe.in_form, info.navigates());
+                if !again {
+                    break Some(effect);
+                }
+                b.network_quiet(Duration::from_secs(3)).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let Ok((e, n, rr)) = b.resolve(&r_now).await else { break Some(effect) };
+                if b.rect(&e).await.is_err() {
+                    break Some(effect);
+                }
+                let fresh = b.target_info(&e).await;
+                if fresh.blocking {
+                    break Some(effect);
+                }
+                (el, r_now, info) = (e, rr, fresh);
+                notes.extend(n);
+                notes.push(
+                    "Retried once: the first click came while the page was still starting up and did nothing; \
+                     waited for it to settle and clicked again."
+                        .into(),
+                );
+                retried = true;
+            };
+            if let Some(effect) = effect {
+                let form = if verify::submitish(&el.role, &el.name, probe.is_submit, probe.in_form) {
+                    b.form_check(Some(&el), &url_before).await
+                } else {
+                    None
+                };
+                let errors = form.as_ref().is_some_and(|l| !l.contains("no error messages"));
+                if effect == verify::ClickEffect::Nothing && !errors {
+                    notes.push(verify::dead_click_line(&el.label(), &info, &url_before, retried));
+                } else {
+                    notes.extend(form);
+                }
+            }
             let expect = input["expect"].as_str().map(str::to_string);
-            b.after_action_expecting(format!("Clicked [{r}] {}.", el.label()), format!("clicked {}", el.label()), expect)
+            let verify = Verify { lines: notes, settled, ..Default::default() };
+            b.after_action_full(format!("Clicked [{r_now}] {}.", el.label()), format!("clicked {}", el.label()), expect, verify)
                 .await
         })
     }
@@ -1059,7 +1159,7 @@ impl Tool for Type {
             let text = input["text"].as_str().ok_or("Invalid input: `text` is required")?.to_string();
             let clear = input["clear"].as_bool().unwrap_or(true);
             let submit = input["submit"].as_bool().unwrap_or(false);
-            let el = b.element(r).await?;
+            let (el, stale, r_now) = b.resolve(r).await?;
             let probe = b.probe(&el).await;
             if probe.sensitive {
                 return Err(format!(
@@ -1073,6 +1173,7 @@ impl Tool for Type {
             // Text fields get the text typed; date, time and similar inputs
             // get their value set; rich text editors get it line by line.
             let note = b.type_into(&el, &text, clear).await?;
+            let url_before = b.state().await.map(|s| s.url).unwrap_or_default();
             if submit {
                 let probe = b.probe(&el).await;
                 if probe.submit_commits() {
@@ -1081,12 +1182,18 @@ impl Tool for Type {
                 b.key(&parse_keys("Enter")?.0, 0).await?;
             }
             let shown: String = text.chars().take(60).collect();
-            b.after_action_expecting(
-                format!("Typed \"{shown}\" into [{r}] {}{}.{note}", el.label(), if submit { " and pressed Enter" } else { "" }),
-                format!("typed into {}", el.label()),
-                input["expect"].as_str().map(str::to_string),
-            )
-            .await
+            let what = format!("Typed \"{shown}\" into [{r_now}] {}{}.{note}", el.label(), if submit { " and pressed Enter" } else { "" });
+            let summary = format!("typed into {}", el.label());
+            // Read the field back once the page has had its say (7.1); after
+            // Enter many fields clear on purpose (search, chat), so check the
+            // form's response instead.
+            let verify = Verify {
+                lines: stale.into_iter().collect(),
+                typed: if submit { Vec::new() } else { vec![(el.clone(), r_now.clone(), text.clone())] },
+                form: (submit && probe.in_form).then(|| (Some(el.clone()), url_before)),
+                ..Default::default()
+            };
+            b.after_action_full(what, summary, input["expect"].as_str().map(str::to_string), verify).await
         })
     }
 }
@@ -1136,17 +1243,22 @@ impl Tool for Press {
                      Use browser_clipboard to copy and paste."
                 ));
             }
+            let mut in_form = false;
             if key.key == "Enter" && mods == 0 {
                 let probe = b.probe_focused().await;
                 if probe.submit_commits() {
                     b.confirm(&ctx, "Submit the form (Enter)".into(), "Pressing Enter submits a form that sends information".into(), &probe).await?;
                 }
+                // Enter in a text area is a new line, not a submit.
+                in_form = probe.in_form && probe.tag != "textarea";
             }
+            let url_before = b.state().await.map(|s| s.url).unwrap_or_default();
             for _ in 0..times {
                 b.key(&key, mods).await?;
             }
             let what = if times > 1 { format!("Pressed {combo} {times} times.") } else { format!("Pressed {combo}.") };
-            b.after_action_expecting(what, format!("pressed {combo}"), input["expect"].as_str().map(str::to_string)).await
+            let verify = Verify { form: in_form.then(|| (None, url_before)), ..Default::default() };
+            b.after_action_full(what, format!("pressed {combo}"), input["expect"].as_str().map(str::to_string), verify).await
         })
     }
 }
@@ -1501,7 +1613,8 @@ impl Tool for Select {
             check_keys(&input, &["ref", "option"])?;
             let r = arg_str(&input, "ref")?;
             let option = arg_str(&input, "option")?.to_string();
-            let el = b.element(r).await?;
+            let (el, stale, r) = b.resolve(r).await?;
+            let r = r.as_str();
             let rect = b.rect(&el).await?;
             b.bridge.highlight(rect, format!("select “{option}”"));
             let f = format!(
@@ -1536,7 +1649,9 @@ impl Tool for Select {
                 return Err(format!("{err} “{option}”. Options: {opts}"));
             }
             let chosen = v["chosen"].as_str().unwrap_or(&option).to_string();
-            b.after_action(format!("Selected “{chosen}” in [{r}] {}.", el.label()), format!("selected {chosen}")).await
+            let what = format!("Selected “{chosen}” in [{r}] {}.", el.label());
+            let verify = Verify { lines: stale.into_iter().collect(), ..Default::default() };
+            b.after_action_full(what, format!("selected {chosen}"), None, verify).await
         })
     }
 }
@@ -1567,79 +1682,13 @@ impl Tool for Hover {
         let b = self.0.clone();
         Box::pin(async move {
             check_keys(&input, &["ref"])?;
-            let r = arg_str(&input, "ref")?;
-            let el = b.element(r).await?;
+            let (el, stale, r) = b.resolve(arg_str(&input, "ref")?).await?;
             let rect = b.rect(&el).await?;
             b.bridge.highlight(rect, format!("hover {}", el.label()));
             b.mouse("mouseMoved", rect.x + rect.width / 2.0, rect.y + rect.height / 2.0, "none", 0).await?;
             tokio::time::sleep(Duration::from_millis(400)).await;
-            b.after_action(format!("Hovered over [{r}] {}.", el.label()), format!("hovered {}", el.label())).await
-        })
-    }
-}
-
-fn tab_list(tabs: &[TabInfo]) -> String {
-    tabs.iter()
-        .map(|t| {
-            let title = if t.title.is_empty() { "(untitled)" } else { &t.title };
-            format!("{} tab {}: {title} — {}", if t.active { "→" } else { " " }, t.id, t.url)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-impl Tool for Tabs {
-    fn name(&self) -> &'static str {
-        "browser_tabs"
-    }
-    fn description(&self) -> &'static str {
-        "List, open, switch to, or close tabs in the app's browser. The active tab is the one the user sees and \
-         the one the other browser tools act on. Open a new tab to look something up without losing the \
-         current page; switch back afterwards."
-    }
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["list", "new", "switch", "close"]},
-                "url": {"type": "string", "description": "For new: what to open (default: the home page)."},
-                "tab": {"type": "integer", "description": "For switch/close: the tab id from the list."}
-            },
-            "required": ["action"],
-            "additionalProperties": false
-        })
-    }
-    fn effect(&self) -> Effect {
-        Effect::Read
-    }
-    fn describe_call(&self, input: &Value) -> String {
-        match input["action"].as_str().unwrap_or("list") {
-            "new" => format!("Open a tab: {}", input["url"].as_str().unwrap_or("home")),
-            "switch" => format!("Switch to tab {}", input["tab"]),
-            "close" => format!("Close tab {}", input["tab"]),
-            _ => "List tabs".into(),
-        }
-    }
-    fn call(&self, input: Value) -> BoxFuture<'static, ToolResult> {
-        let b = self.0.clone();
-        Box::pin(async move {
-            check_keys(&input, &["action", "url", "tab"])?;
-            let action = arg_str(&input, "action")?.to_string();
-            let tab = || input["tab"].as_u64().map(|t| t as u32).ok_or("Invalid input: `tab` is required".to_string());
-            let op = match action.as_str() {
-                "list" => TabOp::List,
-                "new" => TabOp::New { url: input["url"].as_str().map(str::to_string) },
-                "switch" => TabOp::Switch { id: tab()? },
-                "close" => TabOp::Close { id: tab()? },
-                other => return Err(format!("Unknown action `{other}`")),
-            };
-            let tabs = b.bridge.tabs(op).await?;
-            let list = tab_list(&tabs);
-            if action == "list" || action == "close" {
-                return Ok(ToolOutput::text(format!("Tabs (→ = active):\n{list}"), format!("{} tabs", tabs.len())));
-            }
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            b.after_action(format!("Tabs (→ = active):\n{list}"), format!("{action} tab")).await
+            let verify = Verify { lines: stale.into_iter().collect(), ..Default::default() };
+            b.after_action_full(format!("Hovered over [{r}] {}.", el.label()), format!("hovered {}", el.label()), None, verify).await
         })
     }
 }

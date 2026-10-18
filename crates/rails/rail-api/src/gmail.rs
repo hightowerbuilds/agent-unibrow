@@ -25,7 +25,7 @@ impl Gmail {
         Self { auth, http: reqwest::Client::new(), me: OnceCell::new() }
     }
 
-    async fn get(&self, path: &str, query: &[(&str, &str)]) -> Result<Value, String> {
+    pub(crate) async fn get(&self, path: &str, query: &[(&str, &str)]) -> Result<Value, String> {
         let token = self.auth.access_token().await?;
         let resp = self
             .http

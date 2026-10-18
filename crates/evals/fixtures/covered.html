@@ -1,0 +1,21 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Member rewards – Unibrow Test Shop</title>
+<style>
+  body { font: 16px system-ui, sans-serif; max-width: 640px; margin: 32px auto; padding: 0 16px; color: #1b2733; }
+  button { padding: 10px 18px; font: inherit; }
+  #shade { position: fixed; inset: 0; background: rgba(10, 20, 30, 0.55); display: flex; align-items: center; justify-content: center; }
+  #shade .box { background: #fff; border-radius: 10px; padding: 22px; max-width: 360px; }
+</style></head>
+<body>
+  <h1>Member rewards</h1>
+  <p>Thanks for being a member. Your spring coupon is ready.</p>
+  <button id="show" onclick="document.getElementById('coupon').textContent = 'Your coupon: KESTREL-15'">Show my coupon</button>
+  <p id="coupon" role="status"></p>
+  <div id="shade" class="newsletter-popup">
+    <div class="box">
+      <h2>Get 10% off your next order</h2>
+      <p>Hear about new parts first. We send one email a month.</p>
+      <button onclick="document.getElementById('shade').remove()">No thanks</button>
+      <button onclick="document.getElementById('shade').remove()">Sign me up</button>
+    </div>
+  </div>
+</body></html>

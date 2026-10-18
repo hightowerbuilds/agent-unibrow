@@ -1,6 +1,7 @@
 //! The API rail: the user's own data behind OAuth (Gmail now; Calendar,
 //! Microsoft Graph and Plaid later). Nothing here touches a web page.
 
+pub mod codes;
 pub mod gmail;
 mod google_auth;
 mod mime;
@@ -33,6 +34,13 @@ impl ApiRail {
             }
         };
         (Self { gmail }, notes)
+    }
+}
+
+impl ApiRail {
+    /// Where verification codes can be found: the user's Gmail, if set up.
+    pub fn code_source(&self) -> Option<Arc<dyn router::CodeSource>> {
+        self.gmail.clone().map(|g| Arc::new(codes::GmailCodes(g)) as Arc<dyn router::CodeSource>)
     }
 }
 

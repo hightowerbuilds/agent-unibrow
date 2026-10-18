@@ -1,0 +1,14 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Spring catalogue – page 1 – Unibrow Test Shop</title>
+<style>body { font: 16px system-ui, sans-serif; max-width: 720px; margin: 32px auto; padding: 0 16px; color: #1b2733; } .item { border: 1px solid #d5dce2; border-radius: 8px; padding: 10px; margin: 8px 0; } .pager { margin-top: 20px; }</style></head>
+<body>
+  <h1>Spring catalogue</h1>
+  <p>Page 1 of 2</p>
+  <div class="item">Maple bass neck — $189.00</div>
+  <div class="item">Rosewood fretboard — $74.00</div>
+  <div class="item">Chrome bridge — $39.00</div>
+  <div class="pager"><a id="next" href="catalogue-2.html">Next page</a></div>
+  <script>
+    // A broken client-side router: it swallows the click and never navigates.
+    document.getElementById('next').addEventListener('click', e => { e.preventDefault(); });
+  </script>
+</body></html>

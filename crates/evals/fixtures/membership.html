@@ -1,0 +1,28 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Member details – Unibrow Test Shop</title>
+<style>body { font: 16px system-ui, sans-serif; max-width: 600px; margin: 32px auto; padding: 0 16px; color: #1b2733; } label { display: block; margin: 14px 0 4px; font-weight: 600; } input { padding: 8px; font: inherit; width: 100%; box-sizing: border-box; } .hint { color: #a33; font-size: 14px; min-height: 1.2em; }</style></head>
+<body>
+  <h1>Member details</h1>
+  <p>Enter your membership number to get member prices.</p>
+  <div class="field">
+    <label for="member">Membership number</label>
+    <input id="member" type="text" autocomplete="off" aria-describedby="member-error">
+    <div id="member-error" class="hint"></div>
+  </div>
+  <div class="field">
+    <label for="nick">Display name</label>
+    <input id="nick" type="text" autocomplete="off">
+  </div>
+  <p id="status" role="status"></p>
+  <script>
+    // Checks the number a moment after typing stops, and clears it if it's wrong.
+    const f = document.getElementById('member'), err = document.getElementById('member-error');
+    let t = null;
+    f.addEventListener('input', () => {
+      clearTimeout(t);
+      t = setTimeout(() => {
+        if (/^M-\d{5}$/.test(f.value)) { f.removeAttribute('aria-invalid'); err.textContent = ''; document.getElementById('status').textContent = 'Member prices on.'; }
+        else if (f.value) { f.value = ''; f.setAttribute('aria-invalid', 'true'); err.textContent = 'Membership numbers look like M-12345.'; }
+      }, 300);
+    });
+  </script>
+</body></html>

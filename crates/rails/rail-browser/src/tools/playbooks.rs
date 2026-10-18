@@ -71,6 +71,24 @@ fn target_for(lines: &[String], r: &str) -> Option<Target> {
     Some(Target { role: el.role.clone(), name: el.name.clone(), nth, matches_params: false })
 }
 
+/// Where the element `r` from the outline `before` is in the outline
+/// `after`, for a ref that went stale because the page re-rendered (7.3):
+/// the element with the same role and name, found the way replays find
+/// recorded steps. Only exact matches count, and only when the page has as
+/// many elements with that role and name as before, so "the second Save
+/// button" still means the same one. Unnamed elements aren't guessed at.
+pub(super) fn refind(before: &[String], after: &[String], r: &str) -> Option<String> {
+    let t = target_for(before, r)?;
+    if t.name.trim().is_empty() {
+        return None;
+    }
+    let count = |lines: &[String]| elements(lines).iter().filter(|e| e.role == t.role && e.name == t.name).count();
+    if count(before) != count(after) {
+        return None;
+    }
+    find(after, &t, "", &BTreeMap::new(), &WordMatch).filter(|f| f.confidence >= 1.0).map(|f| f.r)
+}
+
 // ------------------------------------------------------------ decisions (8.3)
 
 /// Answers closed questions inside known pages. A fast decision model (Jev)
@@ -604,6 +622,21 @@ mod tests {
         assert_eq!((t.role.as_str(), t.name.as_str(), t.nth), ("button", "Add to cart", 1));
         let f = find(&lines(), &t, "/item", &BTreeMap::new(), &WordMatch).unwrap();
         assert_eq!((f.r.as_str(), f.confidence), ("e30", 1.0));
+    }
+
+    #[test]
+    fn stale_refs_are_found_again_by_role_and_name() {
+        // The page re-rendered: same elements, new refs.
+        let after: Vec<String> = lines().iter().map(|l| l.replace("[e", "[e10")).collect();
+        assert_eq!(refind(&lines(), &after, "e24").as_deref(), Some("e1024"));
+        assert_eq!(refind(&lines(), &after, "e30").as_deref(), Some("e1030"), "the second Add to cart stays the second");
+        // One of two same-named buttons gone: which one is ambiguous.
+        let fewer: Vec<String> = after.iter().filter(|l| !l.contains("[e1030]")).cloned().collect();
+        assert!(refind(&lines(), &fewer, "e30").is_none());
+        // Gone entirely, or renamed: no guessing.
+        let renamed: Vec<String> = after.iter().map(|l| l.replace("Bone Jazz", "Bone Precision")).collect();
+        assert!(refind(&lines(), &renamed, "e24").is_none());
+        assert!(refind(&lines(), &after, "e99").is_none(), "never seen");
     }
 
     #[test]

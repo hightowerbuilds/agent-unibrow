@@ -97,6 +97,26 @@ pub struct ApprovalRequest {
     pub purchase: Option<Purchase>,
 }
 
+/// A verification code found in the user's email.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CodeEmail {
+    pub code: String,
+    pub from: String,
+    pub subject: String,
+    /// Unix seconds.
+    pub received: i64,
+}
+
+/// Somewhere the app can look for verification codes the user was just
+/// sent (their Gmail). Implemented by the API rail, used by the browser
+/// rail; codes go to the user's screen, never to the model.
+pub trait CodeSource: Send + Sync {
+    /// Codes in messages received at or after `since` (Unix seconds),
+    /// newest first. `hint` is the site asking (`netflix.com`) to rank its
+    /// sender first.
+    fn recent_codes(&self, since: i64, hint: Option<String>) -> BoxFuture<'static, Result<Vec<CodeEmail>, String>>;
+}
+
 /// Passed to [`Tool::call_with`].
 #[derive(Clone)]
 pub struct ToolContext {

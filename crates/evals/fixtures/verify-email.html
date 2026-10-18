@@ -1,0 +1,9 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Unibrow Test Shop – Check your email</title><style>body { font: 16px system-ui, sans-serif; max-width: 520px; margin: 32px auto; padding: 0 16px; background: #fff; color: #1b2733; } input, button { font: inherit; padding: 8px; } .boxes input { width: 2.2em; text-align: center; } output { display: block; font-weight: 600; margin-top: 10px; }</style></head>
+<body>
+  <h1>Check your email</h1>
+  <p>We emailed a 6-digit sign-in code to a••@example.com. Enter it below to finish signing in.</p>
+  <label for="code">Sign-in code</label>
+  <input id="code" name="otp" autocomplete="one-time-code" inputmode="numeric">
+  <button onclick="document.getElementById('out').textContent = document.getElementById('code').value === '482913' ? 'SIGNED IN: welcome back' : 'That code is wrong'">Continue</button>
+  <output id="out"></output>
+</body></html>

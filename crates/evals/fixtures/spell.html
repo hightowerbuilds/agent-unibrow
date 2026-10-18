@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Spelling test</title>
+<style>
+  body { font: 18px/1.5 system-ui, sans-serif; margin: 0; padding: 20px; }
+  textarea { font: 20px/1.4 sans-serif; width: 600px; height: 120px; padding: 8px; margin: 0; }
+</style>
+</head>
+<body>
+<textarea id="note" autofocus spellcheck="true">Thiss sentense has a speling mistake.</textarea>
+<p id="out"></p>
+<p id="idle"></p>
+<script>
+  const t = document.getElementById('note');
+  t.focus();
+  t.setSelectionRange(t.value.length, t.value.length);
+  // ?next=URL: go there after 6 seconds (a fresh page, e.g. on another site).
+  const next = new URLSearchParams(location.search).get('next');
+  if (next) setTimeout(() => { location.href = next; }, 6000);
+  // ?type=SECS: type more text that long after loading, as the user would.
+  const typeAfter = Number(new URLSearchParams(location.search).get('type') || 0);
+  if (typeAfter) setTimeout(() => {
+    t.focus();
+    t.setSelectionRange(t.value.length, t.value.length);
+    document.execCommand('insertText', false, ' Anothr wrod here.');
+  }, typeAfter * 1000);
+  // Whether the page gets idle time (the spellchecker runs in it).
+  let idles = 0;
+  const tick = () => { idles++; document.getElementById('idle').textContent = 'idle callbacks: ' + idles; setTimeout(() => requestIdleCallback(tick), 500); };
+  requestIdleCallback(tick);
+  t.addEventListener('input', () => { document.getElementById('out').textContent = 'Now: ' + t.value; });
+</script>
+</body>
+</html>

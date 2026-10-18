@@ -16,7 +16,7 @@ use gpui::EventEmitter;
 use rail_browser::bridge::Rect;
 use rail_browser::bridge::{TabInfo, TabOp};
 use rail_browser::{
-    ContextMenuInfo, Cursor, DialogInfo, EditCommand, KeyInput, Modifiers, NavAction, Request, WebView,
+    ContextMenuInfo, Cursor, DialogInfo, EditCommand, KeyInput, Modifiers, NavAction, Request, Visibility, WebView,
     normalize_address, zoom_factor, zoom_level_for,
 };
 use std::cell::Cell;
@@ -102,6 +102,8 @@ struct Chrome {
     permission: Option<rail_browser::permissions::PermissionPrompt>,
     /// The page is this tab's reader view of this address.
     reader_of: Option<String>,
+    /// An element of the page (a video) is fullscreen.
+    fullscreen: bool,
 }
 
 impl Chrome {
@@ -113,6 +115,10 @@ impl Chrome {
 
 /// History or focus changed (a visit was recorded, focus toggled).
 pub struct BrowsingChanged;
+
+/// A page's video went fullscreen or came back: the shell hides or shows
+/// everything around the page.
+pub struct FullscreenChanged;
 
 /// The user wants the agent to stop: the Stop button, or they started
 /// using the page themselves while the agent was driving it.
@@ -141,10 +147,50 @@ const BG_PAGE_MAX_AGE: Duration = Duration::from_secs(300);
 /// Background pages lay out like a desktop window, whatever the pane size.
 const BG_PAGE_SIZE: (i32, i32) = (1280, 900);
 
+/// A verification code on screen, and what happened to it.
+struct CodeShown {
+    card: rail_browser::bridge::CodeCard,
+    shown: Instant,
+    /// "Copied", "Filled in", "No code field found"…
+    status: Option<String>,
+}
+
+/// The longest a code stays on screen.
+const CODE_CARD_FOR: Duration = Duration::from_secs(10 * 60);
+
+/// Fills a page's verification-code field: one field, or a row of
+/// one-digit boxes. Values are set the way typing would (input and change
+/// events) so the page's own scripts see them.
+const FILL_CODE_JS: &str = r#"(function (code) {
+  const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const skip = ['hidden', 'password', 'submit', 'button', 'checkbox', 'radio', 'file', 'email'];
+  const inputs = Array.from(document.querySelectorAll('input')).filter(i => vis(i) && !skip.includes(i.type) && !i.disabled);
+  const set = (el, v) => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+  const boxes = inputs.filter(i => i.maxLength === 1);
+  if (boxes.length >= code.length) {
+    code.split('').forEach((c, k) => { boxes[k].focus(); set(boxes[k], c); });
+    return 'boxes';
+  }
+  const hint = i => [i.autocomplete, i.name, i.id, i.placeholder, i.getAttribute('aria-label')].join(' ');
+  const field = inputs.find(i => /one-time-code/i.test(i.autocomplete))
+    || inputs.find(i => /otp|code|verif|passcode|pin|token/i.test(hint(i)))
+    || (document.activeElement && document.activeElement.tagName === 'INPUT' ? document.activeElement : null);
+  if (!field) return 'none';
+  field.focus();
+  set(field, code);
+  return 'field';
+})"#;
+
 /// One open tab: its own Chromium page and toolbar state.
 struct Tab {
     id: u32,
     view: WebView,
+    /// A popup window (`window.open`) and the tab whose page opened it.
+    opener: Option<u32>,
     chrome: Chrome,
     favicon: Option<Arc<RenderImage>>,
     favicon_seq: u64,
@@ -155,6 +201,9 @@ struct Tab {
     audio: Audio,
     /// The reader view this tab last opened.
     reader: Option<Reader>,
+    /// The page the tab opened on is in history (later ones are recorded
+    /// as the address changes).
+    recorded: bool,
 }
 
 /// A tab's sound indicator.
@@ -169,6 +218,32 @@ struct Audio {
 struct Reader {
     data_url: String,
     source: String,
+}
+
+/// The tab the agent's browser tools act on, when it isn't simply the
+/// active tab (roadmap 3.1).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AgentTab {
+    id: u32,
+    /// The agent chose it (a background tab it opened or picked), so it
+    /// stays the agent's tab after the turn. Otherwise it's the tab the
+    /// agent started the turn in, kept for the turn so the user can switch
+    /// away and keep browsing while the agent finishes there.
+    chosen: bool,
+}
+
+/// How long Back or Forward must be held to show the tab's history.
+const LONG_PRESS: Duration = Duration::from_millis(450);
+/// Most entries in the Back/Forward history list.
+const NAV_MENU_ITEMS: usize = 15;
+const NAV_MENU_WIDTH: f32 = 320.0;
+
+/// The tab's history under Back or Forward (right click or long press, 3.3).
+struct NavMenu {
+    back: bool,
+    tab_id: u32,
+    /// (history index, label), nearest first.
+    items: Vec<(usize, String)>,
 }
 
 /// The app's context menu, open over a tab's page.
@@ -194,12 +269,30 @@ enum MenuCmd {
     Paste,
     SelectAll,
     SavePdf,
+    SaveScreenshot,
     ViewSource,
+    /// Replace the misspelled word with suggestion n.
+    Replace(u8),
+    AddToDictionary,
 }
 
+/// Most spelling suggestions shown.
+const MAX_SUGGESTIONS: usize = 5;
+
 /// The context menu for what was right-clicked: `None` is a separator.
-fn menu_entries(info: &ContextMenuInfo, chrome: &Chrome) -> Vec<Option<(&'static str, bool, MenuCmd)>> {
-    let mut out = Vec::new();
+fn menu_entries(info: &ContextMenuInfo, chrome: &Chrome) -> Vec<Option<(SharedString, bool, MenuCmd)>> {
+    let mut out: Vec<Option<(SharedString, bool, MenuCmd)>> = Vec::new();
+    if info.editable && !info.misspelled_word.is_empty() {
+        if info.suggestions.is_empty() {
+            out.push(Some(("No spelling suggestions".into(), false, MenuCmd::Replace(0))));
+        }
+        for (i, s) in info.suggestions.iter().take(MAX_SUGGESTIONS).enumerate() {
+            out.push(Some((s.clone().into(), true, MenuCmd::Replace(i as u8))));
+        }
+        out.push(Some(("Add to dictionary".into(), true, MenuCmd::AddToDictionary)));
+        out.push(None);
+    }
+    let mut out = MenuList(out);
     if !info.link_url.is_empty() {
         out.push(Some(("Open link in new tab", true, MenuCmd::OpenLink)));
         out.push(Some(("Copy link address", true, MenuCmd::CopyLink)));
@@ -229,9 +322,32 @@ fn menu_entries(info: &ContextMenuInfo, chrome: &Chrome) -> Vec<Option<(&'static
         out.push(Some(("Select all", true, MenuCmd::SelectAll)));
     }
     out.push(Some(("Save page as PDF", true, MenuCmd::SavePdf)));
+    out.push(Some(("Save screenshot", true, MenuCmd::SaveScreenshot)));
     let is_web = chrome.url.starts_with("http://") || chrome.url.starts_with("https://");
     out.push(Some(("View page source", is_web, MenuCmd::ViewSource)));
-    out
+    out.0
+}
+
+/// Menu entries being built; takes `&'static str` labels as well.
+struct MenuList(Vec<Option<(SharedString, bool, MenuCmd)>>);
+
+impl MenuList {
+    fn push(&mut self, e: Option<(&'static str, bool, MenuCmd)>) {
+        self.0.push(e.map(|(l, on, c)| (l.into(), on, c)));
+    }
+}
+
+/// Where a new tab goes: (shown to the user, becomes the agent's tab).
+/// Opened in the foreground by the agent's tab, it becomes the agent's tab
+/// (the agent follows what it opened), shown only if the agent's tab was:
+/// the agent working in the background never takes over the screen.
+/// Otherwise it opens as asked.
+fn placement(from_agent: bool, from_active: bool, foreground: bool) -> (bool, bool) {
+    if from_agent && foreground {
+        (from_active, true)
+    } else {
+        (foreground && (from_active || !from_agent), false)
+    }
 }
 
 /// A free file name in the downloads folder for a PDF of the page `title`.
@@ -268,8 +384,8 @@ pub struct BrowserPane {
     store: Arc<Browsing>,
     /// Requests from agent tools (DevTools commands, navigation, highlights).
     requests: async_channel::Receiver<Request>,
-    /// The element the agent is about to act on.
-    highlight: Option<(Rect, String, Instant)>,
+    /// The element the agent is about to act on, in which tab.
+    highlight: Option<(u32, Rect, String, Instant)>,
     /// An agent turn is running.
     agent_busy: bool,
     /// ...and it has used the browser during this turn.
@@ -277,6 +393,16 @@ pub struct BrowserPane {
     tabs: Vec<Tab>,
     background: Vec<BgPage>,
     active: usize,
+    /// The tab the agent works in, if not the active one (3.1).
+    agent_tab: Option<AgentTab>,
+    /// The user closed the tab the agent was working in this turn: its
+    /// page requests fail until it picks a tab, rather than land in the
+    /// user's tab.
+    agent_tab_gone: bool,
+    /// Back/Forward history list (3.3), and a press that may become a long press.
+    nav_menu: Option<NavMenu>,
+    nav_press: Option<(bool, Instant)>,
+    nav_long_fired: bool,
     next_tab_id: u32,
     /// Page size and scale every tab is laid out at.
     size: Option<(i32, i32, f32)>,
@@ -302,6 +428,8 @@ pub struct BrowserPane {
     /// A short notice over the page (blocked permission requests).
     notice: Option<(String, Instant)>,
     handoff: Option<Handoff>,
+    /// A verification code from the user's email, shown for them to paste (5.2).
+    code_card: Option<CodeShown>,
     /// Zoom levels the user set this session, by site.
     site_zoom: HashMap<String, f64>,
     /// Ctrl+wheel distance not yet turned into a zoom step.
@@ -314,14 +442,24 @@ pub struct BrowserPane {
     test_next: Instant,
     /// `shot:<name>`: the next page frame is saved under the data dir.
     test_shot: Option<String>,
+    /// `agentshot:<name>`: the same for the agent's tab, shown or not.
+    test_agent_shot: Option<String>,
+    /// "Save screenshot": the next page frame goes to this PNG.
+    save_shot: Option<std::path::PathBuf>,
     /// The active tab's site asked for an HTTP sign-in.
     auth: Option<AuthPrompt>,
+    /// The page fills the window (a fullscreen video): no tabs, toolbar
+    /// or sidebar. `window_fullscreened` says we also made the window
+    /// fullscreen, so leaving puts it back.
+    fullscreen: bool,
+    window_fullscreened: bool,
     page_focus: FocusHandle,
     _pump: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl EventEmitter<BrowsingChanged> for BrowserPane {}
+impl EventEmitter<FullscreenChanged> for BrowserPane {}
 impl EventEmitter<AgentControl> for BrowserPane {}
 
 impl BrowserPane {
@@ -392,6 +530,11 @@ impl BrowserPane {
             tabs: Vec::new(),
             background: Vec::new(),
             active: 0,
+            agent_tab: None,
+            agent_tab_gone: false,
+            nav_menu: None,
+            nav_press: None,
+            nav_long_fired: false,
             next_tab_id: 1,
             size: None,
             unavailable: cef.err(),
@@ -410,6 +553,7 @@ impl BrowserPane {
             downloads_open: false,
             notice: None,
             handoff: None,
+            code_card: None,
             site_zoom: HashMap::new(),
             zoom_wheel: 0.0,
             menu: None,
@@ -419,7 +563,11 @@ impl BrowserPane {
                 .unwrap_or_default(),
             test_next: Instant::now() + Duration::from_secs(2),
             test_shot: None,
+            test_agent_shot: None,
+            save_shot: None,
             auth: None,
+            fullscreen: false,
+            window_fullscreened: false,
             page_focus,
             _pump: pump,
             _subscriptions: subscriptions,
@@ -454,54 +602,112 @@ impl BrowserPane {
             self.applied = wanted;
         }
 
-        // Links that asked for new tabs.
+        // Links that asked for new tabs, popup windows pages opened, and
+        // pages that closed themselves (a sign-in popup that's done).
         let mut opens = Vec::new();
+        let mut popups = Vec::new();
+        let mut closed = Vec::new();
         for t in &self.tabs {
-            opens.extend(t.view.take_new_tab_requests());
+            opens.extend(t.view.take_new_tab_requests().into_iter().map(|(url, fg)| (t.id, url, fg)));
+            popups.extend(t.view.take_new_popups().into_iter().map(|v| (t.id, v)));
+            if t.view.closed_by_page() {
+                closed.push(t.id);
+            }
         }
-        for (url, foreground) in opens {
-            let _ = self.open_tab(&url, foreground, cx);
+        for (from, url, foreground) in opens {
+            let _ = self.open_tab_from(from, &url, foreground, cx);
         }
+        for (opener, view) in popups {
+            self.adopt_popup(opener, view, cx);
+        }
+        for id in closed {
+            if let Some(i) = self.index_of(id) {
+                eprintln!("pane: tab {id} closed itself ({})", self.tabs[i].chrome.url);
+                self.close_tab(i, cx);
+            }
+        }
+        self.sync_visibility();
 
         let mut changed = false;
         let mut tab_ops: Vec<(TabOp, rail_browser::bridge::Reply<Vec<TabInfo>>)> = Vec::new();
-        let Some(view) = self.tabs.get(self.active).map(|t| &t.view) else { return };
+        // Asked for the user's attention (a handoff): show the agent's tab.
+        let mut bring_forward = false;
         while let Ok(req) = self.requests.try_recv() {
-            if self.agent_busy && !self.agent_driving && !req.is_background() {
-                self.agent_driving = true;
-                changed = true;
+            if self.agent_busy && !req.is_background() {
+                if !self.agent_driving {
+                    self.agent_driving = true;
+                    changed = true;
+                }
+                // The agent keeps the tab it started in for the turn, even
+                // if the user switches tabs meanwhile.
+                if self.agent_tab.is_none() && !self.agent_tab_gone {
+                    if let Some(t) = self.tabs.get(self.active) {
+                        self.agent_tab = Some(AgentTab { id: t.id, chosen: false });
+                    }
+                }
             }
+            // The tab the agent's page requests go to.
+            let target = if self.agent_tab_gone { None } else { self.agent_index() };
+            let gone = || {
+                if self.agent_tab_gone {
+                    "The tab you were working in was closed. Use browser_tabs to list the tabs and pick one.".to_string()
+                } else {
+                    "No tab is open.".to_string()
+                }
+            };
+            let view = target.map(|i| &self.tabs[i].view);
             match req {
-                Request::Cdp { method, params, reply } => view.cdp(&method, params, reply),
+                Request::Cdp { method, params, reply } => match view {
+                    Some(view) => view.cdp(&method, params, reply),
+                    None => {
+                        let _ = reply.send(Err(gone()));
+                    }
+                },
                 Request::Navigate { url, reply } => {
-                    view.navigate(&url);
-                    let _ = reply.send(Ok(()));
+                    let r = view.map(|v| v.navigate(&url)).ok_or_else(gone);
+                    let _ = reply.send(r);
                 }
                 Request::Nav { action, reply } => {
-                    match action {
-                        NavAction::Back => view.go_back(),
-                        NavAction::Forward => view.go_forward(),
-                        NavAction::Reload => view.reload(),
-                    }
-                    let _ = reply.send(Ok(()));
+                    let r = view
+                        .map(|view| match action {
+                            NavAction::Back => view.go_back(),
+                            NavAction::Forward => view.go_forward(),
+                            NavAction::Reload => view.reload(),
+                        })
+                        .ok_or_else(gone);
+                    let _ = reply.send(r);
                 }
                 Request::State { reply } => {
-                    let _ = reply.send(Ok(view.page_state()));
+                    let r = match (view, target) {
+                        (Some(view), Some(i)) => {
+                            let mut st = view.page_state();
+                            st.tab_note = self.tab_note(i);
+                            Ok(st)
+                        }
+                        _ => Err(gone()),
+                    };
+                    let _ = reply.send(r);
                 }
                 Request::Highlight { rect, label } => {
                     debug(|| {
-                        let z = self.tabs.get(self.active).map(|t| zoom_factor(t.zoom)).unwrap_or(1.0);
+                        let z = target.map(|i| zoom_factor(self.tabs[i].zoom)).unwrap_or(1.0);
                         format!(
                             "highlight {label:?} css ({:.0},{:.0} {:.0}x{:.0}) drawn at ({:.0},{:.0} {:.0}x{:.0}) zoom {:.0}%",
                             rect.x, rect.y, rect.width, rect.height,
                             rect.x * z, rect.y * z, rect.width * z, rect.height * z, z * 100.0
                         )
                     });
-                    self.highlight = Some((rect, label, Instant::now()));
-                    changed = true;
+                    if let Some(i) = target {
+                        self.highlight = Some((self.tabs[i].id, rect, label, Instant::now()));
+                        changed = true;
+                    }
                 }
                 Request::Dialog { accept, text, reply } => {
-                    let r = if view.answer_dialog(accept, text.as_deref()) { Ok(()) } else { Err("No dialog is open.".into()) };
+                    let r = match view {
+                        Some(view) if view.answer_dialog(accept, text.as_deref()) => Ok(()),
+                        Some(_) => Err("No dialog is open.".into()),
+                        None => Err(gone()),
+                    };
                     let _ = reply.send(r);
                     changed = true;
                 }
@@ -510,13 +716,18 @@ impl BrowserPane {
                     let all: Vec<_> = self.tabs.iter().flat_map(|t| t.view.downloads()).collect();
                     let _ = reply.send(Ok(all));
                 }
-                Request::SavePdf { path, done } => view.print_to_pdf(&path, done),
+                Request::SavePdf { path, done } => {
+                    if let Some(view) = view {
+                        view.print_to_pdf(&path, done);
+                    }
+                }
                 Request::BgOpen { url, reply } => {
                     let r = if self.background.len() >= MAX_BG_PAGES {
                         Err(format!("{MAX_BG_PAGES} background pages are already open; wait for those to finish."))
                     } else {
                         WebView::create(&url, BG_PAGE_SIZE.0, BG_PAGE_SIZE.1, 1.0).map(|view| {
                             view.set_hidden(true);
+                            view.refuse_popups();
                             let id = self.next_tab_id;
                             self.next_tab_id += 1;
                             self.background.push(BgPage { id, view, opened: Instant::now() });
@@ -542,6 +753,11 @@ impl BrowserPane {
                         changed = true;
                     }
                 }
+                Request::ShowCode { card } => {
+                    self.code_card = Some(CodeShown { card, shown: Instant::now(), status: None });
+                    bring_forward = true;
+                    changed = true;
+                }
                 Request::Handoff { message, reply } => {
                     // Test hook: finish handoffs automatically.
                     let auto = std::env::var("UNIBROW_AUTOHANDOFF").ok();
@@ -552,6 +768,7 @@ impl BrowserPane {
                             let _ = old.send(Ok(false));
                         }
                         self.handoff = Some(Handoff { message, reply: Some(reply) });
+                        bring_forward = true;
                         changed = true;
                     }
                 }
@@ -561,6 +778,13 @@ impl BrowserPane {
             let r = self.apply_tab_op(op, cx).map(|_| self.tab_infos());
             let _ = reply.send(r);
             changed = true;
+        }
+        // The user is needed on the page the agent works in: show it.
+        if bring_forward {
+            if let Some(i) = self.agent_index().filter(|i| *i != self.active) {
+                debug(|| format!("handoff: showing the agent's tab {}", self.tabs[i].id));
+                self.activate(i, cx);
+            }
         }
         // Background pages: nobody is there to answer dialogs, pickers or
         // popups, so turn them down; close pages a tool left behind.
@@ -586,7 +810,7 @@ impl BrowserPane {
         let before = self.background.len();
         self.background.retain(|p| p.opened.elapsed() < BG_PAGE_MAX_AGE);
         changed |= before != self.background.len();
-        if self.highlight.as_ref().is_some_and(|(_, _, at)| at.elapsed() > HIGHLIGHT_FOR) {
+        if self.highlight.as_ref().is_some_and(|(_, _, _, at)| at.elapsed() > HIGHLIGHT_FOR) {
             self.highlight = None;
             changed = true;
         }
@@ -620,9 +844,22 @@ impl BrowserPane {
             self.notice = Some((format!("Blocked: {last}"), Instant::now()));
             changed = true;
         }
+        if self.code_card.as_ref().is_some_and(|c| c.shown.elapsed() > CODE_CARD_FOR) {
+            self.code_card = None;
+            changed = true;
+        }
         if self.notice.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(6)) {
             self.notice = None;
             changed = true;
+        }
+        // Test hook: a frame of the agent's tab, wherever it is.
+        if let Some(i) = self.test_agent_shot.as_ref().and_then(|_| self.agent_index()) {
+            let view = &self.tabs[i].view;
+            let frame = if i == self.active { None } else { view.take_frame() };
+            if let (Some(frame), Some(name)) = (frame, self.test_agent_shot.as_ref()) {
+                save_ppm(&rail_browser::data_dir().join(format!("{name}.ppm")), &frame);
+                self.test_agent_shot = None;
+            }
         }
         let Some(view) = self.tabs.get(self.active).map(|t| &t.view) else { return };
         let seq = view.state().frame_seq;
@@ -631,6 +868,9 @@ impl BrowserPane {
             if let Some(frame) = view.take_frame() {
                 if let Some(name) = self.test_shot.take() {
                     save_ppm(&rail_browser::data_dir().join(format!("{name}.ppm")), &frame);
+                }
+                if let Some(path) = self.save_shot.take() {
+                    Self::save_screenshot(path, &frame, cx);
                 }
                 if let Some(buf) = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra) {
                     // GPUI images are BGRA, which is what Chromium paints.
@@ -682,10 +922,19 @@ impl BrowserPane {
                     crashed: s.crashed.clone(),
                     unresponsive: s.unresponsive,
                     auth: s.auth.clone(),
+                    fullscreen: s.fullscreen,
                 }
             };
+            // The first page's address doesn't change from what the tab was
+            // opened with: record it once it has a title or has loaded.
+            let first_page = !t.recorded && (!chrome.title.is_empty() || (!chrome.loading && chrome != t.chrome));
+            if first_page {
+                t.recorded = true;
+                browsing_changed |= self.store.record_visit(&chrome.url, &chrome.title);
+            }
             if chrome != t.chrome {
                 if chrome.url != t.chrome.url {
+                    t.recorded = true;
                     browsing_changed |= self.store.record_visit(&chrome.url, &chrome.title);
                 } else if chrome.title != t.chrome.title && !chrome.title.is_empty() {
                     self.store.update_title(&chrome.url, &chrome.title);
@@ -718,6 +967,7 @@ impl BrowserPane {
                 }
                 self.chrome = active;
                 changed = true;
+                self.follow_fullscreen(cx);
             }
         }
         if changed {
@@ -731,6 +981,7 @@ impl BrowserPane {
         let mut changed = false;
         let now = Instant::now();
         let mut audio_checks = Vec::new();
+        let mut icons_saved = false;
         for t in self.tabs.iter_mut() {
             // Zoom: the level the user chose for this site this session.
             // Re-applied when Chromium resets it (a navigation to another site).
@@ -755,6 +1006,15 @@ impl BrowserPane {
                 t.favicon_seq = seq;
                 let icon = t.view.take_favicon();
                 debug(|| format!("tab {} favicon {:?}", t.id, icon.as_ref().map(|f| (f.width, f.height))));
+                // Kept per site for the History and Bookmarks lists.
+                if let Some(f) = &icon {
+                    let url = t.view.state().url.clone();
+                    let saved = browsing::Favicon { width: f.width, height: f.height, bgra: f.bgra.clone() };
+                    if self.store.save_favicon(&url, saved) {
+                        debug(|| format!("saved the favicon of {url}"));
+                        icons_saved = true;
+                    }
+                }
                 if let Some(old) = std::mem::replace(&mut t.favicon, icon.and_then(render_image)) {
                     self.retired.push(old);
                 }
@@ -782,6 +1042,9 @@ impl BrowserPane {
                 t.audio.last_check = Some(now);
                 audio_checks.push((t.id, t.view.evaluate(AUDIO_JS)));
             }
+        }
+        if icons_saved {
+            cx.emit(BrowsingChanged);
         }
         for (id, rx) in audio_checks {
             cx.spawn(async move |this, cx| {
@@ -853,16 +1116,90 @@ impl BrowserPane {
         self.tabs.get(self.active).map(|t| &t.view)
     }
 
+    /// Index of the tab the agent's browser tools act on: its own tab, or
+    /// the active one.
+    fn agent_index(&self) -> Option<usize> {
+        self.agent_tab
+            .and_then(|a| self.index_of(a.id))
+            .or_else(|| (self.active < self.tabs.len()).then_some(self.active))
+    }
+
+    /// The agent is working in a tab the user isn't looking at.
+    fn agent_in_background(&self) -> bool {
+        self.agent_tab.and_then(|a| self.index_of(a.id)).is_some_and(|i| i != self.active)
+    }
+
+    /// The tab to mark in the tab strip as the agent's, if any.
+    fn agent_marked(&self) -> Option<u32> {
+        let working = self.agent_busy && self.agent_driving;
+        let chosen = self.agent_tab.is_some_and(|a| a.chosen);
+        if working || chosen { self.agent_index().map(|i| self.tabs[i].id) } else { None }
+    }
+
+    /// What the agent should know about the tab it works in: that the user
+    /// is looking at another one, or that it's a popup.
+    fn tab_note(&self, i: usize) -> Option<String> {
+        let t = self.tabs.get(i)?;
+        let mut notes = Vec::new();
+        if i != self.active {
+            let user = self.tabs.get(self.active).map(|u| {
+                let name = if u.chrome.title.is_empty() { u.chrome.url.clone() } else { u.chrome.title.clone() };
+                format!("tab {} (“{name}”)", u.id)
+            });
+            notes.push(format!(
+                "Tab {}: you're working in this tab in the background; the user is looking at {}.",
+                t.id,
+                user.unwrap_or_else(|| "another tab".into())
+            ));
+        }
+        if let Some(o) = t.opener {
+            notes.push(format!(
+                "This tab is a popup window opened by tab {o}, and can pass its result back to it. It closes \
+                 itself when it's done; you're then back in tab {o}."
+            ));
+        }
+        (!notes.is_empty()).then(|| notes.join(" "))
+    }
+
+    /// The active tab is shown; the agent's tab, while it works there,
+    /// stays live off screen; every other tab is hidden.
+    fn sync_visibility(&self) {
+        let working = if self.agent_busy { self.agent_index() } else { None };
+        for (i, t) in self.tabs.iter().enumerate() {
+            let v = if i == self.active {
+                Visibility::Shown
+            } else if Some(i) == working {
+                Visibility::Working
+            } else {
+                Visibility::Hidden
+            };
+            if t.view.visibility() != v {
+                debug(|| format!("tab {} is now {v:?}", t.id));
+            }
+            t.view.set_visibility(v);
+        }
+    }
+
     /// Opens a tab at `url`. Background tabs start hidden.
     fn open_tab(&mut self, url: &str, activate: bool, cx: &mut Context<Self>) -> Result<u32, String> {
         let (w, h, scale) = self.size.ok_or("The browser isn't laid out yet.")?;
         let view = WebView::create(url, w, h, scale)?;
+        Ok(self.add_tab(view, url, activate, None, cx))
+    }
+
+    /// Adds a tab for `view`. `agent` makes it the agent's tab (with
+    /// whether the agent chose it), before it's shown or hidden.
+    fn add_tab(&mut self, view: WebView, url: &str, activate: bool, agent: Option<bool>, cx: &mut Context<Self>) -> u32 {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
+        if let Some(chosen) = agent {
+            self.agent_tab = Some(AgentTab { id, chosen });
+        }
         let chrome = Chrome { url: url.to_string(), ..Default::default() };
         self.tabs.push(Tab {
             id,
             view,
+            opener: None,
             chrome,
             favicon: None,
             favicon_seq: 0,
@@ -870,29 +1207,95 @@ impl BrowserPane {
             zoom_asked: None,
             audio: Audio::default(),
             reader: None,
+            recorded: false,
         });
         if activate {
             self.activate(self.tabs.len() - 1, cx);
         } else {
-            self.tabs.last().expect("just pushed").view.set_hidden(true);
+            self.sync_visibility();
             cx.notify();
         }
+        id
+    }
+
+    /// Where a tab opened by tab `from` goes; see [`placement`].
+    fn placement_for(&self, from: u32, foreground: bool) -> (bool, bool) {
+        let from_agent = self.agent_tab.is_some_and(|a| a.id == from);
+        let from_active = self.tabs.get(self.active).is_some_and(|t| t.id == from);
+        placement(from_agent, from_active, foreground)
+    }
+
+    /// A link on tab `from` asked for a new tab.
+    fn open_tab_from(&mut self, from: u32, url: &str, foreground: bool, cx: &mut Context<Self>) -> Result<u32, String> {
+        let (show, follow) = self.placement_for(from, foreground);
+        let (w, h, scale) = self.size.ok_or("The browser isn't laid out yet.")?;
+        let view = WebView::create(url, w, h, scale)?;
+        let agent = self.agent_tab.filter(|_| follow).map(|a| a.chosen);
+        let id = self.add_tab(view, url, show, agent, cx);
+        debug(|| format!("tab {id} opened from tab {from} ({url}) shown {show} agent's {follow}"));
         Ok(id)
+    }
+
+    /// A page asked for a new window and Chromium created it with that
+    /// page as its would-be opener (3.2). It becomes a tab, marked as the
+    /// page's popup once the new page confirms it has a `window.opener`:
+    /// links (`target=_blank`, which implies `noopener`) come this way too
+    /// and stay plain tabs.
+    fn adopt_popup(&mut self, opener: u32, view: WebView, cx: &mut Context<Self>) {
+        let Some((w, h, scale)) = self.size else { return };
+        view.resize(w, h, scale);
+        let url = view.state().url.clone();
+        let (show, follow) = self.placement_for(opener, true);
+        let agent = self.agent_tab.filter(|_| follow).map(|a| a.chosen);
+        let id = self.add_tab(view, &url, show, agent, cx);
+        eprintln!("pane: tab {id} opened by tab {opener} ({url}) shown {show} agent's {follow}");
+        self.check_opener(id, opener, 0, cx);
+    }
+
+    /// Asks the new page whether it has an opener; marks it as a popup if so.
+    fn check_opener(&mut self, id: u32, opener: u32, attempt: u32, cx: &mut Context<Self>) {
+        let Some(t) = self.tabs.iter().find(|t| t.id == id) else { return };
+        let rx = t.view.evaluate("window.opener !== null");
+        cx.spawn(async move |this, cx| {
+            let answer = rx.await.ok().and_then(Result::ok).and_then(|v| v["result"]["value"].as_bool());
+            if answer.is_none() {
+                cx.background_executor().timer(Duration::from_millis(300)).await;
+            }
+            let _ = this.update(cx, |pane, cx| match answer {
+                Some(true) => {
+                    let alive = pane.index_of(opener).is_some();
+                    if let Some(t) = pane.tabs.iter_mut().find(|t| t.id == id) {
+                        t.opener = alive.then_some(opener);
+                        eprintln!("pane: tab {id} is a popup of tab {opener} (it has window.opener)");
+                        cx.notify();
+                    }
+                }
+                Some(false) => eprintln!("pane: tab {id} has no opener: a plain tab"),
+                None if attempt < 10 => pane.check_opener(id, opener, attempt + 1, cx),
+                None => eprintln!("pane: couldn't tell whether tab {id} has an opener"),
+            });
+        })
+        .detach();
     }
 
     fn activate(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.tabs.len() {
             return;
         }
+        // Leaving a tab ends its fullscreen video.
         if index != self.active {
             if let Some(old) = self.tabs.get(self.active) {
-                old.view.set_hidden(true);
+                if old.view.is_fullscreen() {
+                    old.view.exit_fullscreen();
+                }
             }
         }
         self.close_menu(cx);
+        self.nav_menu = None;
         self.active = index;
+        self.sync_visibility();
         let tab = &self.tabs[index];
-        tab.view.set_hidden(false);
+        debug(|| format!("activate tab {}", tab.id));
         // Show the new tab's next frame, not the old tab's last one.
         if let Some(old) = self.image.take() {
             self.retired.push(old);
@@ -902,6 +1305,7 @@ impl BrowserPane {
         }
         self.last_seq = u64::MAX;
         self.chrome = tab.chrome.clone();
+        self.follow_fullscreen(cx);
         if !self.editing_address {
             let url = self.chrome.shown_url();
             self.address.update(cx, |a, cx| a.set_text(&url, cx));
@@ -914,10 +1318,25 @@ impl BrowserPane {
             return;
         }
         let closing_active = index == self.active;
-        if self.menu.as_ref().is_some_and(|m| m.tab_id == self.tabs[index].id) {
+        let (id, opener) = (self.tabs[index].id, self.tabs[index].opener);
+        if self.menu.as_ref().is_some_and(|m| m.tab_id == id) {
             self.close_menu(cx);
         }
+        if self.nav_menu.as_ref().is_some_and(|m| m.tab_id == id) {
+            self.nav_menu = None;
+        }
         self.tabs.remove(index); // dropping the WebView closes its page
+        // A popup that closes hands the agent back to the page that opened
+        // it. Any other tab the agent was working in is gone for this turn.
+        if self.agent_tab.is_some_and(|a| a.id == id) {
+            match opener.filter(|o| self.index_of(*o).is_some()) {
+                Some(o) => self.agent_tab = self.agent_tab.map(|a| AgentTab { id: o, ..a }),
+                None => {
+                    self.agent_tab = None;
+                    self.agent_tab_gone = self.agent_busy;
+                }
+            }
+        }
         if self.tabs.is_empty() {
             let _ = self.open_tab(HOME, true, cx);
             return;
@@ -926,8 +1345,11 @@ impl BrowserPane {
             self.active = self.active.saturating_sub(1);
         }
         if closing_active {
-            self.activate(self.active, cx);
+            // Closing a popup returns to the page that opened it.
+            let next = opener.and_then(|o| self.index_of(o)).unwrap_or(self.active);
+            self.activate(next, cx);
         }
+        self.sync_visibility();
         cx.notify();
     }
 
@@ -936,26 +1358,53 @@ impl BrowserPane {
     }
 
     fn apply_tab_op(&mut self, op: TabOp, cx: &mut Context<Self>) -> Result<(), String> {
-        match op {
+        // Any tab choice settles where the agent works.
+        let picks = !matches!(op, TabOp::List | TabOp::Close { .. });
+        let r = match op {
             TabOp::List => Ok(()),
-            TabOp::New { url } => {
+            TabOp::New { url, background } => {
                 let url = url.map(|u| normalize_address(&u)).unwrap_or_else(|| HOME.to_string());
-                self.open_tab(&url, true, cx).map(|_| ())
+                let (w, h, scale) = self.size.ok_or("The browser isn't laid out yet.")?;
+                let view = WebView::create(&url, w, h, scale)?;
+                // A background tab is the agent's own; a shown one is
+                // simply the active tab, which the agent follows.
+                if !background {
+                    self.agent_tab = None;
+                }
+                self.add_tab(view, &url, !background, background.then_some(true), cx);
+                Ok(())
             }
             TabOp::Switch { id } => {
                 let i = self.index_of(id).ok_or_else(|| format!("No tab {id}."))?;
+                self.agent_tab = None;
                 self.activate(i, cx);
+                Ok(())
+            }
+            TabOp::Use { id } => {
+                let i = self.index_of(id).ok_or_else(|| format!("No tab {id}."))?;
+                self.agent_tab = Some(AgentTab { id, chosen: i != self.active });
                 Ok(())
             }
             TabOp::Close { id } => {
                 let i = self.index_of(id).ok_or_else(|| format!("No tab {id}."))?;
+                let own = self.agent_tab.is_some_and(|a| a.id == id);
                 self.close_tab(i, cx);
+                // The agent closed its own tab: it's back in the active one.
+                if own {
+                    self.agent_tab_gone = false;
+                }
                 Ok(())
             }
+        };
+        if picks && r.is_ok() {
+            self.agent_tab_gone = false;
         }
+        self.sync_visibility();
+        r
     }
 
     fn tab_infos(&self) -> Vec<TabInfo> {
+        let agent = if self.agent_tab_gone { None } else { self.agent_index() };
         self.tabs
             .iter()
             .enumerate()
@@ -964,6 +1413,8 @@ impl BrowserPane {
                 title: t.chrome.title.clone(),
                 url: t.chrome.url.clone(),
                 active: i == self.active,
+                agent: Some(i) == agent,
+                opener: t.opener,
             })
             .collect()
     }
@@ -1114,6 +1565,13 @@ impl BrowserPane {
                 None => view.edit(EditCommand::Paste),
             },
             MenuCmd::SelectAll => view.edit(EditCommand::SelectAll),
+            MenuCmd::Replace(i) => {
+                if let Some(word) = info.suggestions.get(i as usize) {
+                    debug(|| format!("replace {:?} with {word:?}", info.misspelled_word));
+                    view.replace_misspelling(word);
+                }
+            }
+            MenuCmd::AddToDictionary => view.add_to_dictionary(&info.misspelled_word),
             MenuCmd::OpenLink => {
                 let _ = self.open_tab(&info.link_url, false, cx);
             }
@@ -1122,6 +1580,13 @@ impl BrowserPane {
             }
             MenuCmd::ViewSource => {
                 let _ = self.open_tab(&format!("view-source:{}", chrome.url), true, cx);
+            }
+            MenuCmd::SaveScreenshot => {
+                let title = if chrome.title.is_empty() { site_of(&chrome.url).unwrap_or_default() } else { chrome.title };
+                let stem = pdf_path(std::path::Path::new(""), &title);
+                let stem = stem.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                self.save_shot = Some(chats::free_path(&rail_browser::downloads_dir(), &format!("Screenshot of {stem}.png")));
+                view.invalidate();
             }
             MenuCmd::SavePdf => {
                 let title = if chrome.title.is_empty() { site_of(&chrome.url).unwrap_or_default() } else { chrome.title };
@@ -1141,6 +1606,31 @@ impl BrowserPane {
             }
         }
         cx.notify();
+    }
+
+    /// Writes `frame` (what the page shows) as a PNG, off the UI thread.
+    fn save_screenshot(path: std::path::PathBuf, frame: &rail_browser::Frame, cx: &mut Context<Self>) {
+        let (w, h) = (frame.width, frame.height);
+        let mut rgba = frame.bgra.clone();
+        cx.spawn(async move |this, cx| {
+            let task_path = path.clone();
+            let ok = cx
+                .background_executor()
+                .spawn(async move {
+                    for px in rgba.chunks_exact_mut(4) {
+                        px.swap(0, 2);
+                    }
+                    image::RgbaImage::from_raw(w, h, rgba).map(|img| img.save(&task_path).is_ok()).unwrap_or(false)
+                })
+                .await;
+            let _ = this.update(cx, |pane, cx| {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                debug(|| format!("screenshot {ok} {} ({w}x{h})", path.display()));
+                pane.notice = Some((if ok { format!("Saved {name} to Downloads") } else { "Couldn't save the screenshot".into() }, Instant::now()));
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn context_menu_view(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -1201,6 +1691,7 @@ impl BrowserPane {
     }
 
     fn tab_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let agent_tab = self.agent_marked();
         div()
             .flex()
             .items_end()
@@ -1216,6 +1707,12 @@ impl BrowserPane {
                     t.chrome.title.clone()
                 };
                 let id = t.id;
+                let agents = agent_tab == Some(t.id);
+                // A popup window shows which tab opened it.
+                let title = match t.opener {
+                    Some(_) => format!("⧉ {title}"),
+                    None => title,
+                };
                 let icon = match &t.favicon {
                     Some(image) => img(image.clone()).size(px(14.)).flex_none().into_any_element(),
                     None => div()
@@ -1262,6 +1759,8 @@ impl BrowserPane {
                     .text_xs()
                     .bg(rgb(if active { theme::PANE } else { theme::BG }))
                     .text_color(rgb(if active { theme::FG } else { theme::MUTED }))
+                    .border_t_2()
+                    .border_color(rgb(if agents { theme::ACCENT } else if active { theme::PANE } else { theme::BG }))
                     .when(!active, |d| d.cursor_pointer().hover(|s| s.bg(rgb(theme::RAISED))))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(i) = this.index_of(id) {
@@ -1276,6 +1775,18 @@ impl BrowserPane {
                     }))
                     .child(icon)
                     .child(div().flex_1().min_w(px(0.)).overflow_hidden().truncate().child(SharedString::from(title)))
+                    // The tab the agent is working in.
+                    .when(agents, |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .px_1()
+                                .rounded_sm()
+                                .bg(rgb(theme::ACCENT))
+                                .text_color(rgb(theme::BG))
+                                .child("agent"),
+                        )
+                    })
                     .children(sound)
                     .child(
                         div()
@@ -1320,6 +1831,12 @@ impl BrowserPane {
         self.agent_busy = busy;
         if !busy {
             self.agent_driving = false;
+            self.agent_tab_gone = false;
+            // The tab the agent happened to start in was only its tab for
+            // the turn; a background tab it chose stays its own.
+            if self.agent_tab.is_some_and(|a| !a.chosen) {
+                self.agent_tab = None;
+            }
             self.highlight = None;
             if let Some(reply) = self.handoff.take().and_then(|h| h.reply) {
                 let _ = reply.send(Ok(false));
@@ -1331,7 +1848,8 @@ impl BrowserPane {
     /// The user is acting on the page while the agent drives it. (Not
     /// during a handoff: then the agent is waiting for exactly that.)
     fn user_took_over(&mut self, cx: &mut Context<Self>) {
-        if self.agent_busy && self.agent_driving && self.handoff.is_none() {
+        // Browsing another tab while the agent works in its own is fine.
+        if self.agent_busy && self.agent_driving && self.handoff.is_none() && !self.agent_in_background() {
             cx.emit(AgentControl::TookOver);
         }
     }
@@ -1427,6 +1945,13 @@ impl BrowserPane {
         }
         let Some(v) = self.view() else { return };
         let k = &ev.keystroke;
+        // Off-screen pages don't leave fullscreen on Escape by themselves
+        // (in Chrome the browser window does it), so the pane does.
+        if k.key == "escape" && v.is_fullscreen() {
+            v.exit_fullscreen();
+            cx.stop_propagation();
+            return;
+        }
         if std::env::var_os("UNIBROW_DEBUG_KEYS").is_some() {
             eprintln!("page key down: key={:?} char={:?} mods={:?}", k.key, k.key_char, k.modifiers);
         }
@@ -1476,16 +2001,8 @@ impl BrowserPane {
             .bg(rgb(theme::PANE))
             .border_b_1()
             .border_color(rgb(theme::RULE))
-            .child(nav("back", "←", self.chrome.can_go_back).on_click(cx.listener(|this, _, _, _| {
-                if let Some(v) = this.view() {
-                    v.go_back();
-                }
-            })))
-            .child(nav("forward", "→", self.chrome.can_go_forward).on_click(cx.listener(|this, _, _, _| {
-                if let Some(v) = this.view() {
-                    v.go_forward();
-                }
-            })))
+            .child(self.history_button(nav("back", "←", self.chrome.can_go_back), true, cx))
+            .child(self.history_button(nav("forward", "→", self.chrome.can_go_forward), false, cx))
             .child(nav("reload", if loading { "✕" } else { "↻" }, !self.tabs.is_empty()).on_click(cx.listener(
                 move |this, _, _, _| {
                     if let Some(v) = this.view() {
@@ -1499,6 +2016,131 @@ impl BrowserPane {
             .child(self.bookmark_button(cx))
             .child(self.focus_button(cx))
             .children(self.downloads_button(cx))
+    }
+
+    /// Back or Forward: a click goes one step; a right click or a long
+    /// press lists the tab's history that way (3.3).
+    fn history_button(&self, button: gpui::Stateful<gpui::Div>, back: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        button
+            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                let at = Instant::now();
+                this.nav_press = Some((back, at));
+                this.nav_long_fired = false;
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(LONG_PRESS).await;
+                    let _ = this.update(cx, |pane, cx| {
+                        if pane.nav_press == Some((back, at)) {
+                            pane.nav_press = None;
+                            pane.nav_long_fired = true;
+                            pane.open_nav_menu(back, cx);
+                        }
+                    });
+                })
+                .detach();
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.nav_press = None))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| this.nav_press = None))
+            .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, cx| this.open_nav_menu(back, cx)))
+            .on_click(cx.listener(move |this, _, _, _| {
+                // The press already showed the list.
+                if std::mem::take(&mut this.nav_long_fired) {
+                    return;
+                }
+                if let Some(v) = this.view() {
+                    if back { v.go_back() } else { v.go_forward() }
+                }
+            }))
+    }
+
+    /// Shows the active tab's history behind (`back`) or ahead of the
+    /// current page, nearest first.
+    fn open_nav_menu(&mut self, back: bool, cx: &mut Context<Self>) {
+        let Some(t) = self.tabs.get(self.active) else { return };
+        let h = t.view.history();
+        let label = |i: usize| {
+            let e = &h.entries[i];
+            let text = if e.title.trim().is_empty() { e.url.clone() } else { e.title.clone() };
+            text.chars().take(80).collect::<String>()
+        };
+        let items: Vec<(usize, String)> = if back {
+            (0..h.current.min(h.entries.len())).rev().take(NAV_MENU_ITEMS).map(|i| (i, label(i))).collect()
+        } else {
+            (h.current + 1..h.entries.len()).take(NAV_MENU_ITEMS).map(|i| (i, label(i))).collect()
+        };
+        debug(|| format!("history menu ({}) for tab {}: {} entries, current {}, items {items:?}", if back { "back" } else { "forward" }, t.id, h.entries.len(), h.current));
+        self.nav_menu = (!items.is_empty()).then(|| NavMenu { back, tab_id: t.id, items });
+        cx.notify();
+    }
+
+    /// Goes straight to history entry `index` of tab `tab_id`, however many
+    /// steps away. DevTools numbers the entries the same way Chromium's
+    /// list does and jumps by entry id.
+    fn jump_history(&mut self, tab_id: u32, index: usize, cx: &mut Context<Self>) {
+        self.nav_menu = None;
+        let Some(t) = self.tabs.iter().find(|t| t.id == tab_id) else { return };
+        let list = t.view.cdp_call("Page.getNavigationHistory", serde_json::json!({}));
+        cx.spawn(async move |this, cx| {
+            let entry = list.await.ok().and_then(Result::ok).and_then(|v| v["entries"].get(index)?["id"].as_i64());
+            let _ = this.update(cx, |pane, cx| {
+                let (Some(entry), Some(t)) = (entry, pane.tabs.iter().find(|t| t.id == tab_id)) else {
+                    eprintln!("pane: history entry {index} of tab {tab_id} is gone");
+                    return;
+                };
+                debug(|| format!("history jump in tab {tab_id} to entry {index} (id {entry})"));
+                drop(t.view.cdp_call("Page.navigateToHistoryEntry", serde_json::json!({"entryId": entry})));
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The Back/Forward history list, under its button.
+    fn nav_menu_view(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let m = self.nav_menu.as_ref()?;
+        if self.tabs.get(self.active).map(|t| t.id) != Some(m.tab_id) {
+            return None;
+        }
+        let tab_id = m.tab_id;
+        Some(
+            div()
+                .id("history-menu")
+                .absolute()
+                .top(px(2.))
+                .left(px(if m.back { 8. } else { 40. }))
+                .w(px(NAV_MENU_WIDTH))
+                .py_1()
+                .rounded_md()
+                .bg(rgb(theme::PANE))
+                .border_1()
+                .border_color(rgb(theme::RULE))
+                .shadow_lg()
+                .occlude()
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.nav_menu = None;
+                    cx.notify();
+                }))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .children(m.items.iter().map(|(index, label)| {
+                    let index = *index;
+                    div()
+                        .id(("history-item", index))
+                        .h(px(MENU_ITEM_HEIGHT))
+                        .mx_1()
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .rounded_sm()
+                        .text_sm()
+                        .text_color(rgb(theme::FG))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(theme::RAISED)))
+                        .on_click(cx.listener(move |this, _, _, cx| this.jump_history(tab_id, index, cx)))
+                        .child(div().min_w(px(0.)).truncate().child(SharedString::from(label.clone())))
+                })),
+        )
     }
 
     /// The page's zoom when it isn't 100%; clicking resets it.
@@ -1733,7 +2375,8 @@ impl BrowserPane {
         };
         // The agent's rect is in CSS pixels; at page zoom Z each is Z of ours.
         let z = self.tabs.get(self.active).map(|t| zoom_factor(t.zoom) as f32).unwrap_or(1.0);
-        let highlight = self.highlight.as_ref().map(|(r, label, _)| {
+        let active_id = self.tabs.get(self.active).map(|t| t.id);
+        let highlight = self.highlight.as_ref().filter(|(tab, ..)| Some(*tab) == active_id).map(|(_, r, label, _)| {
             let (x, y) = (r.x as f32 * z, r.y as f32 * z);
             let (w, h) = ((r.width as f32 * z).max(4.), (r.height as f32 * z).max(4.));
             vec![
@@ -1762,12 +2405,26 @@ impl BrowserPane {
             ]
         });
         let bg = self.background.len();
-        let bar_label = match (self.agent_driving, bg) {
-            (true, 0) => "Agent is using the browser".to_string(),
-            (true, n) => format!("Agent is using the browser · reading {n} page{} in the background", if n == 1 { "" } else { "s" }),
-            (false, n) => format!("Agent is reading {n} page{} in the background", if n == 1 { "" } else { "s" }),
+        // Working in a tab the user isn't looking at (3.1): say which, and
+        // offer to show it rather than "Take over" this one.
+        let elsewhere = (self.agent_driving && self.agent_in_background())
+            .then(|| self.agent_index().map(|i| &self.tabs[i]))
+            .flatten()
+            .map(|t| {
+                let name: String = if t.chrome.title.is_empty() { t.chrome.url.clone() } else { t.chrome.title.clone() };
+                let name: String = name.chars().take(40).collect();
+                (t.id, name)
+            });
+        let pages = |n: usize| format!("{n} page{}", if n == 1 { "" } else { "s" });
+        let bar_label = match (&elsewhere, self.agent_driving, bg) {
+            (Some((_, name)), _, 0) => format!("Agent is working in another tab: {name}"),
+            (Some((_, name)), _, n) => format!("Agent is working in another tab: {name} · reading {} in the background", pages(n)),
+            (None, true, 0) => "Agent is using the browser".to_string(),
+            (None, true, n) => format!("Agent is using the browser · reading {} in the background", pages(n)),
+            (None, false, n) => format!("Agent is reading {} in the background", pages(n)),
         };
-        let driving = self.agent_driving;
+        let driving = self.agent_driving && elsewhere.is_none();
+        let show_tab = elsewhere.as_ref().map(|(id, _)| *id);
         let agent_bar = (self.agent_busy && (self.agent_driving || bg > 0) && self.handoff.is_none()).then(|| {
             div()
                 .absolute()
@@ -1792,6 +2449,25 @@ impl BrowserPane {
                         .text_color(rgb(theme::FG))
                         .child(div().text_color(rgb(theme::ACCENT)).child("●"))
                         .child(bar_label)
+                        .when_some(show_tab, |d, id| d.child(
+                            div()
+                                .id("agent-show-tab")
+                                .px_2()
+                                .py(px(2.))
+                                .rounded_full()
+                                .border_1()
+                                .border_color(rgb(theme::RULE))
+                                .text_color(rgb(theme::FG))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(theme::RAISED)))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(i) = this.index_of(id) {
+                                        this.activate(i, cx);
+                                    }
+                                }))
+                                .child("Show"),
+                        ))
                         .when(driving, |d| d.child(
                             div()
                                 .id("agent-takeover")
@@ -1874,7 +2550,9 @@ impl BrowserPane {
             .children(self.permission_card(cx))
             .children(self.crash_overlay(cx))
             .children(self.handoff_banner(cx))
+            .children(self.code_card_view(cx))
             .children(self.context_menu_view(cx))
+            .children(self.nav_menu_view(cx))
             .children(self.notice.as_ref().map(|(text, _)| {
                 div()
                     .absolute()
@@ -1904,7 +2582,119 @@ impl BrowserPane {
         if let Some(reply) = self.handoff.take().and_then(|h| h.reply) {
             let _ = reply.send(Ok(done));
         }
+        // The code was for this handoff; don't leave it on screen.
+        self.code_card = None;
         cx.notify();
+    }
+
+    /// Puts the code into the page's code field (the user's click).
+    fn fill_code(&mut self, cx: &mut Context<Self>) {
+        let (Some(shown), Some(view)) = (self.code_card.as_ref(), self.view()) else { return };
+        let code = serde_json::to_string(&shown.card.code).unwrap_or_default();
+        let (tx, rx) = futures::channel::oneshot::channel();
+        view.cdp(
+            "Runtime.evaluate",
+            serde_json::json!({"expression": format!("({FILL_CODE_JS})({code})"), "returnByValue": true}),
+            tx,
+        );
+        cx.spawn(async move |this, cx| {
+            let how = rx.await.ok().and_then(|r| r.ok()).and_then(|v| v["result"]["value"].as_str().map(str::to_string));
+            let _ = this.update(cx, |pane, cx| {
+                if let Some(shown) = pane.code_card.as_mut() {
+                    shown.status = Some(match how.as_deref() {
+                        Some("none") | None => "No code field found on this page. Use Copy and paste it in.".into(),
+                        _ => "Filled in. Check it, submit the form, then press Done.".into(),
+                    });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The code from the user's email, big enough to read, with Copy and
+    /// Fill. Only the user sees it; the agent is told it was shown.
+    fn code_card_view(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let shown = self.code_card.as_ref()?;
+        let sender = shown.card.from.split('<').next().unwrap_or("").trim().trim_matches('"').to_string();
+        let sender = if sender.is_empty() { shown.card.from.clone() } else { sender };
+        let mins = (chrono::Utc::now().timestamp() - shown.card.received).max(0) / 60;
+        let age = match mins {
+            0 => "just now".to_string(),
+            1 => "1 minute ago".to_string(),
+            n => format!("{n} minutes ago"),
+        };
+        // "482913" reads as "482 913".
+        let code = &shown.card.code;
+        let spaced = if code.len() == 6 { format!("{} {}", &code[..3], &code[3..]) } else { code.clone() };
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .text_sm()
+                .cursor_pointer()
+                .border_1()
+                .border_color(rgb(if primary { theme::ACCENT } else { theme::RULE }))
+                .bg(rgb(if primary { theme::ACCENT } else { theme::PANE }))
+                .text_color(rgb(if primary { theme::BG } else { theme::FG }))
+                .hover(|s| s.opacity(0.85))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(label)
+        };
+        let copy_code = code.clone();
+        Some(
+            div()
+                .absolute()
+                .top(px(if self.handoff.is_some() { 56. } else { 8. }))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .p_3()
+                        .rounded_md()
+                        .bg(rgb(theme::PANE))
+                        .border_1()
+                        .border_color(rgb(theme::ACCENT))
+                        .shadow_lg()
+                        .child(div().text_xs().text_color(rgb(theme::MUTED)).child(format!("Code from {sender} · {age}")))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .child(div().text_2xl().font_family("monospace").text_color(rgb(theme::FG)).child(spaced))
+                                .child(button("code-copy", "Copy", false).on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(copy_code.clone()));
+                                    if let Some(s) = this.code_card.as_mut() {
+                                        s.status = Some("Copied. Paste it into the code field.".into());
+                                    }
+                                    cx.notify();
+                                })))
+                                .child(button("code-fill", "Fill the code field", true).on_click(cx.listener(|this, _, _, cx| this.fill_code(cx))))
+                                .child(
+                                    div()
+                                        .id("code-dismiss")
+                                        .px_1()
+                                        .text_color(rgb(theme::MUTED))
+                                        .cursor_pointer()
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.code_card = None;
+                                            cx.notify();
+                                        }))
+                                        .child("×"),
+                                ),
+                        )
+                        .children(shown.status.clone().map(|t| div().text_xs().text_color(rgb(theme::ACCENT)).child(t))),
+                ),
+        )
     }
 
     /// "Your turn": the agent is waiting for the user to do something.
@@ -2119,8 +2909,12 @@ impl BrowserPane {
 impl BrowserPane {
     /// One `UNIBROW_TEST_PANE` step, done the way the user's input would
     /// do it, with the outcome logged to stderr. Steps: `zoom+`, `zoom-`,
-    /// `zoom0`, `zoom:<percent>`, `click:X:Y`, `rclick:X:Y` (page pixels), `menu:<label>`,
-    /// `reader`, `mute`, `tab:<n>`, `wait`, `log`.
+    /// `zoom0`, `zoom:<percent>`, `click:X:Y`, `rclick:X:Y` (page pixels), `type:<text>`, `userclick:X:Y`
+    /// (a click that counts as the user taking over), `menu:<label>`,
+    /// `reader`, `mute`, `tab:<n>`, `wait`, `log`, `histmenu:back|forward` (the
+    /// Back/Forward history list), `histpick:<n>` (its nth entry, nearest
+    /// first), `shot:<name>`, `agentshot:<name>` (a frame of the agent's tab
+    /// while it's in the background).
     fn run_test_step(&mut self, step: &str, cx: &mut Context<Self>) {
         let (name, arg) = step.split_once(':').unwrap_or((step, ""));
         let xy = || {
@@ -2140,9 +2934,14 @@ impl BrowserPane {
                     self.site_zoom.insert(key, zoom_level_for(percent / 100.0));
                 }
             }
-            "click" | "rclick" => {
+            "click" | "rclick" | "userclick" => {
+                // userclick: the user clicking their page while the agent
+                // works, which stops the agent if it's working in that tab.
+                if name == "userclick" {
+                    self.user_took_over(cx);
+                }
                 if let (Some(v), Some((x, y))) = (self.view(), xy()) {
-                    let b = if name == "click" { rail_browser::MouseButton::Left } else { rail_browser::MouseButton::Right };
+                    let b = if name == "rclick" { rail_browser::MouseButton::Right } else { rail_browser::MouseButton::Left };
                     v.set_focus(true);
                     v.mouse_move(x, y, Modifiers::default());
                     v.mouse_button(x, y, b, false, 1, Modifiers::default());
@@ -2151,6 +2950,38 @@ impl BrowserPane {
                         self.user_right_click = Some((Instant::now(), x, y));
                     }
                 }
+            }
+            // clicksel:<css selector>: a left click in the middle of that
+            // element of the active page, like the user's.
+            "clicksel" => {
+                let Some(t) = self.tabs.get(self.active) else { return };
+                let (id, zoom) = (t.id, zoom_factor(t.zoom) as f32);
+                let sel = serde_json::to_string(arg).unwrap_or_default();
+                let rx = t.view.evaluate(&format!(
+                    "(() => {{ const e = document.querySelector({sel}); if (!e) return null; \
+                     const r = e.getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; }})()"
+                ));
+                let step = step.to_string();
+                cx.spawn(async move |this, cx| {
+                    let at = rx.await.ok().and_then(Result::ok).and_then(|v| {
+                        let a = v["result"]["value"].as_array()?.clone();
+                        Some((a.first()?.as_f64()? as f32, a.get(1)?.as_f64()? as f32))
+                    });
+                    let _ = this.update(cx, |pane, _| {
+                        let (Some((x, y)), Some(t)) = (at, pane.tabs.iter().find(|t| t.id == id)) else {
+                            eprintln!("pane test: {step}: no such element");
+                            return;
+                        };
+                        let (x, y) = (x * zoom, y * zoom);
+                        eprintln!("pane test: {step}: clicking at {x:.0},{y:.0}");
+                        let m = Modifiers::default();
+                        t.view.set_focus(true);
+                        t.view.mouse_move(x, y, m);
+                        t.view.mouse_button(x, y, rail_browser::MouseButton::Left, false, 1, m);
+                        t.view.mouse_button(x, y, rail_browser::MouseButton::Left, true, 1, m);
+                    });
+                })
+                .detach();
             }
             "menu" => {
                 let found = self.menu.as_ref().and_then(|m| {
@@ -2163,10 +2994,87 @@ impl BrowserPane {
                 }
             }
             "reader" => self.toggle_reader(cx),
+            // Types text into the focused field (as committed keyboard input).
+            "type" => {
+                if let Some(v) = self.view() {
+                    v.insert_text(arg);
+                }
+            }
+            // Waits for a code card, then presses Fill.
+            "fillcode" => {
+                if self.code_card.is_some() {
+                    self.fill_code(cx);
+                } else {
+                    self.test_steps.push_front(step.to_string());
+                }
+            }
+            // Waits for a handoff, then presses Done.
+            "handoffdone" => {
+                if self.handoff.is_some() {
+                    self.finish_handoff(true, cx);
+                } else {
+                    self.test_steps.push_front(step.to_string());
+                }
+            }
+            // What Escape does over a fullscreen page.
+            "esc" => {
+                if let Some(v) = self.view().filter(|v| v.is_fullscreen()) {
+                    v.exit_fullscreen();
+                }
+            }
+            "js" | "jsfile" => {
+                // js:<expression> evaluates in the active page and logs the
+                // value (steps are split on ';', so keep it to one
+                // expression); jsfile:<path> evaluates a file's script.
+                let script = if name == "js" { arg.to_string() } else { std::fs::read_to_string(arg).unwrap_or_default() };
+                if let Some(v) = self.view() {
+                    let rx = v.evaluate(&script);
+                    cx.spawn(async move |_, _| {
+                        let out = match rx.await {
+                            Ok(Ok(v)) => match &v["result"]["value"] {
+                                serde_json::Value::String(s) => s.clone(),
+                                serde_json::Value::Null => v.to_string(),
+                                other => other.to_string(),
+                            },
+                            Ok(Err(e)) => format!("error: {e}"),
+                            Err(_) => "error: no reply".into(),
+                        };
+                        eprintln!("pane test: js => {out}");
+                    })
+                    .detach();
+                }
+            }
             "shot" => {
                 self.test_shot = Some(if arg.is_empty() { "shot".into() } else { arg.to_string() });
                 if let Some(v) = self.view() {
                     v.invalidate();
+                }
+            }
+            "agentshot" => {
+                match self.agent_index().filter(|i| *i != self.active) {
+                    Some(i) => {
+                        self.test_agent_shot = Some(if arg.is_empty() { "agentshot".into() } else { arg.to_string() });
+                        self.tabs[i].view.invalidate();
+                    }
+                    None => eprintln!("pane test: the agent isn't working in a background tab"),
+                }
+            }
+            "histmenu" => {
+                self.open_nav_menu(arg != "forward", cx);
+                let items = self.nav_menu.as_ref().map(|m| m.items.clone());
+                eprintln!("pane test: history menu {arg}: {items:?}");
+            }
+            "histpick" => {
+                let pick = arg.parse::<usize>().ok().and_then(|n| {
+                    let m = self.nav_menu.as_ref()?;
+                    m.items.get(n).map(|(index, label)| (m.tab_id, *index, label.clone()))
+                });
+                match pick {
+                    Some((tab_id, index, label)) => {
+                        eprintln!("pane test: history jump to entry {index} ({label})");
+                        self.jump_history(tab_id, index, cx);
+                    }
+                    None => eprintln!("pane test: no history menu item {arg}"),
                 }
             }
             "mute" => {
@@ -2184,9 +3092,12 @@ impl BrowserPane {
                     let st = t.view.page_state();
                     let url: String = t.chrome.url.chars().take(90).collect();
                     eprintln!(
-                        "pane test: tab {i} id={} active={} url={url} title={:?} zoom={:.0}% css={}x{} favicon={:?} audible={} muted={} reader_of={:?}",
+                        "pane test: tab {i} id={} active={} agent={} opener={:?} visibility={:?} url={url} title={:?} zoom={:.0}% css={}x{} favicon={:?} audible={} muted={} reader_of={:?}",
                         t.id,
                         i == self.active,
+                        Some(i) == self.agent_index() && self.agent_tab.is_some(),
+                        t.opener,
+                        t.view.visibility(),
                         t.chrome.title,
                         zoom_factor(t.zoom) * 100.0,
                         st.width,
@@ -2201,6 +3112,34 @@ impl BrowserPane {
                 eprintln!("pane test: menu={menu:?} notice={:?}", self.notice.as_ref().map(|n| &n.0));
             }
             _ => {}
+        }
+    }
+}
+
+impl BrowserPane {
+    /// Whether the page fills the window (a fullscreen video).
+    pub fn is_fullscreen(&self) -> bool {
+        self.fullscreen
+    }
+
+    /// Follows the active tab into and out of fullscreen.
+    fn follow_fullscreen(&mut self, cx: &mut Context<Self>) {
+        let want = self.chrome.fullscreen;
+        if want != self.fullscreen {
+            debug(|| format!("page fullscreen {want}"));
+            self.fullscreen = want;
+            cx.emit(FullscreenChanged);
+        }
+    }
+
+    /// The window goes fullscreen with the page (unless it already was)
+    /// and comes back after.
+    fn sync_window_fullscreen(&mut self, window: &mut Window) {
+        if self.fullscreen && !self.window_fullscreened && !window.is_fullscreen() {
+            self.window_fullscreened = true;
+            window.toggle_fullscreen();
+        } else if !self.fullscreen && std::mem::take(&mut self.window_fullscreened) && window.is_fullscreen() {
+            window.toggle_fullscreen();
         }
     }
 }
@@ -2223,6 +3162,10 @@ impl Render for BrowserPane {
                     .text_color(rgb(theme::ERROR))
                     .child(SharedString::from(format!("The browser couldn't start: {reason}"))),
             );
+        }
+        self.sync_window_fullscreen(window);
+        if self.fullscreen {
+            return root.child(self.page(window, cx));
         }
         root = root.child(self.tab_strip(cx)).child(self.toolbar(cx)).child(self.panels(cx));
         if let Some(err) = &self.chrome.load_error {
@@ -2473,7 +3416,7 @@ mod tests {
         let got = labels(&ContextMenuInfo::default(), &chrome);
         assert_eq!(
             got,
-            ["Back", "(Forward)", "Reload", "-", "Select all", "Save page as PDF", "View page source"]
+            ["Back", "(Forward)", "Reload", "-", "Select all", "Save page as PDF", "Save screenshot", "View page source"]
         );
     }
 
@@ -2499,6 +3442,39 @@ mod tests {
         assert_eq!(&got[..5], ["(Cut)", "(Copy)", "Paste", "Select all", "-"]);
         // No second "Select all" further down for an editable field.
         assert_eq!(got.iter().filter(|l| l.contains("Select all")).count(), 1);
+    }
+
+    #[test]
+    fn new_tab_placement() {
+        // The user's own links and popups open as asked.
+        assert_eq!(placement(false, true, true), (true, false));
+        assert_eq!(placement(false, true, false), (false, false));
+        assert_eq!(placement(false, false, true), (true, false));
+        // The agent working in the user's tab: the user sees what it opens.
+        assert_eq!(placement(true, true, true), (true, true));
+        // The agent working in a background tab: it follows quietly.
+        assert_eq!(placement(true, false, true), (false, true));
+        // A background-tab request (Ctrl+click) stays one.
+        assert_eq!(placement(true, true, false), (false, false));
+    }
+
+    #[test]
+    fn spelling_menu() {
+        let chrome = Chrome::default();
+        let info = ContextMenuInfo {
+            editable: true,
+            misspelled_word: "sentense".into(),
+            suggestions: (1..=7).map(|i| format!("s{i}")).collect(),
+            ..Default::default()
+        };
+        let got = labels(&info, &chrome);
+        assert_eq!(&got[..7], ["s1", "s2", "s3", "s4", "s5", "Add to dictionary", "-"]);
+        assert_eq!(menu_entries(&info, &chrome)[1].as_ref().unwrap().2, MenuCmd::Replace(1));
+        let none = ContextMenuInfo { suggestions: vec![], ..info.clone() };
+        assert_eq!(&labels(&none, &chrome)[..2], ["(No spelling suggestions)", "Add to dictionary"]);
+        // Outside a text field there's nothing to fix.
+        let page = ContextMenuInfo { editable: false, ..info };
+        assert!(!labels(&page, &chrome).iter().any(|l| l == "s1"));
     }
 
     #[test]

@@ -105,6 +105,14 @@ impl TextInput {
         cx.notify();
     }
 
+    /// Replaces the contents with `text`, all of it selected (typing
+    /// replaces it), e.g. a title being renamed.
+    pub fn set_text_selected(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.set_text(text, cx);
+        self.move_to(0, cx);
+        self.select_to(self.content.len(), cx);
+    }
+
     #[allow(dead_code)] // the chat box stays enabled now; other inputs may use it
     pub fn set_disabled(&mut self, disabled: bool, cx: &mut Context<Self>) {
         self.disabled = disabled;

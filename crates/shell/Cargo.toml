@@ -19,6 +19,7 @@ browsing.workspace = true
 chats.workspace = true
 async-channel.workspace = true
 chrono.workspace = true
+futures.workspace = true
 rail-browser = { path = "../rails/rail-browser" }
 image = { version = "0.25", default-features = false }
 keyring.workspace = true

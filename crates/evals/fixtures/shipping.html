@@ -1,0 +1,28 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Shipping – Unibrow Test Shop</title>
+<style>body { font: 16px system-ui, sans-serif; max-width: 600px; margin: 32px auto; padding: 0 16px; color: #1b2733; } label { display: block; margin: 14px 0 4px; font-weight: 600; } input { padding: 8px; font: inherit; width: 100%; box-sizing: border-box; } .error { color: #a33; font-size: 14px; } button { margin-top: 18px; padding: 8px 16px; font: inherit; }</style></head>
+<body>
+  <h1>Shipping address</h1>
+  <form id="ship" novalidate>
+    <label for="name">Full name</label>
+    <input id="name" name="name" type="text" autocomplete="off">
+    <label for="postcode">Postcode</label>
+    <input id="postcode" name="postcode" type="text" autocomplete="off" aria-describedby="pc-error">
+    <p id="pc-error" class="error" role="alert" hidden></p>
+    <button type="submit">Continue</button>
+  </form>
+  <p id="done"></p>
+  <script>
+    document.getElementById('ship').addEventListener('submit', e => {
+      e.preventDefault();
+      const pc = document.getElementById('postcode'), err = document.getElementById('pc-error');
+      if (!/^\d{5}$/.test(pc.value.trim())) {
+        pc.setAttribute('aria-invalid', 'true');
+        err.textContent = 'Postcode must be 5 digits.';
+        err.hidden = false;
+        return;
+      }
+      pc.removeAttribute('aria-invalid'); err.hidden = true;
+      document.getElementById('done').textContent = 'Shipping saved. Delivery code SWIFT-08.';
+    });
+  </script>
+</body></html>

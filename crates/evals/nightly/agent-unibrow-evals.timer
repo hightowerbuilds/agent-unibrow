@@ -1,0 +1,14 @@
+# Starts agent-unibrow-evals.service every night (roadmap 7.5). Setup and
+# commands are in agent-unibrow-evals.service.
+
+[Unit]
+Description=Nightly agent-unibrow evals
+
+[Timer]
+OnCalendar=*-*-* 03:30
+# Missed while the machine was off or asleep: run at the next chance.
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

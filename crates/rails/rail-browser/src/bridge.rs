@@ -35,6 +35,10 @@ pub struct PageState {
     /// A site (shown as host[:port]) is waiting for an HTTP sign-in that
     /// only the user can give.
     pub auth: Option<String>,
+    /// Which tab this is, when that matters to the agent: it's working in a
+    /// tab the user isn't looking at (3.1), or the tab is a popup window
+    /// another tab opened (3.2). Filled in by the UI.
+    pub tab_note: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,15 +63,38 @@ pub struct TabInfo {
     pub id: u32,
     pub title: String,
     pub url: String,
+    /// The tab the user is looking at.
     pub active: bool,
+    /// The tab the agent's browser tools act on (roadmap 3.1). Usually the
+    /// active one; a background tab once the agent opened or picked one.
+    pub agent: bool,
+    /// A popup window (`window.open`) and the tab that opened it, which it
+    /// can talk back to (3.2).
+    pub opener: Option<u32>,
 }
 
 pub enum TabOp {
     List,
-    /// Open a tab (at `url`, or the home page) and make it active.
-    New { url: Option<String> },
+    /// Open a tab (at `url`, or the home page). It becomes the active tab,
+    /// or with `background` the agent's own tab: the agent works in it
+    /// while the user keeps the tab they're on.
+    New { url: Option<String>, background: bool },
+    /// Show a tab to the user; the agent then works in the active tab again.
     Switch { id: u32 },
+    /// Work in this tab without showing it to the user.
+    Use { id: u32 },
     Close { id: u32 },
+}
+
+
+/// A verification code from the user's email, shown to the user only.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CodeCard {
+    pub code: String,
+    /// Sender as the email shows it ("Netflix <info@netflix.com>").
+    pub from: String,
+    /// Unix seconds.
+    pub received: i64,
 }
 
 pub enum Request {
@@ -87,6 +114,9 @@ pub enum Request {
     /// Hand the page to the user ("enter the code, then click Done").
     /// Replies true when they click Done, false for "Not now".
     Handoff { message: String, reply: Reply<bool> },
+    /// Show a verification code above the page for the user to copy or
+    /// fill (5.2). Cleared when the handoff that follows ends.
+    ShowCode { card: CodeCard },
     /// Answer the open JavaScript dialog.
     Dialog { accept: bool, text: Option<String>, reply: Reply<()> },
     /// Background pages (roadmap 9.x, 3.1): hidden pages the agent loads to
@@ -206,6 +236,10 @@ impl BrowserBridge {
     /// Closes a background page. Never blocks, so it's safe from `Drop`.
     pub fn bg_close(&self, id: u32) {
         let _ = self.tx.try_send(Request::BgClose { id });
+    }
+
+    pub fn show_code(&self, card: CodeCard) {
+        let _ = self.tx.try_send(Request::ShowCode { card });
     }
 
     pub fn highlight(&self, rect: Rect, label: impl Into<String>) {

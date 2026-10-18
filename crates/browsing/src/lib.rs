@@ -13,9 +13,11 @@
 //! Stored in SQLite at `~/.local/share/agent-unibrow/browsing.sqlite3`.
 //! The store is `Send + Sync`: the UI writes visits, agent tools read.
 
+pub mod favicons;
 pub mod sitemap;
 mod tools;
 
+pub use favicons::Favicon;
 pub use tools::tools;
 
 use chrono::{DateTime, Local, TimeZone};
@@ -142,6 +144,8 @@ pub struct HistoryQuery {
 
 pub struct Browsing {
     conn: Mutex<Connection>,
+    /// Bumped when a site icon is saved (see [`favicons`]).
+    favicon_version: std::sync::atomic::AtomicU64,
 }
 
 /// The site a URL belongs to: its host without a leading `www.`.
@@ -232,7 +236,8 @@ impl Browsing {
         )
         .map_err(|e| format!("can't set up the history database: {e}"))?;
         sitemap::init(&conn).map_err(|e| format!("can't set up site maps: {e}"))?;
-        Ok(Self { conn: Mutex::new(conn) })
+        favicons::init(&conn).map_err(|e| format!("can't set up site icons: {e}"))?;
+        Ok(Self { conn: Mutex::new(conn), favicon_version: Default::default() })
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -349,6 +354,7 @@ impl Browsing {
 
     pub fn clear_history(&self) {
         let _ = self.conn().execute("DELETE FROM visits", []);
+        self.prune_favicons();
     }
 
     /// Bookmarks, newest first.

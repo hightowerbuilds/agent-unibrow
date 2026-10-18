@@ -94,5 +94,5 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial · todo.
 ## Later
 
 - Agents in background chats (needs per-chat browser tabs).
-- Rename chats; search across chats; export a chat.
+- ✅ **COMPLETED**: rename chats (double-click the title), search across chats (All chats), export a chat to Markdown.
 - Per-chat trace files.

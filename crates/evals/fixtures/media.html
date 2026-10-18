@@ -1,0 +1,228 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Media check – Unibrow Test Shop</title>
+<style>
+  body { font: 14px system-ui, sans-serif; margin: 16px; background: #fff; color: #1b2733; }
+  .grid { display: flex; flex-wrap: wrap; gap: 8px; }
+  .cell { border: 1px solid #d5dce2; border-radius: 6px; padding: 4px; width: 170px; }
+  .cell video { width: 160px; height: 90px; background: #000; display: block; }
+  .cell b { display: block; font-size: 12px; }
+  .ok { color: #17663a; } .bad { color: #b3261e; }
+  pre { font-size: 11px; white-space: pre-wrap; }
+</style></head><body>
+<h1>Media check</h1>
+<p><button id="sound" style="font-size:16px;padding:8px 16px">Play sound</button>
+  <button id="fs" style="font-size:16px;padding:8px 16px">Fullscreen</button>
+  <button id="pip" style="font-size:16px;padding:8px 16px">Picture in picture</button> <span id="sound-out"></span></p>
+<p id="status">Checking…</p>
+<div class="grid" id="grid"></div>
+<pre id="out"></pre>
+<script>
+// Every clip is silent. Each one is played and reported as `playing`,
+// `error <code> <message>` or `blocked <reason>`; videos also say whether
+// a decoded frame has any picture in it (not black).
+const R = { clips: {}, canPlayType: {}, mse: {}, eme: {}, decoding: {} };
+window.__media = R;
+
+const CLIPS = [
+  ['video', 'media/h264-aac.mp4', 'H.264 + AAC (MP4)'],
+  ['video', 'media/vp8-vorbis.webm', 'VP8 + Vorbis (WebM)'],
+  ['video', 'media/vp9-opus.webm', 'VP9 + Opus (WebM)'],
+  ['video', 'media/av1-opus.webm', 'AV1 + Opus (WebM)'],
+  ['video', 'media/av1.mp4', 'AV1 + Opus (MP4)'],
+  ['video', 'media/hls.m3u8', 'HLS (H.264 in TS)'],
+  ['audio', 'media/silent.mp3', 'MP3'],
+  ['audio', 'media/silent.m4a', 'AAC (M4A)'],
+  ['audio', 'media/silent.opus', 'Opus (Ogg)'],
+  ['audio', 'media/silent.ogg', 'Vorbis (Ogg)'],
+  ['audio', 'media/silent.flac', 'FLAC'],
+];
+
+const TYPES = {
+  'video/mp4; codecs="avc1.42E01E"': 'H.264',
+  'video/mp4; codecs="hev1.1.6.L93.B0"': 'HEVC',
+  'audio/mp4; codecs="mp4a.40.2"': 'AAC',
+  'audio/mpeg': 'MP3',
+  'video/webm; codecs="vp8, vorbis"': 'VP8/Vorbis',
+  'video/webm; codecs="vp9, opus"': 'VP9/Opus',
+  'video/webm; codecs="av01.0.05M.08"': 'AV1',
+  'video/mp4; codecs="av01.0.05M.08"': 'AV1 MP4',
+  'audio/ogg; codecs="opus"': 'Opus',
+  'audio/flac': 'FLAC',
+  'application/vnd.apple.mpegurl': 'HLS',
+};
+
+function hasPicture(v) {
+  try {
+    const c = document.createElement('canvas');
+    c.width = 16; c.height = 9;
+    const g = c.getContext('2d');
+    g.drawImage(v, 0, 0, 16, 9);
+    const d = g.getImageData(0, 0, 16, 9).data;
+    let sum = 0;
+    for (let i = 0; i < d.length; i += 4) sum += d[i] + d[i + 1] + d[i + 2];
+    return sum / (d.length / 4) / 3 > 8;
+  } catch (e) { return 'canvas: ' + e.message; }
+}
+
+function cell(label) {
+  const div = document.createElement('div');
+  div.className = 'cell';
+  const b = document.createElement('b');
+  b.textContent = label + ': …';
+  div.appendChild(b);
+  document.getElementById('grid').appendChild(div);
+  return { div, b };
+}
+
+function playClip([kind, src, label]) {
+  return new Promise(resolve => {
+    const { div, b } = cell(label);
+    // Muted autoplay is allowed for <video> only, so audio files play in a
+    // (hidden) video element too; sound needs a click (see the button).
+    const el = document.createElement('video');
+    el.muted = true;
+    el.loop = true;
+    el.playsInline = true;
+    if (kind === 'video') div.prepend(el);
+    let done = false;
+    const finish = (verdict) => {
+      if (done) return;
+      done = true;
+      R.clips[label] = verdict;
+      b.textContent = label + ': ' + verdict;
+      b.className = verdict.startsWith('playing') ? 'ok' : 'bad';
+      resolve();
+    };
+    el.addEventListener('error', () => {
+      const e = el.error;
+      finish('error ' + (e ? e.code + ' ' + e.message : '?'));
+    });
+    el.addEventListener('playing', () => {
+      if (kind !== 'video') return finish('playing');
+      setTimeout(() => finish('playing, picture ' + hasPicture(el) + ' ' + el.videoWidth + 'x' + el.videoHeight), 400);
+    });
+    setTimeout(() => finish('timeout readyState=' + el.readyState + ' networkState=' + el.networkState), 6000);
+    el.src = src;
+    el.play().catch(e => { if (e.name !== 'AbortError') finish('blocked ' + e.name + ': ' + e.message); });
+  });
+}
+
+// Sound with a user click: an unmuted (silent) clip and Web Audio.
+document.getElementById('sound').addEventListener('click', async () => {
+  const out = document.getElementById('sound-out');
+  const a = new Audio('media/silent.opus');
+  a.loop = true;
+  try {
+    await a.play();
+    const ac = new AudioContext();
+    await ac.resume();
+    R.sound = 'playing unmuted, AudioContext ' + ac.state;
+  } catch (e) { R.sound = 'blocked ' + e.name + ': ' + e.message; }
+  out.textContent = R.sound;
+});
+
+// Fullscreen and picture-in-picture on the first playing video.
+const firstVideo = () => [...document.querySelectorAll('video')].find(v => !v.paused);
+document.addEventListener('fullscreenchange', () => {
+  R.fullscreen = (document.fullscreenElement ? 'in ' : 'out ') + innerWidth + 'x' + innerHeight;
+  document.getElementById('sound-out').textContent = 'fullscreen ' + R.fullscreen;
+});
+document.getElementById('fs').addEventListener('click', () => {
+  firstVideo().requestFullscreen().catch(e => { R.fullscreen = 'error ' + e.name + ': ' + e.message; });
+});
+document.getElementById('pip').addEventListener('click', () => {
+  firstVideo().requestPictureInPicture()
+    .then(() => { R.pip = 'opened'; document.exitPictureInPicture(); })
+    .catch(e => { R.pip = 'error ' + e.name + ': ' + e.message; });
+});
+
+async function mseAppend() {
+  // What YouTube-style players do: fetch a WebM and feed it to a SourceBuffer.
+  const type = 'video/webm; codecs="vp9"';
+  if (!window.MediaSource || !MediaSource.isTypeSupported(type)) return 'unsupported';
+  const { div, b } = cell('MSE VP9');
+  const v = document.createElement('video');
+  v.muted = true;
+  div.prepend(v);
+  const ms = new MediaSource();
+  v.src = URL.createObjectURL(ms);
+  await new Promise(r => ms.addEventListener('sourceopen', r, { once: true }));
+  const sb = ms.addSourceBuffer(type);
+  const data = await (await fetch('media/vp9-mse.webm')).arrayBuffer();
+  const verdict = await new Promise(resolve => {
+    sb.addEventListener('error', () => setTimeout(() => resolve('append error: ' + (v.error ? v.error.code + ' ' + v.error.message : 'no media error')), 50), { once: true });
+    sb.addEventListener('updateend', () => {
+      ms.endOfStream();
+      v.play().then(() => setTimeout(() => resolve('playing, picture ' + hasPicture(v)), 400),
+                    e => resolve('blocked ' + e.name));
+    }, { once: true });
+    sb.appendBuffer(data);
+    setTimeout(() => resolve('timeout'), 6000);
+  });
+  b.textContent = 'MSE VP9: ' + verdict;
+  b.className = verdict.startsWith('playing') ? 'ok' : 'bad';
+  return verdict;
+}
+
+async function keySystem(name) {
+  const configs = [
+    { initDataTypes: ['cenc'], videoCapabilities: [{ contentType: 'video/mp4; codecs="avc1.42E01E"' }] },
+    { initDataTypes: ['webm'], videoCapabilities: [{ contentType: 'video/webm; codecs="vp9"' }] },
+  ];
+  try {
+    const access = await navigator.requestMediaKeySystemAccess(name, configs);
+    const cfg = access.getConfiguration();
+    return 'available (' + (cfg.videoCapabilities || []).map(c => c.contentType).join(', ') + ')';
+  } catch (e) { return 'unavailable: ' + e.name + ': ' + e.message; }
+}
+
+async function decoding(contentType) {
+  try {
+    const r = await navigator.mediaCapabilities.decodingInfo({
+      type: 'media-source',
+      video: { contentType, width: 1920, height: 1080, bitrate: 4000000, framerate: 30 },
+    });
+    return `supported=${r.supported} smooth=${r.smooth} powerEfficient=${r.powerEfficient}`;
+  } catch (e) { return 'error: ' + e.message; }
+}
+
+(async () => {
+  for (const t in TYPES) {
+    const v = document.createElement('video');
+    R.canPlayType[TYPES[t]] = v.canPlayType(t) || 'no';
+    R.mse[TYPES[t]] = window.MediaSource ? MediaSource.isTypeSupported(t) : 'no MediaSource';
+  }
+  R.autoplay = navigator.getAutoplayPolicy ? navigator.getAutoplayPolicy('mediaelement') : 'n/a';
+  try {
+    const ac = new AudioContext();
+    R.audioContext = `${ac.state} ${ac.sampleRate}Hz`;
+    ac.close();
+  } catch (e) { R.audioContext = 'error: ' + e.message; }
+  R.fullscreenEnabled = document.fullscreenEnabled;
+  R.pictureInPictureEnabled = document.pictureInPictureEnabled;
+  R.documentPictureInPicture = 'documentPictureInPicture' in window;
+  try {
+    const gl = document.createElement('canvas').getContext('webgl');
+    const ext = gl && gl.getExtension('WEBGL_debug_renderer_info');
+    R.webgl = gl ? (ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : 'yes') : 'none';
+  } catch (e) { R.webgl = 'error: ' + e.message; }
+  R.eme.ClearKey = await keySystem('org.w3.clearkey');
+  R.eme.Widevine = await keySystem('com.widevine.alpha');
+  R.decoding['H.264 1080p'] = await decoding('video/mp4; codecs="avc1.640028"');
+  R.decoding['VP9 1080p'] = await decoding('video/webm; codecs="vp09.00.40.08"');
+  R.decoding['AV1 1080p'] = await decoding('video/mp4; codecs="av01.0.08M.08"');
+  await Promise.all(CLIPS.map(playClip));
+  R.mseAppend = await mseAppend();
+  const bad = Object.entries(R.clips).filter(([, v]) => !v.startsWith('playing')).map(([k]) => k);
+  document.getElementById('status').textContent =
+    'Media check done. Playing: ' + (Object.keys(R.clips).length - bad.length) + '/' + Object.keys(R.clips).length +
+    (bad.length ? '. Not playing: ' + bad.join(', ') : '');
+  document.getElementById('out').textContent = JSON.stringify(R, null, 1);
+  // One line per check, for the test log: `name => verdict | …`.
+  const lines = { ...R.clips, 'MSE append': R.mseAppend, 'ClearKey': R.eme.ClearKey, 'Widevine': R.eme.Widevine };
+  for (const k in R.mse) lines['MSE ' + k] = R.mse[k];
+  R.summary = Object.entries(lines).map(([k, v]) => k + ' => ' + v).join(' | ');
+  document.title = 'Media check done';
+  R.done = true;
+})();
+</script>
+</body></html>

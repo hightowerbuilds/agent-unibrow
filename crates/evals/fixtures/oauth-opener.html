@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Unibrow Test Shop – Sign in</title>
+<style>
+  body { font: 16px system-ui, sans-serif; max-width: 640px; margin: 32px auto; padding: 0 16px; color: #1b2733; }
+  button { padding: 10px 18px; font: inherit; cursor: pointer; }
+  #status { margin-top: 18px; padding: 12px; background: #eef6f5; border-radius: 6px; }
+</style>
+</head>
+<body>
+  <h1>Sign in</h1>
+  <p>Sign in to see your orders. We use Unibrow ID: it opens a small window where you allow access.</p>
+  <p><button id="signin">Sign in with Unibrow ID</button></p>
+  <div id="status" role="status">Not signed in.</div>
+  <script>
+    const status = document.getElementById('status');
+    let popup = null;
+    document.getElementById('signin').addEventListener('click', () => {
+      // Like "Sign in with Google": a named popup window that posts its
+      // result back to this page through window.opener.
+      popup = window.open('oauth-popup.html', 'unibrow-id', 'width=480,height=600');
+      status.textContent = popup ? 'Waiting for the Unibrow ID window…' : 'The sign-in window was blocked.';
+    });
+    window.addEventListener('message', (ev) => {
+      if (ev.origin !== location.origin || !ev.data || ev.data.kind !== 'unibrow-id') return;
+      status.textContent = 'Signed in as ' + ev.data.email + ' (session ' + ev.data.session + ').';
+    });
+  </script>
+</body>
+</html>

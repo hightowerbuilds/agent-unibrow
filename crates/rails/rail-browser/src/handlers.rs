@@ -23,17 +23,57 @@ wrap_app! {
     impl App {
         fn on_before_command_line_processing(
             &self,
-            _process_type: Option<&CefStringUtf16>,
+            process_type: Option<&CefStringUtf16>,
             command_line: Option<&mut CommandLine>,
         ) {
             let Some(cl) = command_line else { return };
+            // Pages follow the desktop's dark preference
+            // (`prefers-color-scheme`). Chromium asks GTK, which a CEF built
+            // without GTK (Arch's, the one with H.264) can't, so ask the
+            // desktop portal here, in the browser process, at startup.
+            let browser_process = process_type.is_none_or(|t| t.to_string().is_empty());
+            if browser_process && desktop_prefers_dark() {
+                cl.append_switch(Some(&"force-dark-mode".into()));
+            }
             cl.append_switch(Some(&"noerrdialogs".into()));
             cl.append_switch(Some(&"hide-crash-restore-bubble".into()));
             // Store passwords in Chromium's own encrypted file, not the
             // desktop keyring (avoids keyring prompts from a subprocess).
             cl.append_switch_with_value(Some(&"password-store".into()), Some(&"basic".into()));
+            // Test instances: extra Chromium switches, comma-separated
+            // (`mute-audio`, `name=value`), so real sites can be checked
+            // without sound on the user's speakers.
+            if let Ok(extra) = std::env::var("UNIBROW_TEST_SWITCHES") {
+                for s in extra.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    match s.split_once('=') {
+                        Some((k, v)) => cl.append_switch_with_value(Some(&k.into()), Some(&v.into())),
+                        None => cl.append_switch(Some(&s.into())),
+                    }
+                }
+            }
         }
     }
+}
+
+/// The desktop's color-scheme preference (xdg-desktop-portal: 1 is
+/// "prefer dark"). Anything that goes wrong reads as no preference.
+fn desktop_prefers_dark() -> bool {
+    let out = std::process::Command::new("busctl")
+        .args([
+            "--user",
+            "--timeout=1",
+            "call",
+            "org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Settings",
+            "ReadOne",
+            "ss",
+            "org.freedesktop.appearance",
+            "color-scheme",
+        ])
+        .stderr(std::process::Stdio::null())
+        .output();
+    out.is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "v u 1")
 }
 
 pub fn app() -> cef::App {
@@ -184,6 +224,16 @@ wrap_display_handler! {
             host.download_image(Some(&CefString::from(url.as_str())), 1, 32, 0, Some(&mut cb));
         }
 
+        /// The page put an element in fullscreen (a video's fullscreen
+        /// button) or left it. Off-screen, Chromium only lays the element
+        /// out over the whole view; the UI makes the view fill the screen.
+        fn on_fullscreen_mode_change(&self, _browser: Option<&mut Browser>, fullscreen: ::std::os::raw::c_int) {
+            debug(|| format!("fullscreen {fullscreen}"));
+            let mut s = self.handler.state.borrow_mut();
+            s.fullscreen = fullscreen != 0;
+            s.frame_seq += 1;
+        }
+
         fn on_title_change(&self, _browser: Option<&mut Browser>, title: Option<&CefString>) {
             if let Some(t) = title {
                 self.handler.state.borrow_mut().title = t.to_string();
@@ -317,6 +367,7 @@ wrap_load_handler! {
         ) {
             if let Some(b) = browser {
                 crate::harden_profile(b);
+                crate::spelling::enable(b);
             }
             let mut s = self.handler.state.borrow_mut();
             s.loading = is_loading == 1;
@@ -439,6 +490,7 @@ wrap_request_handler! {
             let mut s = self.handler.state.borrow_mut();
             eprintln!("renderer for {} terminated: {why}", s.url);
             s.crashed = Some(why);
+            s.fullscreen = false;
             s.loading = false;
             s.unresponsive = false;
             s.unresponsive_callback = None;
@@ -557,9 +609,31 @@ fn text_host(url: &str) -> String {
 
 // ------------------------------------------------------------- life span
 
+/// A popup's page, waiting to be handed to the tab that opened it once
+/// Chromium has created it.
+pub(crate) struct Adoption {
+    opener: Rc<RefCell<ViewState>>,
+    pending: Pending,
+    events: Events,
+}
+
 #[derive(Clone)]
 pub struct LifeSpan {
     state: Rc<RefCell<ViewState>>,
+    /// Set on a popup's own client until its page exists.
+    adoption: Rc<RefCell<Option<Adoption>>>,
+}
+
+/// Whether a request for a new window is created through Chromium's popup
+/// path, so the new page can have the requester as its `window.opener`
+/// (roadmap 3.2): sign-in popups ("Sign in with Google") post their result
+/// back that way. Ctrl/middle clicks (background tabs) never are. CEF
+/// doesn't say whether the opener was suppressed (`target=_blank` links
+/// imply `noopener`), so links come this way too; the UI asks the new page
+/// whether it got an opener and shows it as a plain tab if not.
+pub(crate) fn wants_popup(disposition: cef::sys::cef_window_open_disposition_t, scriptable: bool) -> bool {
+    use cef::sys::cef_window_open_disposition_t as D;
+    scriptable && matches!(disposition, D::CEF_WOD_NEW_POPUP | D::CEF_WOD_NEW_FOREGROUND_TAB | D::CEF_WOD_NEW_WINDOW)
 }
 
 wrap_life_span_handler! {
@@ -568,8 +642,11 @@ wrap_life_span_handler! {
     }
 
     impl LifeSpanHandler {
-        /// Links that want a new window or tab become tabs in the app (the
-        /// UI opens them); Chromium's own popup window is cancelled.
+        /// `window.open` with an opener becomes a popup page Chromium
+        /// creates off screen like every other (never a native window),
+        /// shown by the UI as a tab marked as a popup. Everything else that
+        /// wants a new window or tab becomes a plain tab (the UI opens it)
+        /// and Chromium's own window is cancelled.
         fn on_before_popup(
             &self,
             _browser: Option<&mut Browser>,
@@ -578,21 +655,68 @@ wrap_life_span_handler! {
             target_url: Option<&CefString>,
             _target_frame_name: Option<&CefString>,
             target_disposition: WindowOpenDisposition,
-            _user_gesture: ::std::os::raw::c_int,
+            user_gesture: ::std::os::raw::c_int,
             _popup_features: Option<&PopupFeatures>,
-            _window_info: Option<&mut WindowInfo>,
-            _client: Option<&mut Option<Client>>,
-            _settings: Option<&mut BrowserSettings>,
+            window_info: Option<&mut WindowInfo>,
+            client: Option<&mut Option<Client>>,
+            settings: Option<&mut BrowserSettings>,
             _extra_info: Option<&mut Option<DictionaryValue>>,
-            _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
+            no_javascript_access: Option<&mut ::std::os::raw::c_int>,
         ) -> ::std::os::raw::c_int {
-            if let Some(url) = target_url.map(|u| u.to_string()).filter(|u| !u.is_empty()) {
-                use cef::sys::cef_window_open_disposition_t as D;
-                let raw: D = target_disposition.into();
+            use cef::sys::cef_window_open_disposition_t as D;
+            let url = target_url.map(|u| u.to_string()).unwrap_or_default();
+            let raw: D = target_disposition.into();
+            let scriptable = no_javascript_access.as_deref().is_some_and(|v| *v == 0);
+            let refused = self.handler.state.borrow().no_popups;
+            debug(|| format!("popup request {url:?} disposition {raw:?} scriptable {scriptable} gesture {user_gesture}"));
+            if refused {
+                return 1;
+            }
+            if let (true, Some(wi), Some(client), Some(settings)) = (wants_popup(raw, scriptable), window_info, client, settings) {
+                // Off screen, like every page here: no native window, ever.
+                wi.windowless_rendering_enabled = 1;
+                wi.parent_window = 0;
+                wi.shared_texture_enabled = 0;
+                wi.external_begin_frame_enabled = 0;
+                settings.windowless_frame_rate = crate::VISIBLE_FRAME_RATE;
+                settings.background_color = 0xFFFF_FFFF;
+                let (width, height, scale) = {
+                    let s = self.handler.state.borrow();
+                    (s.width, s.height, s.scale)
+                };
+                let state = Rc::new(RefCell::new(ViewState { url: url.clone(), width, height, scale, loading: true, ..Default::default() }));
+                let pending: Pending = Rc::default();
+                let events: Events = Rc::default();
+                let adoption = Adoption { opener: self.handler.state.clone(), pending: pending.clone(), events };
+                *client = Some(crate::handlers::client(state, pending, Some(adoption)));
+                return 0;
+            }
+            if !url.is_empty() {
                 let foreground = raw != D::CEF_WOD_NEW_BACKGROUND_TAB;
                 self.handler.state.borrow_mut().new_tabs.push((url, foreground));
             }
             1 // cancel Chromium's own popup window
+        }
+
+        /// A popup's page exists: hand it to its opener's tab.
+        fn on_after_created(&self, browser: Option<&mut Browser>) {
+            let Some(browser) = browser else { return };
+            let Some(a) = self.handler.adoption.borrow_mut().take() else { return };
+            let view = crate::WebView::adopt(browser.clone(), self.handler.state.clone(), a.pending, a.events);
+            a.opener.borrow_mut().new_popups.push(view);
+        }
+
+        /// A page went away. If it's the live one and we didn't close it,
+        /// it closed itself (`window.close()`, as sign-in popups do).
+        fn on_before_close(&self, browser: Option<&mut Browser>) {
+            let Some(id) = browser.map(|b| b.identifier()) else { return };
+            let mut s = self.handler.state.borrow_mut();
+            if id != 0 && s.browser_id == id {
+                debug(|| format!("page {id} closed itself ({})", s.url));
+                s.browser_id = 0;
+                s.closed_by_page = true;
+                s.frame_seq += 1;
+            }
         }
     }
 }
@@ -979,6 +1103,12 @@ wrap_context_menu_handler! {
                 can_paste: has(E::CM_EDITFLAG_CAN_PASTE),
                 can_select_all: has(E::CM_EDITFLAG_CAN_SELECT_ALL),
                 page_url: text(p.page_url()),
+                misspelled_word: text(p.misspelled_word()),
+                suggestions: {
+                    let mut list = CefStringList::new();
+                    p.dictionary_suggestions(Some(&mut list));
+                    list.into_iter().collect()
+                },
             };
             s.context_menu = Some(info);
             s.context_menu_callback = Some(cb.clone());
@@ -1077,12 +1207,12 @@ wrap_client! {
     }
 }
 
-pub fn client(state: Rc<RefCell<ViewState>>, pending: Pending) -> cef::Client {
+pub(crate) fn client(state: Rc<RefCell<ViewState>>, pending: Pending, adoption: Option<Adoption>) -> cef::Client {
     ClientBuilder::new(
         RenderHandlerBuilder::new(Render { state: state.clone() }),
         DisplayHandlerBuilder::new(Display { state: state.clone() }),
         LoadHandlerBuilder::new(Load { state: state.clone() }),
-        LifeSpanHandlerBuilder::new(LifeSpan { state: state.clone() }),
+        LifeSpanHandlerBuilder::new(LifeSpan { state: state.clone(), adoption: Rc::new(RefCell::new(adoption)) }),
         JsdialogHandlerBuilder::new(Dialogs { state: state.clone() }),
         FindHandlerBuilder::new(Misc { state: state.clone() }),
         DownloadHandlerBuilder::new(Misc { state: state.clone() }),
@@ -1092,6 +1222,44 @@ pub fn client(state: Rc<RefCell<ViewState>>, pending: Pending) -> cef::Client {
         ContextMenuHandlerBuilder::new(Misc { state: state.clone() }),
         RequestHandlerBuilder::new(Requests { state, pending }),
     )
+}
+
+// --------------------------------------------------------------- history
+
+#[derive(Clone)]
+pub struct HistoryCollector {
+    out: Rc<RefCell<crate::TabHistory>>,
+}
+
+wrap_navigation_entry_visitor! {
+    pub struct HistoryVisitorBuilder {
+        collector: HistoryCollector,
+    }
+
+    impl NavigationEntryVisitor {
+        fn visit(
+            &self,
+            entry: Option<&mut NavigationEntry>,
+            current: ::std::os::raw::c_int,
+            index: ::std::os::raw::c_int,
+            _total: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            let text = |u: CefStringUserfree| CefString::from(&u).to_string();
+            if let Some(e) = entry.filter(|e| e.is_valid() == 1) {
+                let mut out = self.collector.out.borrow_mut();
+                if current == 1 {
+                    out.current = index.max(0) as usize;
+                }
+                out.entries.push(crate::HistoryEntry { url: text(e.url()), title: text(e.title()) });
+            }
+            1 // keep going
+        }
+    }
+}
+
+/// Collects a tab's navigation entries into `out`.
+pub(crate) fn history_visitor(out: Rc<RefCell<crate::TabHistory>>) -> cef::NavigationEntryVisitor {
+    HistoryVisitorBuilder::new(HistoryCollector { out })
 }
 
 // -------------------------------------------------------------- devtools
@@ -1244,6 +1412,15 @@ pub fn cdp_observer(pending: Pending, events: Events, state: Rc<RefCell<ViewStat
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn popup_path_is_for_scriptable_new_windows() {
+        use cef::sys::cef_window_open_disposition_t as D;
+        assert!(super::wants_popup(D::CEF_WOD_NEW_POPUP, true));
+        assert!(super::wants_popup(D::CEF_WOD_NEW_FOREGROUND_TAB, true));
+        assert!(!super::wants_popup(D::CEF_WOD_NEW_POPUP, false));
+        assert!(!super::wants_popup(D::CEF_WOD_NEW_BACKGROUND_TAB, true));
+    }
+
     use super::{cert_error_text, is_cert_error, termination_text};
     use cef::sys::{cef_errorcode_t as E, cef_termination_status_t as T};
 

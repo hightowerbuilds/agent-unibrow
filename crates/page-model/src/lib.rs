@@ -39,6 +39,10 @@ const STRUCTURE: &[&str] = &[
     "group", "radiogroup", "article", "tabpanel",
 ];
 
+/// Structural roles that also get refs, though they aren't controls: things
+/// worth a close look (`browser_screenshot` with a ref captures just one).
+const VISUAL: &[&str] = &["img", "image", "figure", "table"];
+
 /// Roles that only add noise; their children are shown in their place.
 const TRANSPARENT: &[&str] = &[
     "generic", "none", "presentation", "LineBreak", "InlineTextBox", "paragraph", "Section", "div",
@@ -412,7 +416,8 @@ impl Walker<'_> {
                 && matches!(role, "group" | "list" | "listitem" | "row" | "cell" | "gridcell" | "region" | "figure");
             let mut next_depth = depth;
             if !unnamed_wrapper {
-                self.lines.push(format!("{}{}", "  ".repeat(depth), self.describe(n, interactive)));
+                let with_ref = interactive || VISUAL.contains(&role);
+                self.lines.push(format!("{}{}", "  ".repeat(depth), self.describe(n, with_ref)));
                 if interactive {
                     self.interactive += 1;
                 }
@@ -718,6 +723,23 @@ mod tests {
         let text = from_ax_tree_hiding(&nodes, &hidden).lines.join("\n");
         assert!(text.contains("[e88] textbox \"Card number\" value=[hidden] sensitive"), "{text}");
         assert!(!text.contains("4111"), "{text}");
+    }
+
+    #[test]
+    fn images_and_figures_get_refs() {
+        let nodes = vec![
+            node("1", None, "RootWebArea", "Report", 1, &["2", "4"]),
+            node("2", Some("1"), "figure", "Revenue by quarter", 5, &["3"]),
+            node("3", Some("2"), "img", "Revenue chart", 6, &[]),
+            node("4", Some("1"), "button", "Next", 7, &[]),
+        ];
+        let m = from_ax_tree(&nodes);
+        assert_eq!(
+            m.lines.join("\n"),
+            "[e5] figure \"Revenue by quarter\"\n  [e6] img \"Revenue chart\"\n[e7] button \"Next\""
+        );
+        // Only controls count as actionable.
+        assert_eq!(m.interactive, 1);
     }
 
     #[test]

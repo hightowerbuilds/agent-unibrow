@@ -1,0 +1,10 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Unibrow Test Shop – Enter your code</title><style>body { font: 16px system-ui, sans-serif; max-width: 520px; margin: 32px auto; padding: 0 16px; background: #fff; color: #1b2733; } input, button { font: inherit; padding: 8px; } .boxes input { width: 2.2em; text-align: center; } output { display: block; font-weight: 600; margin-top: 10px; }</style></head>
+<body>
+  <h1>Enter your code</h1>
+  <p>We sent a 6-digit code to your email.</p>
+  <div class="boxes" role="group" aria-label="Verification code">
+    <input maxlength="1" inputmode="numeric" aria-label="Digit 1"><input maxlength="1" inputmode="numeric" aria-label="Digit 2"><input maxlength="1" inputmode="numeric" aria-label="Digit 3"><input maxlength="1" inputmode="numeric" aria-label="Digit 4"><input maxlength="1" inputmode="numeric" aria-label="Digit 5"><input maxlength="1" inputmode="numeric" aria-label="Digit 6">
+  </div>
+  <button onclick="const v = Array.from(document.querySelectorAll('.boxes input')).map(i => i.value).join(''); document.getElementById('out').textContent = v === '905521' ? 'VERIFIED: account confirmed' : 'Code incomplete'">Verify</button>
+  <output id="out"></output>
+</body></html>

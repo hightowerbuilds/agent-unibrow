@@ -1003,6 +1003,8 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "dirs 6.0.0",
+ "futures",
+ "router",
  "rusqlite",
  "serde_json",
 ]
@@ -4660,6 +4662,7 @@ dependencies = [
  "browsing",
  "cef",
  "cef-dll-sys",
+ "chrono",
  "dirs 6.0.0",
  "futures",
  "keyring",
@@ -5578,6 +5581,7 @@ dependencies = [
  "browsing",
  "chats",
  "chrono",
+ "futures",
  "gpui",
  "image",
  "keyring",

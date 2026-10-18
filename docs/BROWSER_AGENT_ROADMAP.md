@@ -26,14 +26,14 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
 | --- | --- | --- | --- |
 | 1. Foundation | ✅ all | | |
 | 2. Full interaction | 2.1, 2.2, 2.4, 2.5, 2.6 | 2.3 | 2.7 |
-| 3. Tabs, windows, navigation | 3.4 | 3.1, 3.2, 3.3 | |
+| 3. Tabs, windows, navigation | ✅ all | | |
 | 4. Dialogs, permissions, files | 4.1, 4.2, 4.3, 4.4, 4.5 | 4.6 | |
-| 5. Accounts and handoff | 5.1, 5.3, 5.4 | 5.2, 5.5 | |
+| 5. Accounts and handoff | 5.1, 5.2, 5.3, 5.4 | 5.5 | |
 | 6. Safety and policy | ✅ all | | |
-| 7. Reliability | 7.2, 7.5 | 7.1, 7.3 | 7.4 |
+| 7. Reliability | ✅ all | | |
 | 8. Focus sites | 8.1, 8.2, 8.5, 8.6 | 8.3 (slot for Jev) | 8.4 (SubQ) |
 | 9. Extracting | ✅ 9.1, 9.2, 9.3, 9.4 | | |
-| 10. Polish | zoom, reader, context menu, favicons, audio, shortcuts | | translate, spellcheck, region shots; DevTools blocked |
+| 10. Polish | zoom, reader, context menu, favicons, audio, video codecs, fullscreen, region shots, shortcuts | | translate; spellcheck, PiP and DevTools blocked by CEF |
 | 11. Under the hood | throttling, crash recovery, memory caps | | GPU frame path, separate profiles |
 
 ## How the agent will see and drive pages
@@ -162,7 +162,7 @@ The minimum for the agent to work in the browser at all.
 
 ## Phase 3: Tabs, windows and navigation
 
-### 3.1 Multiple tabs — ◐ partial (tab strip, Ctrl+T/W/Tab/L, `browser_tabs`, target=_blank links open tabs; background pages for reading (9.3); agent-driven clicking in background tabs todo)
+### 3.1 Multiple tabs — ✅ **COMPLETED** (tab strip, shortcuts, `browser_tabs`; the agent works in its own background tab (`new` with `background`, or `use`) while the user browses theirs; marked "agent" in the strip; the agent bar offers Show)
 - Real tabs in the UI (a tab strip), each its own `WebView`.
 - Agent tools: `browser_tabs`, `browser_new_tab`, `browser_switch_tab`,
   `browser_close_tab`.
@@ -170,11 +170,11 @@ The minimum for the agent to work in the browser at all.
 - Background tabs, so the agent can compare several pages without taking
   over the one you're on.
 
-### 3.2 Popups — ◐ partial (`window.open` opens a tab; opener link for OAuth popups todo)
+### 3.2 Popups — ✅ **COMPLETED** (`window.open` popups keep `window.opener`, so OAuth sign-ins can post back; shown as tabs marked popup, closed when the page closes itself; `target=_blank` links stay plain tabs)
 - OAuth and payment popups (`window.open`) open as real popup views and
   close themselves back into the opener, instead of replacing the page.
 
-### 3.3 Navigation state — ◐ partial (load failures reported to the agent; per-tab history list todo)
+### 3.3 Navigation state — ✅ **COMPLETED** (load failures reported; right-click or long-press Back/Forward for the tab's history; `browser_history_list` for the agent)
 - Session history list per tab (`navigation_entries`).
 - Detect error pages, 404s, offline, and redirects to login.
 
@@ -223,7 +223,7 @@ The minimum for the agent to work in the browser at all.
 - The agent can ask to "sign in to X"; the app fills the fields itself, so
   **the model never sees the password**.
 
-### 5.2 Two-factor and verification — ◐ partial (code fields detected and refused; `browser_handoff`; reading email codes todo)
+### 5.2 Two-factor and verification — ✅ **COMPLETED** (code fields detected and refused; `browser_handoff`; `browser_email_code` finds an emailed code in Gmail and shows it to the user with Copy and Fill, never to the model; one-digit code boxes hidden from page reads. SMS and authenticator codes stay with the user)
 - Detect 2FA, email or SMS codes, and device checks.
 - Hand off: pause, highlight the field, tell the user what's needed, then
   resume once the page moves on.
@@ -286,7 +286,7 @@ The minimum for the agent to work in the browser at all.
 
 ## Phase 7: Reliability (finishing tasks, not just starting them)
 
-### 7.1 Act, then verify — ◐ partial (actions return the page afterwards; optional `expect` text checked on click/type/press)
+### 7.1 Act, then verify — ✅ **COMPLETED** ("Check:" lines after actions: clicks that did nothing, typed values that didn't stick, form errors after a submit; plus optional `expect`)
 - Every action declares what should change (URL, element, text), and the
   agent checks that it did before moving on.
 
@@ -294,18 +294,18 @@ The minimum for the agent to work in the browser at all.
 - Wait on real signals (load, network idle, element visible, spinner
   gone), never fixed sleeps.
 
-### 7.3 Recovering — ◐ partial (stale refs reported clearly; cookie banners flagged, not auto-accepted; retries todo)
+### 7.3 Recovering — ✅ **COMPLETED** (stale refs found again by role and name; covered elements named instead of clicked through; clicks during loading wait and retry once; anything that could commit is never retried)
 - Stale refs after re-render: re-read and re-find the element by role and
   name.
 - Unexpected modals (cookie banners, newsletter popups): recognize and
   dismiss them.
 - Retries with backoff, then a clear failure the user can act on.
 
-### 7.4 Long tasks — todo
+### 7.4 Long tasks — ✅ **COMPLETED** (`task_progress` plan per chat, shown as a checklist; survives crashes, restarts and turn caps)
 - Checkpoints, so a task can resume after an app restart.
 - Running tasks in background tabs while the user keeps browsing.
 
-### 7.5 Evals — ✅ **COMPLETED** (`crates/evals/run_evals.py`, 38 cases over local test pages; nightly scheduling todo)
+### 7.5 Evals — ✅ **COMPLETED** (`crates/evals/run_evals.py`, 53 cases over local test pages; nightly systemd timer files in `crates/evals/nightly/`, not installed)
 - Local test pages for each capability (forms, dropdowns, iframes, drag,
   dialogs, uploads, infinite scroll).
 - Recorded tasks on focus sites, replayed nightly; pass rates tracked in
@@ -407,13 +407,14 @@ set path instead of starting from scratch each time.
 
 - Zoom (Ctrl+= / Ctrl+- / Ctrl+0, Ctrl+wheel, per site, toolbar badge; agent clicks stay accurate) — ✅ **COMPLETED**
 - Reader mode (toolbar Reader button, clean article view) — ✅ **COMPLETED**
-- Translate page — todo
-- Spellcheck in fields (`replace_misspelling`) — todo
+- Translate page — skipped: Chromium's translate sends page text to Google. Option: the agent translates the extracted article into chat or reader view — todo
+- Spellcheck in fields — blocked: CEF 154 off-screen browsers never report misspellings (dictionary downloads, prefs set); menu wiring ready if it ever does
 - Right-click context menus rendered in-app (links, images, editing, navigation, save as PDF, view source) — ✅ **COMPLETED**
 - Keyboard shortcuts: Ctrl+L, Ctrl+T, Ctrl+W, Ctrl+Tab, Ctrl+F, Esc — ✅ **COMPLETED**
-- Favicons and page titles in tabs — ✅ **COMPLETED** (bookmarks and history list still text-only)
+- Favicons and page titles in tabs, History and Bookmarks — ✅ **COMPLETED**
 - Audio: ♪ indicator and mute per tab — ✅ **COMPLETED** (play/pause controls todo; indicator can linger on Web Audio pages)
-- Picture of a region ("screenshot this chart") — todo
+- Video: H.264/AAC/HLS through Arch's codec-enabled CEF build (X, Reddit, Vimeo, news players); Widevine; fullscreen fills the window, Escape leaves — ✅ **COMPLETED**. Picture-in-picture can't work with off-screen rendering
+- Picture of a region (`browser_screenshot` with `ref` or `clip`; Save screenshot in the context menu) — ✅ **COMPLETED**
 - Developer tools for debugging pages — blocked: CEF 154 only opens DevTools as a separate native window (no off-screen mode); a remote-debugging port would let any local program drive the browser, so not done
 
 ---

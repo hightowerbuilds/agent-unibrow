@@ -1,0 +1,35 @@
+# Runs the eval suite once (roadmap 7.5); started nightly by
+# agent-unibrow-evals.timer. Not installed or enabled by anything in the
+# repo. To use it:
+#
+#   1. Point WorkingDirectory below at your checkout if it isn't
+#      ~/Desktop/Projects/agent-unibrow.
+#   2. Link both units into your user units and start the timer:
+#        mkdir -p ~/.config/systemd/user
+#        ln -s "$PWD"/crates/evals/nightly/agent-unibrow-evals.{service,timer} ~/.config/systemd/user/
+#        systemctl --user daemon-reload
+#        systemctl --user enable --now agent-unibrow-evals.timer
+#   3. The evals open (hidden) app windows, so the service needs your
+#      graphical session's environment. Most Wayland sessions import it into
+#      systemd; if `systemctl --user show-environment` has no WAYLAND_DISPLAY,
+#      add to your compositor's startup:
+#        systemctl --user import-environment WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE XDG_RUNTIME_DIR
+#
+# Run now:      systemctl --user start agent-unibrow-evals.service
+# Last result:  systemctl --user status agent-unibrow-evals.service
+#               journalctl --user -u agent-unibrow-evals.service
+# Full logs:    crates/evals/results/nightly-*.log and the JSON beside them.
+# Stop it:      systemctl --user disable --now agent-unibrow-evals.timer
+#
+# Only some cases: set Environment=EVAL_CASES=checkout-form widgets …
+
+[Unit]
+Description=agent-unibrow browser-agent evals
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Desktop/Projects/agent-unibrow
+ExecStart=%h/Desktop/Projects/agent-unibrow/crates/evals/nightly/run-nightly.sh
+# A full suite takes a while; each case is capped at 5 minutes by the runner.
+TimeoutStartSec=4h
+Nice=10

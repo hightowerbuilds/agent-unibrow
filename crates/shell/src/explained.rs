@@ -92,6 +92,11 @@ const GUIDE: &[Section] = &[
                 "When it needs you (a sign-in, a code, a CAPTCHA), it says so and waits. Do that part, then tell it \
                  to carry on.",
             ),
+            Block::Para(
+                "Codes sent by email are quicker: the agent finds the email in your Gmail and shows the code above \
+                 the page, with Copy and \"Fill the code field\". It never sees the code itself; you check it and \
+                 press Done.",
+            ),
         ],
     },
     Section {

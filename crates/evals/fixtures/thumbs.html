@@ -1,0 +1,45 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Video thumbnails – Unibrow Test Shop</title>
+<style>
+  body { font: 13px system-ui, sans-serif; margin: 12px; background: #fff; color: #1b2733; }
+  .grid { display: flex; flex-wrap: wrap; gap: 8px; }
+  .cell { border: 1px solid #d5dce2; border-radius: 6px; padding: 4px; width: 170px; }
+  .cell video, .cell img { width: 160px; height: 90px; background: #ddd; display: block; object-fit: cover; }
+  .cell b { display: block; font-size: 11px; min-height: 2.4em; }
+  .spacer { height: 1400px; }
+</style></head><body>
+<h1>Video thumbnails</h1>
+<p id="status">Checking…</p>
+<div class="grid">
+  <div class="cell"><video src="media/h264-aac.mp4" poster="media/poster.jpg" preload="metadata" muted></video><b>MP4 (H.264) + poster</b></div>
+  <div class="cell"><video src="media/h264-aac.mp4" preload="metadata" muted></video><b>MP4 (H.264), no poster</b></div>
+  <div class="cell"><video src="media/vp9-opus.webm" poster="media/poster.jpg" preload="metadata" muted></video><b>WebM (VP9) + poster</b></div>
+  <div class="cell"><video src="media/vp9-opus.webm" preload="metadata" muted></video><b>WebM (VP9), no poster</b></div>
+  <div class="cell"><video src="media/h264-aac.mp4#t=0.5" preload="auto" muted></video><b>MP4 (H.264) #t=0.5 frame</b></div>
+  <div class="cell"><video src="media/vp9-opus.webm#t=0.5" preload="auto" muted></video><b>WebM (VP9) #t=0.5 frame</b></div>
+  <div class="cell"><video src="media/h264-aac.mp4" poster="media/poster.webp" autoplay muted loop playsinline></video><b>MP4 autoplay muted + WebP poster</b></div>
+  <div class="cell"><img src="media/poster.jpg"><b>JPEG image</b></div>
+  <div class="cell"><img src="media/poster.webp"><b>WebP image</b></div>
+  <div class="cell"><img src="media/poster.avif"><b>AVIF image</b></div>
+  <div class="cell"><img loading="lazy" src="media/poster.webp?lazy-top"><b>lazy WebP (in view)</b></div>
+</div>
+<div class="spacer"></div>
+<div class="grid">
+  <div class="cell"><img loading="lazy" src="media/poster.jpg?lazy-below"><b>lazy JPEG (below the fold)</b></div>
+  <div class="cell"><img id="io" data-src="media/poster.webp?io"><b>IntersectionObserver WebP</b></div>
+</div>
+<script>
+// Reports, per element: images loaded (naturalWidth), videos' readyState,
+// error and whether a frame or poster is there to show.
+const io = new IntersectionObserver(es => es.forEach(e => {
+  if (e.isIntersecting) { e.target.src = e.target.dataset.src; io.unobserve(e.target); }
+}));
+io.observe(document.getElementById('io'));
+window.__thumbs = () => JSON.stringify([...document.querySelectorAll('.cell')].map(c => {
+  const el = c.querySelector('video, img');
+  const label = c.querySelector('b').textContent;
+  if (el.tagName === 'IMG') return label + ': ' + (el.complete && el.naturalWidth ? 'loaded ' + el.naturalWidth + 'px' : 'not loaded');
+  return label + ': readyState ' + el.readyState + (el.error ? ' error ' + el.error.code : '') + ' ' + el.videoWidth + 'x' + el.videoHeight;
+}));
+setTimeout(() => { document.getElementById('status').textContent = 'Checked'; document.title = 'Video thumbnails checked'; }, 3000);
+</script>
+</body></html>

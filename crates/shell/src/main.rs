@@ -5,8 +5,11 @@
 //! its own thread; its events arrive here over a channel.
 
 mod browser_pane;
+mod chat_tools;
 mod explained;
 mod safety;
+mod site_icons;
+mod task_plan;
 mod text_input;
 mod theme;
 mod watcher;
@@ -22,7 +25,7 @@ use router::Registry;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use browser_pane::{AgentControl, BrowserPane, BrowsingChanged};
+use browser_pane::{AgentControl, BrowserPane, BrowsingChanged, FullscreenChanged};
 use rail_browser::BrowserBridge;
 use browsing::{Browsing, HistoryQuery, site_of};
 use text_input::{Changed, Submit, TextInput};
@@ -162,8 +165,12 @@ struct Shell {
     chat_list_open: bool,
     /// A chat whose Delete was clicked once and awaits the confirm click.
     confirm_delete: Option<chats::ChatId>,
+    /// Rename, search and export (chat_tools.rs).
+    chat_tools: chat_tools::ChatTools,
     /// The active chat's messages.
     items: Vec<Item>,
+    /// The agent's checklist for this chat (7.4), shown above the messages.
+    task_plan: Option<chats::TaskPlan>,
     /// Index of the assistant item currently receiving streamed text.
     streaming: Option<usize>,
     stream_saved: Instant,
@@ -187,6 +194,8 @@ struct Shell {
     sidebar_view: Option<Entity<SidebarView>>,
     tab: SidebarTab,
     bookmarks_open: bool,
+    /// Favicons for History and Bookmarks rows.
+    site_icons: site_icons::SiteIcons,
     needs_key: bool,
     conv_scroll: ScrollHandle,
     trace_scroll: ScrollHandle,
@@ -207,6 +216,7 @@ impl Shell {
             .unwrap_or_else(|| chats.create());
         chats.mark_active(chat_id);
         let items = load_items(&chats, chat_id);
+        let task_plan = chats.plan(chat_id);
         let input = cx.new(|cx| TextInput::new(IDLE_PLACEHOLDER, cx));
         let (bridge, requests) = rail_browser::bridge::channel();
         let browser = cx.new(|cx| BrowserPane::new(cef, store.clone(), requests, window, cx));
@@ -232,7 +242,9 @@ impl Shell {
             }
         });
         let filter_sub = cx.subscribe(&history_filter, |_: &mut Self, _, _: &Changed, cx| cx.notify());
+        let fullscreen_sub = cx.subscribe(&browser, |_: &mut Self, _, _: &FullscreenChanged, cx| cx.notify());
         window.focus(&input.focus_handle(cx));
+        let (chat_tools, chat_tools_subs) = chat_tools::ChatTools::new(window, cx);
 
         // Site scope (6.3) checks against the focus sites.
         let mut policy = Policy::load();
@@ -258,7 +270,9 @@ impl Shell {
             chat_id,
             chat_list_open: false,
             confirm_delete: None,
+            chat_tools,
             items,
+            task_plan,
             streaming: None,
             stream_saved: Instant::now(),
             pending_recap: None,
@@ -276,12 +290,15 @@ impl Shell {
             sidebar_view: None,
             tab: SidebarTab::Chat,
             bookmarks_open: false,
+            site_icons: Default::default(),
             needs_key: false,
             conv_scroll: ScrollHandle::new(),
             trace_scroll: ScrollHandle::new(),
-            _subscriptions: vec![subscription, browsing_sub, filter_sub, control_sub],
+            _subscriptions: vec![subscription, browsing_sub, filter_sub, fullscreen_sub, control_sub],
             _events: None,
         };
+        shell._subscriptions.extend(chat_tools_subs);
+        shell.spawn_chat_test(cx);
         if let Some(p) = shell.trace.path().cloned() {
             shell.trace.push(Kind::Info, "Trace file opened", Some(p.display().to_string()));
         }
@@ -407,19 +424,26 @@ impl Shell {
         // be signed in through the shared keyring otherwise.
         let test_instance = std::env::var_os("UNIBROW_DATA_DIR").is_some()
             && std::env::var("UNIBROW_ALLOW_GMAIL").as_deref() != Ok("1");
+        let mut codes: Option<Arc<dyn router::CodeSource>> = None;
         let notes = if test_instance {
+            // Test hook: a fake inbox file stands in for Gmail's codes.
+            if let Ok(path) = std::env::var("UNIBROW_TEST_INBOX") {
+                codes = Some(Arc::new(rail_api::codes::FileCodes(path.into())));
+            }
             vec!["Gmail tools off in this test instance".to_string()]
         } else {
             let (rail, notes) = rail_api::ApiRail::from_config();
             registry.add_rail(&rail);
+            codes = rail.code_source();
             notes
         };
         for tool in browsing::tools(self.store.clone()) {
             registry.add_tool(tool);
         }
-        for tool in rail_browser::tools::tools(self.bridge.clone(), self.store.clone()) {
+        for tool in rail_browser::tools::tools(self.bridge.clone(), self.store.clone(), codes) {
             registry.add_tool(tool);
         }
+        registry.add_tool(chats::TaskProgress::new(self.chats.clone(), self.chat_id));
         for n in &notes {
             self.trace.push(Kind::Info, n.clone(), None);
         }
@@ -498,6 +522,10 @@ impl Shell {
             Some(sites) => format!("[Focus sites: {sites}]\n{text}"),
             None => text,
         };
+        // An unfinished task plan: say where it stands (7.4).
+        if let Some(line) = self.chats.plan_reminder(self.chat_id) {
+            message = format!("{line}\n{message}");
+        }
         if let Some(recap) = self.pending_recap.take() {
             message = format!(
                 "[Earlier in this chat, before you joined it. You can't see these messages otherwise:]\n{recap}\n[End of the earlier messages.]\n\n{message}"
@@ -659,6 +687,9 @@ impl Shell {
                 self.trace.push(Kind::ToolCall, format!("{name} {}", compact(&input)), Some(pretty));
             }
             AgentEvent::ToolResult { name, ok, summary, content, evidence, .. } => {
+                if name == "task_progress" {
+                    self.task_plan = self.chats.plan(self.chat_id);
+                }
                 let kind = if ok { Kind::ToolResult } else { Kind::Error };
                 let images = evidence.iter().filter_map(rail_browser::tools::decode_image).collect();
                 self.trace.push_with_images(kind, format!("{name}: {summary}"), Some(content), images);
@@ -915,6 +946,7 @@ impl Shell {
             .child(self.render_chat_strip(cx))
             .child(self.render_backend_bar(cx))
             .when(self.chat_list_open, |d| d.child(self.render_chat_list(cx)))
+            .when_some(self.task_plan.as_ref().filter(|_| !self.chat_list_open), |d, p| d.child(task_plan::render(p)))
             .when(!self.chat_list_open, |d| d.child(
                 div()
                     .id("conversation")
@@ -1068,12 +1100,13 @@ impl Shell {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .pl(px(34.))
+                        .pl(px(10.))
                         .pr_3()
                         .py_1()
                         .cursor_pointer()
                         .hover(|s| s.bg(rgb(theme::RAISED)))
                         .on_click(cx.listener(move |this, _, _, cx| this.open_url(url.clone(), cx)))
+                        .child(self.site_icons.view(&self.store, &m.site))
                         .child(
                             div()
                                 .flex()
@@ -1161,6 +1194,7 @@ impl Shell {
                             .text_color(rgb(theme::MUTED))
                             .child(v.at.format("%-I:%M %p").to_string()),
                     )
+                    .child(self.site_icons.view(&self.store, &v.site))
                     .child(
                         div()
                             .flex()
@@ -1170,6 +1204,7 @@ impl Shell {
                             .child(div().text_sm().text_color(rgb(theme::FG)).truncate().child(label))
                             .child(div().text_xs().text_color(rgb(theme::MUTED)).truncate().child(v.site.clone())),
                     )
+                    .child(self.site_icons.view(&self.store, &v.site))
                     .child(
                         Self::small_button(
                             SharedString::from(format!("visit-focus-{}", v.id)),
@@ -1800,6 +1835,7 @@ impl Shell {
         self.chat_id = id;
         self.chats.mark_active(id);
         self.items = load_items(&self.chats, id);
+        self.task_plan = self.chats.plan(id);
         self.chat_list_open = false;
         self.confirm_delete = None;
         self.can_continue = false;
@@ -1889,9 +1925,16 @@ impl Shell {
                             .bg(rgb(if active { theme::RAISED } else { theme::PANE }))
                             .text_color(rgb(if active { theme::FG } else { theme::MUTED }))
                             .when(!active, |d| d.cursor_pointer().hover(|s| s.text_color(rgb(theme::FG))))
-                            .on_click(cx.listener(move |this, _, _, cx| this.switch_chat(id, cx)))
+                            // Double-click the title to rename the chat.
+                            .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
+                                if ev.click_count() >= 2 {
+                                    this.start_rename(id, false, window, cx);
+                                } else {
+                                    this.switch_chat(id, cx);
+                                }
+                            }))
                             .when(active && self.busy, |d| d.child(div().text_color(rgb(theme::ACCENT)).child("●")))
-                            .child(title)
+                            .child(self.strip_title(id, title, cx))
                             .child(
                                 div()
                                     .id(SharedString::from(format!("chat-close-{id}")))
@@ -1932,77 +1975,6 @@ impl Shell {
                     }))
                     .child("All chats"),
             )
-    }
-
-    /// Every saved chat, newest first (C2.2).
-    fn render_chat_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let all = self.chats.all();
-        let today = chrono::Local::now().date_naive();
-        div()
-            .id("chat-list")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .when(all.is_empty(), |d| d.child(div().p_3().text_sm().text_color(rgb(theme::MUTED)).child("No chats yet.")))
-            .children(all.into_iter().map(|c| {
-                let id = c.id;
-                let active = id == self.chat_id;
-                let confirming = self.confirm_delete == Some(id);
-                let when = if c.updated.date_naive() == today {
-                    c.updated.format("%-I:%M %p").to_string()
-                } else {
-                    c.updated.format("%b %-d").to_string()
-                };
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(rgb(theme::RULE))
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("chat-row-{id}")))
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| this.switch_chat(id, cx)))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .truncate()
-                                    .text_color(rgb(if active { theme::ACCENT } else { theme::FG }))
-                                    .child(c.title.clone()),
-                            )
-                            .child(div().text_xs().text_color(rgb(theme::MUTED)).child(format!(
-                                "{} message{} · {when}{}",
-                                c.items,
-                                if c.items == 1 { "" } else { "s" },
-                                if active { " · open now" } else if c.open { " · in the strip" } else { "" }
-                            ))),
-                    )
-                    .child(
-                        Self::small_button(
-                            SharedString::from(format!("chat-delete-{id}")),
-                            if confirming { "Confirm delete" } else { "Delete" },
-                            confirming,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if this.confirm_delete == Some(id) {
-                                this.close_chat(id, true, cx);
-                                this.chat_list_open = true;
-                            } else {
-                                this.confirm_delete = Some(id);
-                            }
-                            cx.notify();
-                        })),
-                    )
-            }))
     }
 
     fn render_approval(&self, a: &PendingApproval, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2139,7 +2111,8 @@ impl Focusable for Shell {
 }
 
 impl Render for Shell {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.site_icons.release(window);
         if self.sidebar_view.is_none() {
             let shell = cx.entity();
             self.sidebar_view = Some(cx.new(|cx| SidebarView {
@@ -2149,7 +2122,9 @@ impl Render for Shell {
         }
         // Cached: page frames redraw the browser pane (and so this view),
         // but the sidebar only re-renders when the shell itself changes.
-        let sidebar = self.sidebar_open.then(|| {
+        // A fullscreen video gets the whole window.
+        let fullscreen = self.browser.read(cx).is_fullscreen();
+        let sidebar = (self.sidebar_open && !fullscreen).then(|| {
             AnyView::from(self.sidebar_view.clone().expect("created above"))
                 .cached(StyleRefinement::default().w(px(SIDEBAR_WIDTH)).h_full().flex_none())
         });
@@ -2187,7 +2162,7 @@ impl Render for Shell {
             .bg(rgb(theme::BG))
             .text_color(rgb(theme::FG))
             .children(sidebar)
-            .child(self.render_bumper(cx))
+            .when(!fullscreen, |d| d.child(self.render_bumper(cx)))
             .child(self.browser.clone())
     }
 }

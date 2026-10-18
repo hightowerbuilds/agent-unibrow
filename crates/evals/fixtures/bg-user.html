@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Field Notes – reading</title>
+<style>
+  body { font: 17px Georgia, serif; max-width: 680px; margin: 0 auto; padding: 0 16px; color: #1b2733; }
+  #tap { display: block; height: 140px; margin: 0; background: #f3efe6; border: 0; width: 100%; font: inherit; cursor: pointer; }
+</style>
+</head>
+<body>
+  <button id="tap">Tap here to mark your place (marked 0 times)</button>
+  <h1>Field notes on river birds</h1>
+  <p>The user is reading this page while the assistant works elsewhere. Herons stand still for minutes, then strike.</p>
+  <p>Kingfishers dive from a perch; dippers walk underwater against the current.</p>
+  <script>
+    let n = 0;
+    document.getElementById('tap').addEventListener('click', () => {
+      n += 1;
+      document.getElementById('tap').textContent = 'Tap here to mark your place (marked ' + n + ' times)';
+      document.title = 'Field Notes – marked ' + n;
+    });
+  </script>
+</body>
+</html>

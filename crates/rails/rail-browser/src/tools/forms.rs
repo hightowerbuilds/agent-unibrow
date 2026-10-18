@@ -123,12 +123,12 @@ fn shorten(s: &str, n: usize) -> String {
 }
 
 impl Browser {
-    async fn field_kind(&self, el: &Element) -> Value {
+    pub(super) async fn field_kind(&self, el: &Element) -> Value {
         self.call_on(el, KIND_FN).await.unwrap_or(Value::Null)
     }
 
     /// The editable element inside a wrapper, as its own [`Element`].
-    async fn inner_field(&self, el: &Element) -> Option<Element> {
+    pub(super) async fn inner_field(&self, el: &Element) -> Option<Element> {
         let node = self.cdp_el(el, "DOM.resolveNode", json!({"backendNodeId": el.backend_id})).await.ok()?;
         let object_id = node["object"]["objectId"].as_str()?.to_string();
         let r = self
@@ -384,10 +384,11 @@ impl Tool for FillForm {
             // Look at every field first: refuse sensitive ones before typing
             // anything, so a form is never left half-filled by a refusal.
             let mut plan = Vec::new();
+            let mut notes: Vec<String> = Vec::new();
             for f in &fields {
                 check_keys(f, &["ref", "value"])?;
-                let r = arg_str(f, "ref")?.to_string();
-                let el = b.element(&r).await?;
+                let (el, stale, r) = b.resolve(arg_str(f, "ref")?).await?;
+                notes.extend(stale);
                 if b.probe(&el).await.sensitive {
                     return Err(format!(
                         "{} [{r}] is a password, payment or verification-code field. The agent doesn't fill these; \
@@ -399,6 +400,7 @@ impl Tool for FillForm {
             }
             let mut report = Vec::new();
             let mut failed = 0;
+            let mut typed = Vec::new();
             for (r, el, value) in &plan {
                 if let Ok(rect) = b.rect(el).await {
                     b.bridge.highlight(rect, format!("fill {}", el.label()));
@@ -408,7 +410,12 @@ impl Tool for FillForm {
                     other => other.to_string(),
                 };
                 match b.fill_any(el, value).await {
-                    Ok(note) => report.push(format!("• [{r}] {} ← {shown}.{note}", el.label())),
+                    Ok(note) => {
+                        report.push(format!("• [{r}] {} ← {shown}.{note}", el.label()));
+                        if let Value::String(text) = value {
+                            typed.push((el.clone(), r.clone(), text.clone()));
+                        }
+                    }
                     Err(e) => {
                         failed += 1;
                         report.push(format!("• [{r}] {}: NOT filled. {e}", el.label()));
@@ -420,10 +427,13 @@ impl Tool for FillForm {
             } else {
                 format!("Filled {} of {} field(s); {failed} failed. Nothing was submitted.", plan.len() - failed, plan.len())
             };
-            b.after_action_expecting(
+            // Each text field is read back once the page has settled (7.1).
+            let verify = super::Verify { lines: notes, typed, ..Default::default() };
+            b.after_action_full(
                 format!("{head}\n{}", report.join("\n")),
                 format!("filled {} fields", plan.len() - failed),
                 input["expect"].as_str().map(str::to_string),
+                verify,
             )
             .await
         })

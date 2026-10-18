@@ -15,6 +15,7 @@ mod handlers;
 pub mod keys;
 pub mod permissions;
 pub mod reader;
+pub mod spelling;
 pub mod tools;
 pub mod vault;
 
@@ -27,6 +28,20 @@ use std::time::{Duration, Instant};
 
 pub use bridge::{BrowserBridge, NavAction, PageState, Request};
 pub use keys::KeyInput;
+
+/// One entry of a tab's back/forward history (roadmap 3.3).
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoryEntry {
+    pub url: String,
+    pub title: String,
+}
+
+/// A tab's back/forward list and where the page is in it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TabHistory {
+    pub entries: Vec<HistoryEntry>,
+    pub current: usize,
+}
 
 /// Directory holding libcef.so, the .pak resources and locales. Set by the
 /// build script from the CEF download.
@@ -173,6 +188,10 @@ pub struct ContextMenuInfo {
     pub can_paste: bool,
     pub can_select_all: bool,
     pub page_url: String,
+    /// The misspelled word under the pointer in a text field, if any, and
+    /// the spellchecker's suggestions for it.
+    pub misspelled_word: String,
+    pub suggestions: Vec<String>,
 }
 
 /// Editing commands for the frame a context menu was opened on.
@@ -186,6 +205,10 @@ pub enum EditCommand {
 
 /// Frame rate for the visible tab.
 const VISIBLE_FRAME_RATE: i32 = 60;
+/// A tab the agent works in while the user looks at another (3.1). It
+/// stays visible to Chromium, so it lays out, animates and answers
+/// screenshots and input like a shown tab, but nobody watches it.
+const WORKING_FRAME_RATE: i32 = 20;
 /// Hidden tabs and background pages: Chromium doesn't paint them anyway,
 /// so keep the compositor's clock as slow as it goes (scripts still run).
 const HIDDEN_FRAME_RATE: i32 = 1;
@@ -269,6 +292,16 @@ pub struct ViewState {
     pub(crate) permission_callback: Option<PendingPermission>,
     /// Links that asked for a new tab or window: (url, open in foreground).
     pub new_tabs: Vec<(String, bool)>,
+    /// Popup windows this page opened with `window.open` (3.2), created by
+    /// Chromium with this page as their opener, waiting for the UI.
+    pub(crate) new_popups: Vec<WebView>,
+    /// Turn popups down (background pages, where nobody would see them).
+    pub(crate) no_popups: bool,
+    /// The live page's browser id, so a close we didn't ask for (the page
+    /// called `window.close()`) can be told from ours.
+    pub(crate) browser_id: i32,
+    /// The page closed itself (`window.close()`); the tab should go.
+    pub closed_by_page: bool,
     pub popup: Option<PopupLayer>,
     pub dialog: Option<DialogInfo>,
     pub(crate) dialog_callback: Option<cef::JsdialogCallback>,
@@ -295,6 +328,8 @@ pub struct ViewState {
     pub(crate) auth_fetch: Option<handlers::AuthFetch>,
     /// The tab's page was closed to save memory; showing it reloads it.
     pub discarded: bool,
+    /// An element of the page (usually a video) is fullscreen.
+    pub fullscreen: bool,
     /// Logical (DIP) size the page is laid out at.
     pub(crate) width: i32,
     pub(crate) height: i32,
@@ -404,7 +439,7 @@ impl Live {
         // transparent (they'd screenshot as black).
         let browser_settings =
             cef::BrowserSettings { windowless_frame_rate: rate, background_color: 0xFFFF_FFFF, ..Default::default() };
-        let mut client = handlers::client(state.clone(), pending.clone());
+        let mut client = handlers::client(state.clone(), pending.clone(), None);
         let browser = cef::browser_host_create_browser_sync(
             Some(&window_info),
             Some(&mut client),
@@ -414,13 +449,32 @@ impl Live {
             None,
         )
         .ok_or("Chromium couldn't create the page view")?;
+        Ok(Self::attach(browser, state, pending, events))
+    }
+
+    /// Wires up a page Chromium created: DevTools replies and events, and
+    /// its id for telling its own closes from ours.
+    fn attach(browser: cef::Browser, state: &Rc<RefCell<ViewState>>, pending: &handlers::Pending, events: &handlers::Events) -> Self {
+        state.borrow_mut().browser_id = browser.identifier();
         let registration = browser
             .host()
             .and_then(|h| {
                 h.add_dev_tools_message_observer(Some(&mut handlers::cdp_observer(pending.clone(), events.clone(), state.clone())))
             });
-        Ok(Self { browser, _cdp_registration: registration })
+        Self { browser, _cdp_registration: registration }
     }
+}
+
+/// How a page is shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Visibility {
+    /// The tab on screen.
+    Shown,
+    /// Off screen, but the agent is working in it: Chromium treats it as
+    /// visible (painting, timers, screenshots, input) at a lower frame rate.
+    Working,
+    /// A background tab: not painted, timers throttled, may be discarded.
+    Hidden,
 }
 
 /// Profile settings that hold for every page: certificate warnings can't
@@ -453,7 +507,7 @@ pub struct WebView {
     cdp_events: handlers::Events,
     cdp_next_id: Cell<i32>,
     idle: Cell<Idle>,
-    hidden: Cell<bool>,
+    visibility: Cell<Visibility>,
 }
 
 impl WebView {
@@ -469,15 +523,30 @@ impl WebView {
         let cdp_pending: handlers::Pending = Rc::default();
         let cdp_events: handlers::Events = Rc::default();
         let live = Live::open(url, &state, &cdp_pending, &cdp_events, VISIBLE_FRAME_RATE)?;
-        Ok(Self {
+        Ok(Self::with_live(live, state, cdp_pending, cdp_events))
+    }
+
+    /// A popup page Chromium created for an opener (`window.open`).
+    pub(crate) fn adopt(
+        browser: cef::Browser,
+        state: Rc<RefCell<ViewState>>,
+        pending: handlers::Pending,
+        events: handlers::Events,
+    ) -> Self {
+        let live = Live::attach(browser, &state, &pending, &events);
+        Self::with_live(live, state, pending, events)
+    }
+
+    fn with_live(live: Live, state: Rc<RefCell<ViewState>>, cdp_pending: handlers::Pending, cdp_events: handlers::Events) -> Self {
+        Self {
             live: RefCell::new(Some(live)),
             state,
             cdp_pending,
             cdp_events,
             cdp_next_id: Cell::new(1),
             idle: Cell::new(Idle::default()),
-            hidden: Cell::new(false),
-        })
+            visibility: Cell::new(Visibility::Shown),
+        }
     }
 
     fn browser(&self) -> Option<cef::Browser> {
@@ -543,6 +612,7 @@ impl WebView {
             crashed: s.crashed.is_some(),
             auth: s.auth.as_ref().map(|a| a.site()),
             permission_prompt: s.permission_prompt.as_ref().map(|p| format!("{} asks for {}", p.origin, permissions::describe(&p.kinds))),
+            tab_note: None,
         }
     }
 
@@ -759,21 +829,59 @@ impl WebView {
     /// throttles their timers, and their frame rate drops to the minimum.
     /// Showing a discarded tab loads its page again.
     pub fn set_hidden(&self, hidden: bool) {
+        self.apply_visibility(if hidden { Visibility::Hidden } else { Visibility::Shown }, true);
+    }
+
+    /// Shows, hides, or keeps the page working off screen. Does nothing
+    /// if it's already that way.
+    pub fn set_visibility(&self, v: Visibility) {
+        self.apply_visibility(v, false);
+    }
+
+    pub fn visibility(&self) -> Visibility {
+        self.visibility.get()
+    }
+
+    fn apply_visibility(&self, v: Visibility, always: bool) {
+        let hidden = v == Visibility::Hidden;
         if !hidden {
             self.restore();
         }
-        self.hidden.set(hidden);
+        let was = self.visibility.replace(v);
+        if was == v && !always {
+            return;
+        }
         let mut idle = self.idle.get();
         idle.set_hidden(hidden, Instant::now());
         self.idle.set(idle);
         if let Some(h) = self.host() {
-            if !hidden {
-                h.set_windowless_frame_rate(VISIBLE_FRAME_RATE);
+            match v {
+                Visibility::Shown => h.set_windowless_frame_rate(VISIBLE_FRAME_RATE),
+                Visibility::Working => h.set_windowless_frame_rate(WORKING_FRAME_RATE),
+                Visibility::Hidden => {}
             }
             h.was_hidden(hidden as i32);
             if hidden {
                 h.set_windowless_frame_rate(HIDDEN_FRAME_RATE);
+            } else if was == Visibility::Hidden {
+                // Paint once now, so a screenshot taken straight away has a frame.
+                h.invalidate(cef::PaintElementType::from(cef::sys::cef_paint_element_type_t::PET_VIEW));
             }
+        }
+    }
+
+    /// An element of the page (usually a video) asked to be fullscreen.
+    pub fn is_fullscreen(&self) -> bool {
+        self.state.borrow().fullscreen
+    }
+
+    /// Takes the page out of fullscreen, as the page's own exit button would.
+    pub fn exit_fullscreen(&self) {
+        if let Some(h) = self.host() {
+            // Not "will cause resize": Chromium would hold the exit until
+            // the view's size changes, and it may not (the window can stay
+            // fullscreen, or be hidden).
+            h.exit_fullscreen(0);
         }
     }
 
@@ -907,7 +1015,7 @@ impl WebView {
     /// Discards the page if it has been hidden for `after` and nothing on
     /// it is in progress. Returns true if it was discarded now.
     pub fn discard_if_idle(&self, after: Duration) -> bool {
-        if !self.hidden.get() || self.is_discarded() || !self.idle.get().due(Instant::now(), after) || self.busy() {
+        if self.visibility.get() != Visibility::Hidden || self.is_discarded() || !self.idle.get().due(Instant::now(), after) || self.busy() {
             return false;
         }
         self.discard();
@@ -918,6 +1026,7 @@ impl WebView {
     /// title. [`set_hidden`](Self::set_hidden)`(false)` brings it back.
     pub fn discard(&self) {
         let Some(live) = self.live.borrow_mut().take() else { return };
+        self.state.borrow_mut().browser_id = 0;
         if let Some(h) = live.browser.host() {
             h.close_browser(1);
         }
@@ -926,6 +1035,7 @@ impl WebView {
         }
         let mut s = self.state.borrow_mut();
         s.discarded = true;
+        s.fullscreen = false;
         s.frame = None;
         s.popup = None;
         s.loading = false;
@@ -944,7 +1054,11 @@ impl WebView {
             let s = self.state.borrow();
             if s.url.is_empty() { "about:blank".to_string() } else { s.url.clone() }
         };
-        let rate = if self.hidden.get() { HIDDEN_FRAME_RATE } else { VISIBLE_FRAME_RATE };
+        let rate = match self.visibility.get() {
+            Visibility::Shown => VISIBLE_FRAME_RATE,
+            Visibility::Working => WORKING_FRAME_RATE,
+            Visibility::Hidden => HIDDEN_FRAME_RATE,
+        };
         match Live::open(&url, &self.state, &self.cdp_pending, &self.cdp_events, rate) {
             Ok(live) => {
                 *self.live.borrow_mut() = Some(live);
@@ -960,6 +1074,43 @@ impl WebView {
     /// New-tab requests from links on this page since the last call.
     pub fn take_new_tab_requests(&self) -> Vec<(String, bool)> {
         std::mem::take(&mut self.state.borrow_mut().new_tabs)
+    }
+
+    /// New windows this page opened since the last call that Chromium
+    /// created through its popup path (3.2): live pages that may have this
+    /// one as their `window.opener` (script-opened windows do; links that
+    /// imply `noopener` don't).
+    pub fn take_new_popups(&self) -> Vec<WebView> {
+        std::mem::take(&mut self.state.borrow_mut().new_popups)
+    }
+
+    /// Turns down this page's popups and new-tab requests (a hidden page).
+    pub fn refuse_popups(&self) {
+        self.state.borrow_mut().no_popups = true;
+    }
+
+    /// The page closed itself with `window.close()`.
+    pub fn closed_by_page(&self) -> bool {
+        self.state.borrow().closed_by_page
+    }
+
+    /// The tab's back/forward list (3.3), from Chromium's navigation
+    /// entries. Empty for a discarded tab.
+    pub fn history(&self) -> TabHistory {
+        let out = Rc::new(RefCell::new(TabHistory::default()));
+        if let Some(h) = self.host() {
+            let mut visitor = handlers::history_visitor(out.clone());
+            // On the UI thread Chromium visits every entry before returning.
+            h.navigation_entries(Some(&mut visitor), 0);
+        }
+        out.take()
+    }
+
+    /// A DevTools command whose `result` arrives on the receiver.
+    pub fn cdp_call(&self, method: &str, params: serde_json::Value) -> futures::channel::oneshot::Receiver<Result<serde_json::Value, String>> {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.cdp(method, params, tx);
+        rx
     }
 
     pub fn set_focus(&self, focused: bool) {
@@ -1118,6 +1269,20 @@ impl WebView {
         }
     }
 
+    /// Replaces the misspelled word the context menu was opened on.
+    pub fn replace_misspelling(&self, word: &str) {
+        if let Some(b) = self.browser() {
+            spelling::replace(&b, word);
+        }
+    }
+
+    /// Adds `word` to the profile's dictionary (it stops being flagged).
+    pub fn add_to_dictionary(&self, word: &str) {
+        if let Some(b) = self.browser() {
+            spelling::add_to_dictionary(&b, word);
+        }
+    }
+
     /// Cut, copy, paste or select all in the frame the last context menu
     /// was opened on (or the focused frame).
     pub fn edit(&self, command: EditCommand) {
@@ -1133,6 +1298,8 @@ impl WebView {
     }
 
     pub fn close(&self) {
+        // Our close, not the page's.
+        self.state.borrow_mut().browser_id = 0;
         if let Some(h) = self.host() {
             h.close_browser(1);
         }

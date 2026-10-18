@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Unibrow ID – Allow access</title>
+<style>
+  body { font: 16px system-ui, sans-serif; max-width: 420px; margin: 32px auto; padding: 0 16px; color: #1b2733; }
+  button { padding: 10px 18px; font: inherit; cursor: pointer; }
+  .error { color: #a3261b; font-weight: 600; }
+</style>
+</head>
+<body>
+  <h1>Unibrow ID</h1>
+  <p id="ask">Unibrow Test Shop wants to sign you in as <strong>ada@unibrow.test</strong>.</p>
+  <p><button id="allow">Allow</button></p>
+  <p id="note"></p>
+  <script>
+    const note = document.getElementById('note');
+    // A real sign-in popup only works as a popup: it needs the page that
+    // opened it to hand the result to.
+    if (!window.opener) {
+      note.className = 'error';
+      note.textContent = 'Error: this window has no opener (it was opened as a plain tab), so the sign-in can\'t finish.';
+    }
+    document.getElementById('allow').addEventListener('click', () => {
+      if (!window.opener) {
+        note.className = 'error';
+        note.textContent = 'Error: nothing to send the sign-in to: window.opener is null.';
+        return;
+      }
+      const session = 'UID-' + (4400 + document.title.length);
+      window.opener.postMessage({ kind: 'unibrow-id', email: 'ada@unibrow.test', session }, location.origin);
+      note.textContent = 'Signed in. This window closes now.';
+      setTimeout(() => window.close(), 300);
+    });
+  </script>
+</body>
+</html>
