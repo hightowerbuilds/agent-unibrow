@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Unibrow Test Shop – Widgets</title>
+<style>
+  body { font: 16px system-ui, sans-serif; max-width: 640px; margin: 32px auto; padding: 0 16px; color: #1b2733; background: #fff; }
+  section { border: 1px solid #d5dce2; border-radius: 8px; padding: 16px; margin: 16px 0; }
+  .menu { display: inline-block; position: relative; padding: 8px 12px; background: #eef2f5; border-radius: 6px; }
+  .menu .items { display: none; position: absolute; left: 0; top: 100%; background: #fff; border: 1px solid #ccd; padding: 8px; white-space: nowrap; }
+  .menu:hover .items { display: block; }
+  output { display: block; margin-top: 8px; font-weight: 600; }
+  button, select { font: inherit; padding: 6px 12px; }
+</style>
+</head>
+<body>
+  <h1>Widgets</h1>
+
+  <section>
+    <label for="size">Size</label>
+    <select id="size" onchange="document.getElementById('size-out').textContent = 'Size chosen: ' + this.value">
+      <option value="">Choose…</option>
+      <option value="S">Small</option>
+      <option value="M">Medium</option>
+      <option value="L">Large</option>
+    </select>
+    <output id="size-out"></output>
+  </section>
+
+  <section>
+    <div class="menu" tabindex="0">Menu ▾
+      <div class="items"><a href="#secret">Secret clearance sale</a></div>
+    </div>
+  </section>
+
+  <section>
+    <button onclick="alert('Saved!'); document.getElementById('alert-out').textContent = 'Alert acknowledged';">Show alert</button>
+    <output id="alert-out"></output>
+  </section>
+
+  <section>
+    <button onclick="const n = prompt('New name?', 'Bass'); document.getElementById('prompt-out').textContent = n === null ? 'Rename cancelled' : 'Renamed to ' + n;">Rename</button>
+    <output id="prompt-out"></output>
+  </section>
+
+  <section>
+    <button onclick="document.getElementById('confirm-out').textContent = confirm('Delete this item permanently?') ? 'DELETED' : 'KEPT';">Remove from list</button>
+    <output id="confirm-out"></output>
+  </section>
+</body>
+</html>

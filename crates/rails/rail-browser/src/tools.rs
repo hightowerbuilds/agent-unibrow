@@ -5,10 +5,11 @@
 //! its target on screen, waits for the page to settle, and returns the page
 //! as it is afterwards, plus a small screenshot kept for the trace.
 
-use crate::bridge::{BrowserBridge, NavAction, PageState, Rect};
+use crate::bridge::{BrowserBridge, NavAction, PageState, Rect, TabInfo, TabOp};
 use base64::Engine;
 use futures::future::BoxFuture;
-use page_model::{describe_single, from_ax_tree, parse_ref, ref_for};
+use page_model::{describe_single, from_ax_tree_hiding, parse_ref, ref_for};
+use std::collections::HashSet;
 use router::{Effect, Tool, ToolContext, ToolImage, ToolOutput, ToolResult};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -19,14 +20,113 @@ const AFTER_ACTION_CHARS: usize = 6_000;
 /// Characters returned by `browser_read` unless asked otherwise.
 const READ_CHARS: usize = 15_000;
 
-/// Words on a button or link that mean "this does something you can't take
-/// back". Clicking one asks the user first.
+/// Words on a button that mean "this does something you can't take back".
+/// Clicking one asks the user first. Matched as whole words.
 const COMMIT_WORDS: &[&str] = &[
-    "buy", "purchase", "pay", "place order", "order now", "checkout", "check out", "send", "submit", "post",
-    "publish", "delete", "remove", "unsubscribe", "cancel subscription", "cancel order", "confirm", "sign up",
-    "register", "book", "reserve", "transfer", "donate", "subscribe", "apply", "accept", "agree", "authorize",
-    "withdraw", "deposit",
+    "buy", "buy now", "purchase", "pay", "pay now", "place order", "complete order", "submit order",
+    "confirm order", "order now", "send", "submit", "post", "publish", "delete", "remove", "unsubscribe",
+    "cancel subscription", "cancel order", "cancel membership", "confirm", "sign up", "register", "book",
+    "reserve", "transfer", "donate", "subscribe", "authorize", "withdraw", "deposit",
 ];
+
+/// Links usually just navigate, so only clearly destructive or final
+/// wording on a link asks first.
+const LINK_COMMIT_WORDS: &[&str] = &[
+    "delete", "remove", "unsubscribe", "cancel subscription", "cancel order", "cancel membership", "confirm",
+    "place order", "pay now", "transfer", "withdraw",
+];
+
+/// Whether `text` contains any of `words` as whole words ("pay" matches
+/// "Pay now" but not "PayPal" or "payment").
+fn has_word(text: &str, words: &[&str]) -> bool {
+    let norm: String = text.to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { ' ' }).collect();
+    let padded = format!(" {} ", norm.split_whitespace().collect::<Vec<_>>().join(" "));
+    words.iter().any(|w| padded.contains(&format!(" {w} ")))
+}
+
+/// Fields whose contents the agent never types or sees: passwords, payment
+/// cards, government ids, one-time codes. (Roadmap 6.4.)
+const SENSITIVE_SELECTOR: &str = "input[type=password], [autocomplete^='cc-' i], [autocomplete*=' cc-' i], \
+    [autocomplete='one-time-code' i], input[name*='card' i][name*='num' i], input[id*='card' i][id*='num' i], \
+    input[name*='cvv' i], input[name*='cvc' i], input[id*='cvv' i], input[id*='cvc' i], input[name*='ssn' i], \
+    input[id*='ssn' i], input[name*='iban' i], input[name*='security' i][name*='code' i]";
+
+/// Run with an element as `this`: is it sensitive, and what form (if any)
+/// would it submit? Values of sensitive fields come back as `[hidden]`.
+const PROBE_FN: &str = r#"function(sel){
+  const el = this;
+  const isSensitive = (x) => { try { return x.matches && x.matches(sel); } catch (e) { return false; } };
+  const tag = (el.tagName || '').toLowerCase();
+  const type = ((el.getAttribute && el.getAttribute('type')) || '').toLowerCase();
+  const form = el.form || (el.closest && el.closest('form')) || null;
+  const isSubmit = !!form && ((tag === 'button' && (type === '' || type === 'submit')) || (tag === 'input' && (type === 'submit' || type === 'image')));
+  const fields = form ? Array.from(form.elements) : [];
+  const action = form ? String(form.getAttribute('action') || '') : '';
+  const isSearch = !!form && (form.getAttribute('role') === 'search' || /search/i.test(action)
+      || fields.some(x => (x.type || '').toLowerCase() === 'search' || /^(q|query|search|s|keywords?)$/i.test(x.name || '')));
+  const values = fields
+    .filter(x => !['hidden','submit','button','image','reset','fieldset'].includes((x.type || '').toLowerCase()))
+    .slice(0, 25)
+    .map(x => {
+      const label = ((x.labels && x.labels[0] && x.labels[0].innerText) || x.getAttribute('aria-label') || x.placeholder || x.name || x.id || x.type || '').trim();
+      let v = (x.type === 'checkbox' || x.type === 'radio') ? (x.checked ? 'checked' : 'unchecked')
+            : (x.tagName === 'SELECT' ? ((x.selectedOptions[0] || {}).text || '') : (x.value || ''));
+      if (isSensitive(x)) v = v ? '[hidden]' : '';
+      return [label.slice(0, 50), String(v).slice(0, 100)];
+    });
+  return { tag, type, sensitive: isSensitive(el), isSubmit, inForm: !!form,
+           method: form ? String(form.method || 'get').toLowerCase() : '',
+           isSearch, hasSensitive: fields.some(isSensitive), values };
+}"#;
+
+/// What the probe found out about an element and its form.
+#[derive(Default)]
+struct Probe {
+    sensitive: bool,
+    is_submit: bool,
+    in_form: bool,
+    method: String,
+    is_search: bool,
+    has_sensitive: bool,
+    values: Vec<(String, String)>,
+}
+
+impl Probe {
+    fn from(v: &Value) -> Self {
+        Self {
+            sensitive: v["sensitive"].as_bool().unwrap_or(false),
+            is_submit: v["isSubmit"].as_bool().unwrap_or(false),
+            in_form: v["inForm"].as_bool().unwrap_or(false),
+            method: v["method"].as_str().unwrap_or("").to_string(),
+            is_search: v["isSearch"].as_bool().unwrap_or(false),
+            has_sensitive: v["hasSensitive"].as_bool().unwrap_or(false),
+            values: v["values"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|p| Some((p[0].as_str()?.to_string(), p[1].as_str()?.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Submitting this form sends something somewhere: it posts data or
+    /// carries passwords/payment details, and it isn't a search. (6.1)
+    fn submit_commits(&self) -> bool {
+        self.in_form && !self.is_search && (self.method == "post" || self.has_sensitive)
+    }
+
+    /// The form's current values, one per line, sensitive ones hidden.
+    fn summary(&self) -> String {
+        self.values
+            .iter()
+            .filter(|(l, _)| !l.is_empty())
+            .map(|(l, v)| format!("• {l}: {}", if v.is_empty() { "(empty)" } else { v }))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
 
 pub fn tools(bridge: BrowserBridge) -> Vec<Arc<dyn Tool>> {
     let b = Arc::new(Browser { bridge });
@@ -39,6 +139,15 @@ pub fn tools(bridge: BrowserBridge) -> Vec<Arc<dyn Tool>> {
         Arc::new(Press(b.clone())),
         Arc::new(Scroll(b.clone())),
         Arc::new(Wait(b.clone())),
+        Arc::new(Select(b.clone())),
+        Arc::new(Hover(b.clone())),
+        Arc::new(Dialog(b.clone())),
+        Arc::new(Tabs(b.clone())),
+        Arc::new(Find(b.clone())),
+        Arc::new(Downloads(b.clone())),
+        Arc::new(ReadDownload),
+        Arc::new(Upload(b.clone())),
+        Arc::new(SavePdf(b.clone())),
         Arc::new(History(b.clone(), NavAction::Back)),
         Arc::new(History(b.clone(), NavAction::Forward)),
         Arc::new(History(b, NavAction::Reload)),
@@ -98,16 +207,23 @@ impl Browser {
 
     /// The page outline.
     async fn outline(&self, from_line: usize, max_chars: usize) -> Result<String, String> {
+        // While a JavaScript dialog is open the page is frozen; asking it
+        // anything would hang, and the dialog is what matters.
+        if let Some(d) = self.state().await?.dialog {
+            return Ok(dialog_notice(&d));
+        }
         let _ = self.bridge.cdp("Accessibility.enable", json!({})).await;
         let tree = self.bridge.cdp("Accessibility.getFullAXTree", json!({})).await?;
         let nodes = tree["nodes"].as_array().cloned().unwrap_or_default();
-        let model = from_ax_tree(&nodes);
+        let hidden = self.sensitive_ids().await;
+        let model = from_ax_tree_hiding(&nodes, &hidden);
         let st = self.state().await?;
         let mut out = format!(
-            "Page: {}\nURL: {}\n{}{} actionable elements. Refs like [e123] can be passed to browser_click / browser_type.\n\n",
+            "Page: {}\nURL: {}\n{}{}{} actionable elements. Refs like [e123] can be passed to browser_click / browser_type.\n\n",
             if st.title.is_empty() { "(untitled)" } else { &st.title },
             st.url,
             if st.loading { "Still loading.\n" } else { "" },
+            st.load_error.as_ref().map(|e| format!("The page failed to load: {e}\n")).unwrap_or_default(),
             model.interactive,
         );
         if model.lines.is_empty() {
@@ -123,7 +239,11 @@ impl Browser {
         tokio::time::sleep(Duration::from_millis(250)).await;
         let start = Instant::now();
         while start.elapsed() < timeout {
-            let loading = self.state().await.map(|s| s.loading).unwrap_or(false);
+            let st = self.state().await.unwrap_or_default();
+            if st.dialog.is_some() {
+                return;
+            }
+            let loading = st.loading;
             let ready = self
                 .bridge
                 .cdp("Runtime.evaluate", json!({"expression": "document.readyState", "returnByValue": true}))
@@ -144,7 +264,21 @@ impl Browser {
         if scale < 1.0 {
             params["clip"] = json!({"x": 0, "y": 0, "width": st.width.max(1), "height": st.height.max(1), "scale": scale});
         }
-        let r = self.bridge.cdp("Page.captureScreenshot", params).await?;
+        // Mask sensitive fields as dots for the capture, so screenshots never
+        // show card numbers or codes (6.4), then put the page back.
+        let css = format!("{SENSITIVE_SELECTOR} {{ -webkit-text-security: disc !important; }}");
+        let mask = format!(
+            "(() => {{ let s = document.getElementById('__unibrow_mask'); if (!s) {{ s = document.createElement('style'); \
+             s.id = '__unibrow_mask'; (document.head || document.documentElement).appendChild(s); }} s.textContent = {}; }})()",
+            serde_json::to_string(&css).unwrap_or_default()
+        );
+        let _ = self.bridge.cdp("Runtime.evaluate", json!({"expression": mask})).await;
+        let r = self.bridge.cdp("Page.captureScreenshot", params).await;
+        let _ = self
+            .bridge
+            .cdp("Runtime.evaluate", json!({"expression": "document.getElementById('__unibrow_mask')?.remove()"}))
+            .await;
+        let r = r?;
         let data = r["data"].as_str().ok_or("no screenshot data")?.to_string();
         Ok(ToolImage { mime: "image/jpeg".into(), base64: data })
     }
@@ -153,7 +287,9 @@ impl Browser {
     async fn after_action(&self, what: String, summary: String) -> ToolResult {
         self.settle(Duration::from_secs(10)).await;
         let page = self.outline(0, AFTER_ACTION_CHARS).await.unwrap_or_else(|e| format!("(couldn't read the page: {e})"));
-        let evidence = self.screenshot(55, 0.5).await.into_iter().collect();
+        let dialog_open = self.state().await.map(|s| s.dialog.is_some()).unwrap_or(false);
+        // A frozen page can't produce a screenshot.
+        let evidence = if dialog_open { Vec::new() } else { self.screenshot(55, 0.5).await.into_iter().collect() };
         Ok(ToolOutput { content: format!("{what}\n\n{page}"), summary, evidence, ..Default::default() })
     }
 
@@ -191,6 +327,41 @@ impl Browser {
         Ok(Rect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 })
     }
 
+    /// Sends a command that might make the page open a dialog (a click or a
+    /// key). Returns Ok(false) if a dialog opened before Chromium answered:
+    /// the page is then frozen and the command finishes once the dialog is
+    /// answered.
+    async fn cdp_watch(&self, method: &str, params: Value) -> Result<bool, String> {
+        let fut = self.bridge.cdp(method, params);
+        tokio::pin!(fut);
+        loop {
+            tokio::select! {
+                r = &mut fut => return r.map(|_| true),
+                _ = tokio::time::sleep(Duration::from_millis(150)) => {
+                    if self.state().await.map(|s| s.dialog.is_some()).unwrap_or(false) {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A full click at (x, y). Returns false if a dialog interrupted it.
+    async fn click_at(&self, x: f64, y: f64, button: &str, clicks: u32) -> Result<bool, String> {
+        self.mouse("mouseMoved", x, y, "none", 0).await?;
+        for n in 1..=clicks {
+            let ev = json!({"type": "mousePressed", "x": x, "y": y, "button": button, "clickCount": n});
+            if !self.cdp_watch("Input.dispatchMouseEvent", ev).await? {
+                return Ok(false);
+            }
+            let ev = json!({"type": "mouseReleased", "x": x, "y": y, "button": button, "clickCount": n});
+            if !self.cdp_watch("Input.dispatchMouseEvent", ev).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     async fn mouse(&self, kind: &str, x: f64, y: f64, button: &str, clicks: u32) -> Result<(), String> {
         self.bridge
             .cdp(
@@ -215,6 +386,79 @@ impl Browser {
         Ok(r["result"]["value"].clone())
     }
 
+    /// Backend ids of every sensitive field on the page.
+    async fn sensitive_ids(&self) -> HashSet<i64> {
+        let mut out = HashSet::new();
+        let Ok(doc) = self.bridge.cdp("DOM.getDocument", json!({"depth": 0})).await else { return out };
+        let Some(root) = doc["root"]["nodeId"].as_i64() else { return out };
+        let Ok(found) =
+            self.bridge.cdp("DOM.querySelectorAll", json!({"nodeId": root, "selector": SENSITIVE_SELECTOR})).await
+        else {
+            return out;
+        };
+        for id in found["nodeIds"].as_array().into_iter().flatten().filter_map(Value::as_i64) {
+            if let Ok(d) = self.bridge.cdp("DOM.describeNode", json!({"nodeId": id})).await {
+                if let Some(b) = d["node"]["backendNodeId"].as_i64() {
+                    out.insert(b);
+                }
+            }
+        }
+        out
+    }
+
+    async fn probe_object(&self, object_id: &str) -> Probe {
+        self.bridge
+            .cdp(
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": object_id,
+                    "functionDeclaration": PROBE_FN,
+                    "arguments": [{"value": SENSITIVE_SELECTOR}],
+                    "returnByValue": true,
+                }),
+            )
+            .await
+            .map(|r| Probe::from(&r["result"]["value"]))
+            .unwrap_or_default()
+    }
+
+    async fn probe(&self, el: &Element) -> Probe {
+        match self.bridge.cdp("DOM.resolveNode", json!({"backendNodeId": el.backend_id})).await {
+            Ok(n) => match n["object"]["objectId"].as_str() {
+                Some(id) => self.probe_object(id).await,
+                None => Probe::default(),
+            },
+            Err(_) => Probe::default(),
+        }
+    }
+
+    /// The element that has keyboard focus.
+    async fn probe_focused(&self) -> Probe {
+        match self.bridge.cdp("Runtime.evaluate", json!({"expression": "document.activeElement"})).await {
+            Ok(r) => match r["result"]["objectId"].as_str() {
+                Some(id) => self.probe_object(id).await,
+                None => Probe::default(),
+            },
+            Err(_) => Probe::default(),
+        }
+    }
+
+    /// Asks the user before an action that commits, showing the form's
+    /// values and a screenshot. Returns an error if they decline. (6.2)
+    async fn confirm(&self, ctx: &ToolContext, action: String, why: String, probe: &Probe) -> Result<(), String> {
+        let st = self.state().await?;
+        let place = site(&st.url);
+        let shot = self.screenshot(70, 1.0).await.ok();
+        let values = probe.summary();
+        let description = if values.is_empty() {
+            format!("{action} on {place}\n{}", st.url)
+        } else {
+            format!("{action} on {place}\n{}\n\n{values}", st.url)
+        };
+        let ok = ctx.approver.approve("browser_click", description, format!("{why} on {place}"), vec![place], shot).await;
+        if ok { Ok(()) } else { Err(format!("The user declined: {action}.")) }
+    }
+
     async fn key(&self, key: &KeySpec, modifiers: i64) -> Result<(), String> {
         let mut down = json!({
             "type": if key.text.is_some() && modifiers & !8 == 0 { "keyDown" } else { "rawKeyDown" },
@@ -224,14 +468,15 @@ impl Browser {
             down["text"] = json!(t);
             down["unmodifiedText"] = json!(t);
         }
-        self.bridge.cdp("Input.dispatchKeyEvent", down).await?;
-        self.bridge
-            .cdp(
-                "Input.dispatchKeyEvent",
-                json!({"type": "keyUp", "key": key.key, "code": key.code, "windowsVirtualKeyCode": key.vk, "modifiers": modifiers}),
-            )
-            .await
-            .map(|_| ())
+        if !self.cdp_watch("Input.dispatchKeyEvent", down).await? {
+            return Ok(()); // a dialog opened; its card says what happened
+        }
+        self.cdp_watch(
+            "Input.dispatchKeyEvent",
+            json!({"type": "keyUp", "key": key.key, "code": key.code, "windowsVirtualKeyCode": key.vk, "modifiers": modifiers}),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -322,6 +567,16 @@ browser_tool!(Type);
 browser_tool!(Press);
 browser_tool!(Scroll);
 browser_tool!(Wait);
+browser_tool!(Select);
+browser_tool!(Hover);
+browser_tool!(Dialog);
+browser_tool!(Tabs);
+browser_tool!(Find);
+browser_tool!(Downloads);
+/// Reads files from the downloads folder; needs no browser access.
+pub struct ReadDownload;
+browser_tool!(Upload);
+browser_tool!(SavePdf);
 pub struct History(Arc<Browser>, NavAction);
 
 impl Tool for Open {
@@ -475,34 +730,28 @@ impl Tool for Click {
             let el = b.element(r).await?;
             let st = b.state().await?;
 
-            let lower = el.name.to_lowercase();
-            let risky = matches!(el.role.as_str(), "button" | "link" | "menuitem" | "")
-                && COMMIT_WORDS.iter().any(|w| lower.contains(w));
-            if risky {
-                let place = site(&st.url);
-                let ok = ctx
-                    .approver
-                    .approve(
-                        "browser_click",
-                        format!("Click {} on {place}\n{}", el.label(), st.url),
-                        format!("This looks like it could buy, send, post, delete or confirm something on {place}"),
-                        vec![place],
-                    )
-                    .await;
-                if !ok {
-                    return Err(format!("The user declined clicking {}.", el.label()));
-                }
+            let _ = &st;
+            let worded = match el.role.as_str() {
+                "link" => has_word(&el.name, LINK_COMMIT_WORDS),
+                "button" | "menuitem" | "" => has_word(&el.name, COMMIT_WORDS),
+                _ => false,
+            };
+            let probe = b.probe(&el).await;
+            let submits = probe.is_submit && probe.submit_commits();
+            if worded || submits {
+                let why = if worded {
+                    "This looks like it could buy, send, post, delete or confirm something".to_string()
+                } else {
+                    "This submits a form that sends information".to_string()
+                };
+                b.confirm(&ctx, format!("Click {}", el.label()), why, &probe).await?;
             }
 
             let rect = b.rect(&el).await?;
             b.bridge.highlight(rect, format!("click {}", el.label()));
             tokio::time::sleep(Duration::from_millis(350)).await;
             let (x, y) = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
-            b.mouse("mouseMoved", x, y, "none", 0).await?;
-            for n in 1..=clicks {
-                b.mouse("mousePressed", x, y, button, n).await?;
-                b.mouse("mouseReleased", x, y, button, n).await?;
-            }
+            b.click_at(x, y, button, clicks).await?;
             b.after_action(format!("Clicked [{r}] {}.", el.label()), format!("clicked {}", el.label())).await
         })
     }
@@ -536,7 +785,10 @@ impl Tool for Type {
     fn describe_call(&self, input: &Value) -> String {
         format!("Type into {}", input["ref"].as_str().unwrap_or(""))
     }
-    fn call(&self, input: Value) -> BoxFuture<'static, ToolResult> {
+    fn call(&self, _input: Value) -> BoxFuture<'static, ToolResult> {
+        Box::pin(async { Err("browser_type needs the tool context".to_string()) })
+    }
+    fn call_with(&self, input: Value, ctx: ToolContext) -> BoxFuture<'static, ToolResult> {
         let b = self.0.clone();
         Box::pin(async move {
             check_keys(&input, &["ref", "text", "clear", "submit"])?;
@@ -545,6 +797,14 @@ impl Tool for Type {
             let clear = input["clear"].as_bool().unwrap_or(true);
             let submit = input["submit"].as_bool().unwrap_or(false);
             let el = b.element(r).await?;
+            let probe = b.probe(&el).await;
+            if probe.sensitive {
+                return Err(format!(
+                    "{} is a password, payment or verification-code field. The agent doesn't type these; \
+                     ask the user to fill it in, then continue.",
+                    el.label()
+                ));
+            }
             let rect = b.rect(&el).await?;
             b.bridge.highlight(rect, format!("type into {}", el.label()));
             b.bridge.cdp("DOM.focus", json!({"backendNodeId": el.backend_id})).await.map_err(|_| {
@@ -564,6 +824,10 @@ impl Tool for Type {
                 b.bridge.cdp("Input.insertText", json!({"text": text})).await?;
             }
             if submit {
+                let probe = b.probe(&el).await;
+                if probe.submit_commits() {
+                    b.confirm(&ctx, format!("Submit the form from {}", el.label()), "Pressing Enter submits a form that sends information".into(), &probe).await?;
+                }
                 b.key(&parse_keys("Enter")?.0, 0).await?;
             }
             let shown: String = text.chars().take(60).collect();
@@ -601,13 +865,22 @@ impl Tool for Press {
     fn describe_call(&self, input: &Value) -> String {
         format!("Press {}", input["keys"].as_str().unwrap_or(""))
     }
-    fn call(&self, input: Value) -> BoxFuture<'static, ToolResult> {
+    fn call(&self, _input: Value) -> BoxFuture<'static, ToolResult> {
+        Box::pin(async { Err("browser_press needs the tool context".to_string()) })
+    }
+    fn call_with(&self, input: Value, ctx: ToolContext) -> BoxFuture<'static, ToolResult> {
         let b = self.0.clone();
         Box::pin(async move {
             check_keys(&input, &["keys", "times"])?;
             let combo = arg_str(&input, "keys")?.to_string();
             let times = input["times"].as_u64().unwrap_or(1).clamp(1, 50);
             let (key, mods) = parse_keys(&combo)?;
+            if key.key == "Enter" && mods == 0 {
+                let probe = b.probe_focused().await;
+                if probe.submit_commits() {
+                    b.confirm(&ctx, "Submit the form (Enter)".into(), "Pressing Enter submits a form that sends information".into(), &probe).await?;
+                }
+            }
             for _ in 0..times {
                 b.key(&key, mods).await?;
             }
@@ -843,6 +1116,569 @@ impl Tool for History {
     }
 }
 
+fn dialog_notice(d: &crate::DialogInfo) -> String {
+    let what = match d.kind.as_str() {
+        "confirm" => "A confirm dialog is open (OK / Cancel)",
+        "prompt" => "A prompt dialog is open (asks for text)",
+        "beforeunload" => "The page is asking whether to leave",
+        _ => "An alert dialog is open",
+    };
+    let mut s = format!("{what}. The page is frozen until it's answered.\nMessage: \"{}\"", d.message);
+    if d.kind == "prompt" && !d.default_text.is_empty() {
+        s.push_str(&format!("\nDefault text: \"{}\"", d.default_text));
+    }
+    s.push_str("\nAnswer it with browser_dialog.");
+    s
+}
+
+impl Tool for Dialog {
+    fn name(&self) -> &'static str {
+        "browser_dialog"
+    }
+    fn description(&self) -> &'static str {
+        "Answer a JavaScript dialog the page opened (alert, confirm, prompt, or 'leave this page?'). While one \
+         is open the page is frozen. accept=true presses OK, false presses Cancel; text answers a prompt. \
+         Accepting a confirm that deletes, pays or sends asks the user first."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "accept": {"type": "boolean", "description": "OK (true) or Cancel (false)."},
+                "text": {"type": "string", "description": "Text for a prompt dialog."}
+            },
+            "required": ["accept"],
+            "additionalProperties": false
+        })
+    }
+    fn effect(&self) -> Effect {
+        Effect::Stage
+    }
+    fn describe_call(&self, input: &Value) -> String {
+        if input["accept"].as_bool().unwrap_or(false) { "Answer dialog: OK".into() } else { "Answer dialog: Cancel".into() }
+    }
+    fn call(&self, _input: Value) -> BoxFuture<'static, ToolResult> {
+        Box::pin(async { Err("browser_dialog needs the tool context".to_string()) })
+    }
+    fn call_with(&self, input: Value, ctx: ToolContext) -> BoxFuture<'static, ToolResult> {
+        let b = self.0.clone();
+        Box::pin(async move {
+            check_keys(&input, &["accept", "text"])?;
+            let accept = input["accept"].as_bool().ok_or("Invalid input: `accept` is required")?;
+            let text = input["text"].as_str().map(str::to_string);
+            let st = b.state().await?;
+            let d = st.dialog.ok_or("No dialog is open.")?;
+            if accept && d.kind == "confirm" && has_word(&d.message, COMMIT_WORDS) {
+                let place = site(&st.url);
+                let ok = ctx
+                    .approver
+                    .approve(
+                        "browser_click",
+                        format!("Press OK on: \"{}\"\n{}", d.message, st.url),
+                        format!("The page is asking to confirm something that may not be undoable on {place}"),
+                        vec![place],
+                        None,
+                    )
+                    .await;
+                if !ok {
+                    return Err("The user declined confirming this dialog. Answer it with accept=false.".into());
+                }
+            }
+            b.bridge.answer_dialog(accept, text).await?;
+            let what = format!("Answered the {} dialog with {}.", d.kind, if accept { "OK" } else { "Cancel" });
+            b.after_action(what.clone(), what.to_lowercase()).await
+        })
+    }
+}
+
+impl Tool for Select {
+    fn name(&self) -> &'static str {
+        "browser_select"
+    }
+    fn description(&self) -> &'static str {
+        "Choose an option in a dropdown (<select>) by its visible label or value, by the dropdown's ref from \
+         browser_read. For custom dropdowns that aren't real <select> elements, click the dropdown and then \
+         click the option instead."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "The dropdown's ref, like e123."},
+                "option": {"type": "string", "description": "Option label (or value) to select."}
+            },
+            "required": ["ref", "option"],
+            "additionalProperties": false
+        })
+    }
+    fn effect(&self) -> Effect {
+        Effect::Stage
+    }
+    fn describe_call(&self, input: &Value) -> String {
+        format!("Select “{}” in {}", input["option"].as_str().unwrap_or(""), input["ref"].as_str().unwrap_or(""))
+    }
+    fn call(&self, input: Value) -> BoxFuture<'static, ToolResult> {
+        let b = self.0.clone();
+        Box::pin(async move {
+            check_keys(&input, &["ref", "option"])?;
+            let r = arg_str(&input, "ref")?;
+            let option = arg_str(&input, "option")?.to_string();
+            let el = b.element(r).await?;
+            let rect = b.rect(&el).await?;
+            b.bridge.highlight(rect, format!("select “{option}”"));
+            let f = format!(
+                r#"function(){{
+  if (this.tagName !== 'SELECT') return {{ok:false, error:'not a <select>'}};
+  const want = {want}.trim().toLowerCase();
+  const opts = Array.from(this.options);
+  let o = opts.find(x => x.text.trim().toLowerCase() === want) || opts.find(x => x.value.toLowerCase() === want)
+       || opts.find(x => x.text.trim().toLowerCase().includes(want));
+  if (!o) return {{ok:false, error:'no option matching', options: opts.map(x => x.text.trim()).slice(0, 40)}};
+  if (o.disabled) return {{ok:false, error:'that option is disabled'}};
+  this.focus(); this.value = o.value;
+  this.dispatchEvent(new Event('input', {{bubbles:true}}));
+  this.dispatchEvent(new Event('change', {{bubbles:true}}));
+  return {{ok:true, chosen:o.text.trim()}};
+}}"#,
+                want = serde_json::to_string(&option).unwrap_or_default()
+            );
+            let v = b.call_on(&el, &f).await?;
+            if !v["ok"].as_bool().unwrap_or(false) {
+                let err = v["error"].as_str().unwrap_or("couldn't select");
+                if err == "not a <select>" {
+                    return Err(format!(
+                        "{} isn't a native dropdown. Click it to open it, then click the option.",
+                        el.label()
+                    ));
+                }
+                let opts = v["options"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" | "))
+                    .unwrap_or_default();
+                return Err(format!("{err} “{option}”. Options: {opts}"));
+            }
+            let chosen = v["chosen"].as_str().unwrap_or(&option).to_string();
+            b.after_action(format!("Selected “{chosen}” in [{r}] {}.", el.label()), format!("selected {chosen}")).await
+        })
+    }
+}
+
+impl Tool for Hover {
+    fn name(&self) -> &'static str {
+        "browser_hover"
+    }
+    fn description(&self) -> &'static str {
+        "Move the mouse over an element by its ref, without clicking: for menus that open on hover, tooltips, \
+         and controls that only appear when hovered. Returns the page afterwards."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {"ref": {"type": "string", "description": "Element ref, like e123."}},
+            "required": ["ref"],
+            "additionalProperties": false
+        })
+    }
+    fn effect(&self) -> Effect {
+        Effect::Read
+    }
+    fn describe_call(&self, input: &Value) -> String {
+        format!("Hover over {}", input["ref"].as_str().unwrap_or(""))
+    }
+    fn call(&self, input: Value) -> BoxFuture<'static, ToolResult> {
+        let b = self.0.clone();
+        Box::pin(async move {
+            check_keys(&input, &["ref"])?;
+            let r = arg_str(&input, "ref")?;
+            let el = b.element(r).await?;
+            let rect = b.rect(&el).await?;
+            b.bridge.highlight(rect, format!("hover {}", el.label()));
+            b.mouse("mouseMoved", rect.x + rect.width / 2.0, rect.y + rect.height / 2.0, "none", 0).await?;
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            b.after_action(format!("Hovered over [{r}] {}.", el.label()), format!("hovered {}", el.label())).await
+        })
+    }
+}
+
+fn tab_list(tabs: &[TabInfo]) -> String {
+    tabs.iter()
+        .map(|t| {
+            let title = if t.title.is_empty() { "(untitled)" } else { &t.title };
+            format!("{} tab {}: {title} — {}", if t.active { "→" } else { " " }, t.id, t.url)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+impl Tool for Tabs {
+    fn name(&self) -> &'static str {
+        "browser_tabs"
+    }
+    fn description(&self) -> &'static str {
+        "List, open, switch to, or close tabs in the app's browser. The active tab is the one the user sees and \
+         the one the other browser tools act on. Open a new tab to look something up without losing the \
+         current page; switch back afterwards."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["list", "new", "switch", "close"]},
+                "url": {"type": "string", "description": "For new: what to open (default: the home page)."},
+                "tab": {"type": "integer", "description": "For switch/close: the tab id from the list."}
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        })
+    }
+    fn effect(&self) -> Effect {
+        Effect::Read
+    }
+    fn describe_call(&self, input: &Value) -> String {
+        match input["action"].as_str().unwrap_or("list") {
+            "new" => format!("Open a tab: {}", input["url"].as_str().unwrap_or("home")),
+            "switch" => format!("Switch to tab {}", input["tab"]),
+            "close" => format!("Close tab {}", input["tab"]),
+            _ => "List tabs".into(),
+        }
+    }
+    fn call(&self, input: Value) -> BoxFuture<'static, ToolResult> {
+        let b = self.0.clone();
+        Box::pin(async move {
+            check_keys(&input, &["action", "url", "tab"])?;
+            let action = arg_str(&input, "action")?.to_string();
+            let tab = || input["tab"].as_u64().map(|t| t as u32).ok_or("Invalid input: `tab` is required".to_string());
+            let op = match action.as_str() {
+                "list" => TabOp::List,
+                "new" => TabOp::New { url: input["url"].as_str().map(str::to_string) },
+                "switch" => TabOp::Switch { id: tab()? },
+                "close" => TabOp::Close { id: tab()? },
+                other => return Err(format!("Unknown action `{other}`")),
+            };
+            let tabs = b.bridge.tabs(op).await?;
+            let list = tab_list(&tabs);
+            if action == "list" || action == "close" {
+                return Ok(ToolOutput::text(format!("Tabs (→ = active):\n{list}"), format!("{} tabs", tabs.len())));
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            b.after_action(format!("Tabs (→ = active):\n{list}"), format!("{action} tab")).await
+        })
+    }
+}
+
+impl Tool for Find {
+    fn name(&self) -> &'static str {
+        "browser_find"
+    }
+    fn description(&self) -> &'static str {
+        "Find text on the current page (like Ctrl+F): how many times it appears, a snippet around each match, \
+         and the page scrolled to the first one. Faster than reading a long page when you know what to look for."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {"text": {"type": "string", "description": "Text to look for (not case-sensitive)."}},
+            "required": ["text"],
+            "additionalProperties": false
+        })
+    }
+    fn effect(&self) -> Effect {
+        Effect::Read
+    }
+    fn describe_call(&self, input: &Value) -> String {
+        format!("Find “{}”", input["text"].as_str().unwrap_or(""))
+    }
+    fn call(&self, input: Value) -> BoxFuture<'static, ToolResult> {
+        let b = self.0.clone();
+        Box::pin(async move {
+            check_keys(&input, &["text"])?;
+            let text = arg_str(&input, "text")?.to_string();
+            let q = serde_json::to_string(&text).unwrap_or_default();
+            let expr = format!(
+                r#"(() => {{
+  const orig = {q}; const t = orig.toLowerCase();
+  const body = document.body ? document.body.innerText : ''; const lower = body.toLowerCase();
+  let i = 0, n = 0; const snips = [];
+  while (t && (i = lower.indexOf(t, i)) !== -1) {{
+    n++; if (snips.length < 8) snips.push(body.slice(Math.max(0, i - 70), i + t.length + 70).replace(/\s+/g, ' ').trim());
+    i += t.length;
+  }}
+  try {{ getSelection().removeAllRanges(); window.find(orig, false, false, true); }} catch (e) {{}}
+  return JSON.stringify({{n, snips}});
+}})()"#
+            );
+            let r = b.bridge.cdp("Runtime.evaluate", json!({"expression": expr, "returnByValue": true})).await?;
+            let v: Value = r["result"]["value"].as_str().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+            let n = v["n"].as_u64().unwrap_or(0);
+            if n == 0 {
+                return Ok(ToolOutput::text(format!("“{text}” isn't on this page."), format!("“{text}”: no matches")));
+            }
+            let snips: Vec<String> =
+                v["snips"].as_array().into_iter().flatten().filter_map(|x| x.as_str()).map(|x| format!("• …{x}…")).collect();
+            let more = if n as usize > snips.len() { format!("\n(and {} more)", n as usize - snips.len()) } else { String::new() };
+            let evidence = b.screenshot(55, 0.5).await.into_iter().collect();
+            Ok(ToolOutput {
+                content: format!("“{text}” appears {n} time(s); scrolled to the first.\n{}{more}", snips.join("\n")),
+                summary: format!("“{text}”: {n} matches"),
+                evidence,
+                ..Default::default()
+            })
+        })
+    }
+}
+
+impl Tool for Downloads {
+    fn name(&self) -> &'static str {
+        "browser_downloads"
+    }
+    fn description(&self) -> &'static str {
+        "List files downloaded in the app's browser: name, where it was saved, progress, and whether it finished. \
+         Downloads save automatically to the agent-unibrow downloads folder. Use browser_read_download to read one."
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type": "object", "properties": {}, "additionalProperties": false})
+    }
+    fn effect(&self) -> Effect {
+        Effect::Read
+    }
+    fn describe_call(&self, _: &Value) -> String {
+        "List downloads".into()
+    }
+    fn call(&self, input: Value) -> BoxFuture<'static, ToolResult> {
+        let b = self.0.clone();
+        Box::pin(async move {
+            check_keys(&input, &[])?;
+            let list = b.bridge.downloads().await?;
+            if list.is_empty() {
+                return Ok(ToolOutput::text("No downloads yet.", "no downloads"));
+            }
+            let lines: Vec<String> = list
+                .iter()
+                .map(|d| {
+                    let status = if d.complete {
+                        "done".to_string()
+                    } else if d.canceled {
+                        "failed or cancelled".to_string()
+                    } else {
+                        format!("{}%", d.percent.max(0))
+                    };
+                    format!("- {} ({status}, {} bytes) → {}", d.name, d.received, d.path)
+                })
+                .collect();
+            Ok(ToolOutput::text(lines.join("\n"), format!("{} downloads", list.len())))
+        })
+    }
+}
+
+/// Text from a downloaded file: text-like files directly, PDFs through
+/// `pdftotext` when it's installed.
+fn read_download_text(path: &std::path::Path) -> Result<String, String> {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    if ext == "pdf" {
+        let out = std::process::Command::new("pdftotext")
+            .args(["-layout"])
+            .arg(path)
+            .arg("-")
+            .output()
+            .map_err(|_| "Reading PDFs needs `pdftotext` (poppler), which isn't installed.".to_string())?;
+        if !out.status.success() {
+            return Err("pdftotext couldn't read this PDF.".into());
+        }
+        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("Couldn't read the file: {e}"))?;
+    if bytes.iter().take(4096).filter(|b| **b == 0).count() > 0 {
+        return Err("That file isn't text (it looks binary).".into());
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+impl Tool for ReadDownload {
+    fn name(&self) -> &'static str {
+        "browser_read_download"
+    }
+    fn description(&self) -> &'static str {
+        "Read a downloaded file's text (CSV, TXT, JSON, HTML, Markdown, and PDF when pdftotext is installed), \
+         by its name or path from browser_downloads. Only files in the downloads folder can be read."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": {"type": "string", "description": "File name or path from browser_downloads."},
+                "max_chars": {"type": "integer", "minimum": 1000, "maximum": 100000, "description": "Default 20000."}
+            },
+            "required": ["file"],
+            "additionalProperties": false
+        })
+    }
+    fn effect(&self) -> Effect {
+        Effect::Read
+    }
+    fn describe_call(&self, input: &Value) -> String {
+        format!("Read download {}", input["file"].as_str().unwrap_or(""))
+    }
+    fn call(&self, input: Value) -> BoxFuture<'static, ToolResult> {
+        Box::pin(async move {
+            check_keys(&input, &["file", "max_chars"])?;
+            let file = arg_str(&input, "file")?;
+            let max = input["max_chars"].as_u64().unwrap_or(20_000).clamp(1000, 100_000) as usize;
+            let dir = crate::downloads_dir().canonicalize().map_err(|e| e.to_string())?;
+            let candidate = if file.contains('/') { std::path::PathBuf::from(file) } else { dir.join(file) };
+            let path = candidate.canonicalize().map_err(|_| format!("No downloaded file “{file}”."))?;
+            if !path.starts_with(&dir) {
+                return Err("Only files in the downloads folder can be read.".into());
+            }
+            let text = tokio::task::spawn_blocking(move || read_download_text(&path))
+                .await
+                .map_err(|e| e.to_string())??;
+            let total = text.chars().count();
+            let shown: String = text.chars().take(max).collect();
+            let more = if total > max { format!("\n… ({} more characters)", total - max) } else { String::new() };
+            Ok(ToolOutput::text(format!("{shown}{more}"), format!("read {file} ({total} chars)")))
+        })
+    }
+}
+
+impl Tool for Upload {
+    fn name(&self) -> &'static str {
+        "browser_upload"
+    }
+    fn description(&self) -> &'static str {
+        "Attach a file from the user's computer to a file field on the page (e.g. a résumé or a photo). Give the \
+         full path; the user must have told you which file. Always asks the user first. If you don't pass a ref, \
+         the page's first file field is used."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute path of the file to attach."},
+                "ref": {"type": "string", "description": "File field ref, if you have one."}
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        })
+    }
+    fn effect(&self) -> Effect {
+        Effect::Stage
+    }
+    fn describe_call(&self, input: &Value) -> String {
+        format!("Upload {}", input["path"].as_str().unwrap_or(""))
+    }
+    fn call(&self, _input: Value) -> BoxFuture<'static, ToolResult> {
+        Box::pin(async { Err("browser_upload needs the tool context".to_string()) })
+    }
+    fn call_with(&self, input: Value, ctx: ToolContext) -> BoxFuture<'static, ToolResult> {
+        let b = self.0.clone();
+        Box::pin(async move {
+            check_keys(&input, &["path", "ref"])?;
+            let raw = arg_str(&input, "path")?;
+            let expanded = match raw.strip_prefix("~/") {
+                Some(rest) => dirs::home_dir().map(|h| h.join(rest)).ok_or("no home directory")?,
+                None => std::path::PathBuf::from(raw),
+            };
+            let path = expanded.canonicalize().map_err(|_| format!("There's no file at {raw}."))?;
+            if !path.is_file() {
+                return Err(format!("{} isn't a file.", path.display()));
+            }
+            // Never upload from hidden folders (~/.ssh, ~/.config, keyrings...).
+            if path.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.')) {
+                return Err("Files in hidden folders (like ~/.ssh or ~/.config) can't be uploaded.".into());
+            }
+            let backend_id = match input["ref"].as_str() {
+                Some(r) => parse_ref(r).ok_or_else(|| format!("`{r}` isn't a ref."))?,
+                None => {
+                    let doc = b.bridge.cdp("DOM.getDocument", json!({"depth": 0})).await?;
+                    let root = doc["root"]["nodeId"].as_i64().ok_or("no document")?;
+                    let q = b
+                        .bridge
+                        .cdp("DOM.querySelector", json!({"nodeId": root, "selector": "input[type=file]"}))
+                        .await?;
+                    let node = q["nodeId"].as_i64().filter(|n| *n != 0).ok_or("This page has no file field.")?;
+                    let d = b.bridge.cdp("DOM.describeNode", json!({"nodeId": node})).await?;
+                    d["node"]["backendNodeId"].as_i64().ok_or("file field has no id")?
+                }
+            };
+            let st = b.state().await?;
+            let place = site(&st.url);
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let ok = ctx
+                .approver
+                .approve(
+                    "browser_upload",
+                    format!("Attach {} ({size} bytes) on {place}\n{}", path.display(), st.url),
+                    format!("Uploading sends this file to {place}"),
+                    vec![format!("{place}:{}", path.display())],
+                    b.screenshot(70, 1.0).await.ok(),
+                )
+                .await;
+            if !ok {
+                return Err(format!("The user declined uploading {}.", path.display()));
+            }
+            b.bridge
+                .cdp(
+                    "DOM.setFileInputFiles",
+                    json!({"files": [path.to_string_lossy()], "backendNodeId": backend_id}),
+                )
+                .await
+                .map_err(|e| format!("Couldn't attach the file: {e}"))?;
+            b.after_action(
+                format!("Attached {}.", path.display()),
+                format!("attached {}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
+            )
+            .await
+        })
+    }
+}
+
+impl Tool for SavePdf {
+    fn name(&self) -> &'static str {
+        "browser_save_pdf"
+    }
+    fn description(&self) -> &'static str {
+        "Save the current page as a PDF in the downloads folder (receipts, confirmations, articles). Returns the \
+         file's path."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "File name without .pdf (default: the page title)."}},
+            "additionalProperties": false
+        })
+    }
+    fn effect(&self) -> Effect {
+        Effect::Read
+    }
+    fn describe_call(&self, _: &Value) -> String {
+        "Save page as PDF".into()
+    }
+    fn call(&self, input: Value) -> BoxFuture<'static, ToolResult> {
+        let b = self.0.clone();
+        Box::pin(async move {
+            check_keys(&input, &["name"])?;
+            let st = b.state().await?;
+            let base = input["name"].as_str().map(str::to_string).unwrap_or_else(|| {
+                if st.title.is_empty() { "page".into() } else { st.title.clone() }
+            });
+            let clean: String =
+                base.chars().map(|c| if c.is_alphanumeric() || " -_.".contains(c) { c } else { '_' }).take(80).collect();
+            let dir = crate::downloads_dir();
+            let mut path = dir.join(format!("{}.pdf", clean.trim()));
+            let mut n = 1;
+            while path.exists() {
+                path = dir.join(format!("{} ({n}).pdf", clean.trim()));
+                n += 1;
+            }
+            let ok = b.bridge.save_pdf(path.to_string_lossy().into_owned()).await?;
+            if !ok {
+                return Err("Chromium couldn't save this page as a PDF.".into());
+            }
+            Ok(ToolOutput::text(format!("Saved the page as {}.", path.display()), "saved PDF"))
+        })
+    }
+}
+
 /// Decodes a base64 image (for saving trace evidence).
 pub fn decode_image(img: &ToolImage) -> Option<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(&img.base64).ok()
@@ -866,10 +1702,18 @@ mod tests {
 
     #[test]
     fn commit_words_catch_risky_buttons() {
-        let risky = |n: &str| COMMIT_WORDS.iter().any(|w| n.to_lowercase().contains(w));
+        let risky = |n: &str| has_word(n, COMMIT_WORDS);
         assert!(risky("Place order"));
         assert!(risky("Send"));
+        assert!(risky("Pay $13.98"));
+        assert!(!risky("Add payment method"));
+        assert!(!risky("Proceed to checkout"));
+        assert!(!risky("Accept all cookies"));
         assert!(!risky("Preview"));
         assert!(!risky("Next page"));
+        let link = |n: &str| has_word(n, LINK_COMMIT_WORDS);
+        assert!(!link("Open checkout in a new tab"));
+        assert!(!link("Buy now"));
+        assert!(link("Delete account"));
     }
 }

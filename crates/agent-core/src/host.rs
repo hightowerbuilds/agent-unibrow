@@ -72,6 +72,7 @@ impl ToolHost {
                 name: name.clone(),
                 description: tool.describe_call(&input),
                 reason,
+                image: None,
                 respond: tx,
             });
             let approval = rx.await.unwrap_or(Approval::Deny);
@@ -127,6 +128,7 @@ impl Approver for ToolHost {
         description: String,
         reason: String,
         counterparties: Vec<String>,
+        image: Option<ToolImage>,
     ) -> BoxFuture<'static, bool> {
         let host = self.clone();
         Box::pin(async move {
@@ -140,6 +142,7 @@ impl Approver for ToolHost {
                 name: tool.to_string(),
                 description,
                 reason,
+                image,
                 respond: tx,
             });
             let approval = rx.await.unwrap_or(Approval::Deny);

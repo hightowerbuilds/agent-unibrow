@@ -53,12 +53,15 @@ impl ToolOutput {
 pub trait Approver: Send + Sync {
     /// Resolves to true if the user approves (or has pre-approved this tool
     /// for these counterparties).
+    /// `image` is shown on the approval card (e.g. a screenshot of the form
+    /// about to be submitted).
     fn approve(
         &self,
         tool: &'static str,
         description: String,
         reason: String,
         counterparties: Vec<String>,
+        image: Option<ToolImage>,
     ) -> BoxFuture<'static, bool>;
 }
 

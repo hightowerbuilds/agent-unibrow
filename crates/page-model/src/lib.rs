@@ -15,7 +15,7 @@
 //! ```
 
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Roles the agent can act on; these get refs.
 const INTERACTIVE: &[&str] = &[
@@ -173,6 +173,8 @@ fn parse_nodes(nodes: &[Value]) -> (HashMap<String, Node>, Option<String>) {
 
 struct Walker<'a> {
     nodes: &'a HashMap<String, Node>,
+    /// Backend ids of sensitive fields (passwords, card numbers, codes).
+    hidden: &'a HashSet<i64>,
     lines: Vec<String>,
     interactive: usize,
 }
@@ -193,7 +195,13 @@ impl Walker<'_> {
             s.push(' ');
             s.push_str(&quote(&n.name));
         }
-        if !n.value.is_empty() && n.value != n.name {
+        let sensitive = n.backend_id.is_some_and(|b| self.hidden.contains(&b));
+        if sensitive {
+            if !n.value.is_empty() {
+                s.push_str(" value=[hidden]");
+            }
+            s.push_str(" sensitive");
+        } else if !n.value.is_empty() && n.value != n.name {
             s.push_str(&format!(" value={}", quote(&n.value)));
         }
         for (k, v) in &n.props {
@@ -259,6 +267,9 @@ impl Walker<'_> {
                 next_depth = depth + 1;
             }
             let name = if n.name.is_empty() { parent_name.to_string() } else { n.name.clone() };
+            if n.backend_id.is_some_and(|b| self.hidden.contains(&b)) {
+                return; // never show what's inside a sensitive field
+            }
             // Links and buttons say everything in their name.
             if interactive && !matches!(role, "listbox" | "combobox" | "menu" | "tablist" | "radiogroup") {
                 for c in &n.children {
@@ -296,8 +307,15 @@ impl Walker<'_> {
 
 /// Builds the page model from `Accessibility.getFullAXTree`'s `nodes`.
 pub fn from_ax_tree(nodes: &[Value]) -> PageModel {
+    from_ax_tree_hiding(nodes, &HashSet::new())
+}
+
+/// Like [`from_ax_tree`], with the values of `hidden` fields (by backend
+/// DOM node id) replaced by `[hidden]`. Sensitive text a field holds also
+/// shows up as its child text, so that's suppressed too.
+pub fn from_ax_tree_hiding(nodes: &[Value], hidden: &HashSet<i64>) -> PageModel {
     let (map, root) = parse_nodes(nodes);
-    let mut w = Walker { nodes: &map, lines: Vec::new(), interactive: 0 };
+    let mut w = Walker { nodes: &map, hidden, lines: Vec::new(), interactive: 0 };
     if let Some(root) = root {
         w.walk(&root, 0, "");
     }
@@ -366,6 +384,18 @@ mod tests {
              [e101] link \"Help\" -> https://shop.test/help"
         );
         assert_eq!(m.interactive, 3);
+    }
+
+    #[test]
+    fn sensitive_values_are_hidden() {
+        let mut nodes = sample();
+        nodes[6]["value"] = json!({"type": "string", "value": "4111 1111 1111 1111"});
+        nodes[6]["name"] = json!({"type": "computedString", "value": "Card number"});
+        nodes[7]["name"] = json!({"type": "computedString", "value": "4111 1111 1111 1111"});
+        let hidden: HashSet<i64> = [88].into_iter().collect();
+        let text = from_ax_tree_hiding(&nodes, &hidden).lines.join("\n");
+        assert!(text.contains("[e88] textbox \"Card number\" value=[hidden] sensitive"), "{text}");
+        assert!(!text.contains("4111"), "{text}");
     }
 
     #[test]

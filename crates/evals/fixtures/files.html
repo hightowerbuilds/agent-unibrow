@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Unibrow Test Shop – Files</title>
+<style>body { font: 16px system-ui, sans-serif; max-width: 640px; margin: 32px auto; padding: 0 16px; background: #fff; color: #1b2733; } section { border: 1px solid #d5dce2; border-radius: 8px; padding: 16px; margin: 16px 0; } output { display: block; font-weight: 600; margin-top: 8px; }</style>
+</head>
+<body>
+  <h1>Files</h1>
+  <section>
+    <p>We stock TUSQ nuts, TUSQ saddles and TUSQ string trees.</p>
+    <a href="data:text/csv;charset=utf-8,item,price%0ATUSQ XL Jazz Bass nut,13.98%0ABone saddle,9.50%0A" download="prices.csv">Download price list</a>
+  </section>
+  <section>
+    <label for="file">Attach a photo of your bass</label>
+    <input id="file" type="file" onchange="document.getElementById('file-out').textContent = 'Attached: ' + Array.from(this.files).map(f => f.name + ' (' + f.size + ' bytes)').join(', ')">
+    <output id="file-out"></output>
+  </section>
+  <section>
+    <button onclick="navigator.geolocation.getCurrentPosition(p => document.getElementById('geo-out').textContent = 'Location: ' + p.coords.latitude, e => document.getElementById('geo-out').textContent = 'Location error: ' + e.code + ' ' + e.message)">Use my location</button>
+    <output id="geo-out"></output>
+  </section>
+</body>
+</html>

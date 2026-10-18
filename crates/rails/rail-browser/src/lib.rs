@@ -65,9 +65,73 @@ pub struct Modifiers {
     pub command: bool,
 }
 
+/// An open `<select>` list or similar, which Chromium paints separately.
+pub struct PopupLayer {
+    /// Position and size in view (CSS) pixels.
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub frame: Option<Frame>,
+    pub frame_seq: u64,
+}
+
+/// A JavaScript dialog waiting for an answer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DialogInfo {
+    /// `alert`, `confirm`, `prompt` or `beforeunload` ("leave this page?").
+    pub kind: String,
+    pub message: String,
+    pub default_text: String,
+}
+
+/// A download, as reported by Chromium.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DownloadInfo {
+    pub id: u32,
+    pub name: String,
+    pub path: String,
+    pub url: String,
+    pub percent: i32,
+    pub received: i64,
+    pub total: i64,
+    pub complete: bool,
+    pub canceled: bool,
+}
+
+/// The page opened a file chooser (`<input type=file>`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileDialogRequest {
+    pub multiple: bool,
+    pub title: String,
+}
+
+/// Where downloads go: `~/Downloads/agent-unibrow`, or inside
+/// `$UNIBROW_DATA_DIR` for test instances.
+pub fn downloads_dir() -> PathBuf {
+    let dir = match std::env::var_os("UNIBROW_DATA_DIR") {
+        Some(d) => PathBuf::from(d).join("downloads"),
+        None => dirs::download_dir().unwrap_or_else(|| data_dir().join("downloads")).join("agent-unibrow"),
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 /// Everything the UI shows about a page, updated by CEF callbacks.
 #[derive(Default)]
 pub struct ViewState {
+    /// Find-in-page result: (matches, active match ordinal).
+    pub find: Option<(i32, i32)>,
+    pub downloads: Vec<DownloadInfo>,
+    pub file_dialog: Option<FileDialogRequest>,
+    pub(crate) file_dialog_callback: Option<cef::FileDialogCallback>,
+    /// Permission requests the browser turned down, for a notice.
+    pub blocked: Vec<String>,
+    /// Links that asked for a new tab or window: (url, open in foreground).
+    pub new_tabs: Vec<(String, bool)>,
+    pub popup: Option<PopupLayer>,
+    pub dialog: Option<DialogInfo>,
+    pub(crate) dialog_callback: Option<cef::JsdialogCallback>,
     pub frame: Option<Frame>,
     /// Increments on every paint, so the UI can tell a new frame arrived.
     pub frame_seq: u64,
@@ -224,11 +288,47 @@ impl WebView {
             can_go_forward: s.can_go_forward,
             width: s.width,
             height: s.height,
+            dialog: s.dialog.clone(),
+            load_error: s.load_error.clone(),
         }
     }
 
     pub fn state(&self) -> Ref<'_, ViewState> {
         self.state.borrow()
+    }
+
+    /// Takes the newest popup-layer frame (open dropdown list), if any.
+    pub fn take_popup_frame(&self) -> Option<(i32, i32, i32, i32, Frame)> {
+        let mut s = self.state.borrow_mut();
+        let p = s.popup.as_mut()?;
+        let f = p.frame.take()?;
+        Some((p.x, p.y, p.width, p.height, f))
+    }
+
+    pub fn popup_visible(&self) -> bool {
+        self.state.borrow().popup.is_some()
+    }
+
+    pub fn dialog(&self) -> Option<DialogInfo> {
+        self.state.borrow().dialog.clone()
+    }
+
+    /// Answers the open JavaScript dialog: OK (`accept`) or Cancel, with
+    /// `text` for prompts.
+    pub fn answer_dialog(&self, accept: bool, text: Option<&str>) -> bool {
+        let cb = {
+            let mut s = self.state.borrow_mut();
+            s.dialog = None;
+            s.dialog_callback.take()
+        };
+        match cb {
+            Some(cb) => {
+                use cef::ImplJsdialogCallback;
+                cb.cont(accept as i32, text.map(CefString::from).as_ref());
+                true
+            }
+            None => false,
+        }
     }
 
     /// Takes the newest frame, if one arrived since the last call.
@@ -281,6 +381,80 @@ impl WebView {
             }
             h.was_resized();
         }
+    }
+
+    /// Find in page (the user's Ctrl+F). `find_next` continues the same search.
+    pub fn find(&self, text: &str, forward: bool, find_next: bool) {
+        if let Some(h) = self.host() {
+            h.find(Some(&CefString::from(text)), forward as i32, 0, find_next as i32);
+        }
+    }
+
+    pub fn stop_finding(&self) {
+        if let Some(h) = self.host() {
+            h.stop_finding(1);
+        }
+        self.state.borrow_mut().find = None;
+    }
+
+    pub fn find_result(&self) -> Option<(i32, i32)> {
+        self.state.borrow().find
+    }
+
+    pub fn downloads(&self) -> Vec<DownloadInfo> {
+        self.state.borrow().downloads.clone()
+    }
+
+    pub fn file_dialog(&self) -> Option<FileDialogRequest> {
+        self.state.borrow().file_dialog.clone()
+    }
+
+    /// Answers the page's file chooser: the chosen paths, or `None` to cancel.
+    pub fn answer_file_dialog(&self, paths: Option<Vec<String>>) {
+        let cb = {
+            let mut s = self.state.borrow_mut();
+            s.file_dialog = None;
+            s.file_dialog_callback.take()
+        };
+        if let Some(cb) = cb {
+            use cef::ImplFileDialogCallback;
+            match paths {
+                Some(paths) if !paths.is_empty() => {
+                    let mut list = cef::CefStringList::new();
+                    for p in &paths {
+                        list.append(p);
+                    }
+                    cb.cont(Some(&mut list));
+                }
+                _ => cb.cancel(),
+            }
+        }
+    }
+
+    pub fn take_blocked(&self) -> Vec<String> {
+        std::mem::take(&mut self.state.borrow_mut().blocked)
+    }
+
+    /// Saves the page as a PDF at `path`; `done` gets whether it worked.
+    pub fn print_to_pdf(&self, path: &str, done: futures::channel::oneshot::Sender<bool>) {
+        if let Some(h) = self.host() {
+            let settings = cef::PdfPrintSettings { print_background: 1, ..Default::default() };
+            let mut cb = handlers::pdf_callback(done);
+            h.print_to_pdf(Some(&CefString::from(path)), Some(&settings), Some(&mut cb));
+        }
+    }
+
+    /// Background tabs are hidden: Chromium stops painting them and
+    /// throttles their timers.
+    pub fn set_hidden(&self, hidden: bool) {
+        if let Some(h) = self.host() {
+            h.was_hidden(hidden as i32);
+        }
+    }
+
+    /// New-tab requests from links on this page since the last call.
+    pub fn take_new_tab_requests(&self) -> Vec<(String, bool)> {
+        std::mem::take(&mut self.state.borrow_mut().new_tabs)
     }
 
     pub fn set_focus(&self, focused: bool) {

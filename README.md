@@ -37,6 +37,12 @@ registers it, so no rail knows about another.
 The full list of browser-agent capabilities, phased, is in
 [docs/BROWSER_AGENT_ROADMAP.md](docs/BROWSER_AGENT_ROADMAP.md).
 
+## Using it
+
+The sidebar's **Explained** tab (Alt+5) is the in-app guide: what the agent can do, how
+to ask well, approvals and Stop, what it won't do, and shortcuts. Its example requests
+drop straight into the chat box.
+
 ## Run
 
 ```

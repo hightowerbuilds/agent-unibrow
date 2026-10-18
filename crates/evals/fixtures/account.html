@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Unibrow Test Shop – Account</title>
+<style>
+  body { font: 16px system-ui, sans-serif; max-width: 640px; margin: 32px auto; padding: 0 16px; color: #1b2733; background: #fff; }
+  label { display: block; margin: 12px 0 4px; font-weight: 600; }
+  input { padding: 8px; font: inherit; width: 100%; box-sizing: border-box; }
+  button { margin-top: 12px; padding: 8px 16px; font: inherit; }
+  section { border: 1px solid #d5dce2; border-radius: 8px; padding: 16px; margin: 20px 0; }
+</style>
+</head>
+<body>
+  <h1>Your account</h1>
+
+  <section>
+    <h2>Search the shop</h2>
+    <form role="search" method="get" action="account.html">
+      <label for="q">Search</label>
+      <input id="q" name="q" type="search">
+      <button type="submit">Search</button>
+    </form>
+    <p id="results"></p>
+    <script>
+      const q = new URLSearchParams(location.search).get('q');
+      if (q) document.getElementById('results').textContent = 'Results for: ' + q;
+    </script>
+  </section>
+
+  <section>
+    <h2>Sign in</h2>
+    <form method="post" action="https://shop.invalid/login" onsubmit="event.preventDefault(); document.getElementById('signed').textContent='SIGNED IN';">
+      <label for="user">Username</label>
+      <input id="user" name="username" type="text" autocomplete="username">
+      <label for="pw">Password</label>
+      <input id="pw" name="password" type="password" autocomplete="current-password">
+      <button type="submit">Continue</button>
+    </form>
+    <p id="signed"></p>
+  </section>
+
+  <section>
+    <h2>Saved card</h2>
+    <label for="cc">Card number</label>
+    <input id="cc" name="cardnumber" autocomplete="cc-number" value="4111 1111 1111 1111">
+  </section>
+</body>
+</html>

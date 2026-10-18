@@ -99,7 +99,7 @@ The minimum for the agent to work in the browser at all.
 
 ## Phase 2: Full interaction (everything a person does on a page)
 
-### 2.1 Forms — todo
+### 2.1 Forms — partial (fields, checkboxes, radios, native dropdowns with popup rendering, `browser_select`; date pickers, rich editors and `browser_fill_form` todo)
 - Text inputs, text areas, number, email, password fields.
 - Checkboxes, radio buttons, switches.
 - **`<select>` dropdowns**: render CEF's popup layer (`PET_POPUP`), which is
@@ -110,7 +110,7 @@ The minimum for the agent to work in the browser at all.
 - Read validation errors after submit and fix the fields.
 - `browser_fill_form`: fill several fields in one call from a mapping.
 
-### 2.2 Pointer actions — todo
+### 2.2 Pointer actions — partial (hover, right/middle/double click done; drag and drop todo)
 - Double-click, right-click, middle-click.
 - Hover (menus that open on hover, tooltips).
 - Drag and drop: between elements, sliders, sortable lists, file drops
@@ -146,7 +146,7 @@ The minimum for the agent to work in the browser at all.
 
 ## Phase 3: Tabs, windows and navigation
 
-### 3.1 Multiple tabs — todo
+### 3.1 Multiple tabs — partial (tab strip, Ctrl+T/W/Tab/L, `browser_tabs`, target=_blank links open tabs; agent-only background tabs todo)
 - Real tabs in the UI (a tab strip), each its own `WebView`.
 - Agent tools: `browser_tabs`, `browser_new_tab`, `browser_switch_tab`,
   `browser_close_tab`.
@@ -154,39 +154,39 @@ The minimum for the agent to work in the browser at all.
 - Background tabs, so the agent can compare several pages without taking
   over the one you're on.
 
-### 3.2 Popups — partial
+### 3.2 Popups — partial (`window.open` opens a tab; opener link for OAuth popups todo)
 - OAuth and payment popups (`window.open`) open as real popup views and
   close themselves back into the opener, instead of replacing the page.
 
-### 3.3 Navigation state — partial
+### 3.3 Navigation state — partial (load failures reported to the agent; per-tab history list todo)
 - Session history list per tab (`navigation_entries`).
 - Detect error pages, 404s, offline, and redirects to login.
 
-### 3.4 Find in page — todo
+### 3.4 Find in page — done (Ctrl+F bar with match count; `browser_find`)
 - Ctrl+F for people; `browser_find` for the agent (CEF `find` / `FindHandler`).
 
 ---
 
 ## Phase 4: Dialogs, permissions, files and downloads
 
-### 4.1 JavaScript dialogs — todo
+### 4.1 JavaScript dialogs — done
 - `alert`, `confirm`, `prompt`, and "leave site?" (`JsdialogHandler`).
 - Shown to the user as in-app cards; the agent can answer `alert`s, but
   `confirm`s that delete or pay go through approval.
 
-### 4.2 Permission requests — todo
+### 4.2 Permission requests — partial (camera, mic, location, notifications denied with a notice; per-site allow todo)
 - Location, notifications, camera, microphone, clipboard
   (`PermissionHandler`).
 - Default deny for the agent; the user approves per site, remembered per
   site.
 
-### 4.3 File uploads — todo
+### 4.3 File uploads — done (desktop file picker for people; `browser_upload` with approval, hidden folders refused)
 - File chooser (`DialogHandler`): the user picks files, or the agent
   attaches a file the user has explicitly allowed (e.g. a résumé in a
   known folder).
 - Never browse the user's disk on its own.
 
-### 4.4 Downloads — todo
+### 4.4 Downloads — done (auto-save, toolbar list, `browser_downloads`, `browser_read_download` incl. PDF via pdftotext)
 - `DownloadHandler`: save to `~/Downloads/agent-unibrow`, show progress in
   the UI, and report the saved path to the agent.
 - Read downloaded PDFs, CSVs and text so the agent can use their contents.
@@ -195,7 +195,7 @@ The minimum for the agent to work in the browser at all.
 - Certificate errors shown to the user; the agent never clicks through.
 - HTTP basic auth prompts handed to the user.
 
-### 4.6 Print and PDF — todo
+### 4.6 Print and PDF — partial (`browser_save_pdf`; system print dialog todo)
 - Save page as PDF (`print_to_pdf`); print through the system dialog.
 
 ---
@@ -230,7 +230,7 @@ The minimum for the agent to work in the browser at all.
 
 ## Phase 6: Safety and policy for browser actions
 
-### 6.1 Classifying actions by effect — todo
+### 6.1 Classifying actions by effect — done (button wording, form submits that post or carry sensitive fields, Enter in such forms, risky confirm dialogs)
 - **Read**: navigate, read, scroll, search.
 - **Stage**: type into fields, add to cart, save a draft.
 - **Commit**: submit forms that send, pay, post, delete, book, sign up,
@@ -238,7 +238,7 @@ The minimum for the agent to work in the browser at all.
 - Classified from the element (role, button text, form action) and the
   page (checkout, payment fields), with a cautious default.
 
-### 6.2 Approval cards for browser actions — todo
+### 6.2 Approval cards for browser actions — done
 - Show what will happen: a screenshot of the form, the values filled in,
   and the button that will be pressed.
 
@@ -247,7 +247,7 @@ The minimum for the agent to work in the browser at all.
   and anything else needs approval.
 - Per-site rules: read-only sites, never-act sites.
 
-### 6.4 Sensitive data — todo
+### 6.4 Sensitive data — done (no typing into password/card/code fields; values hidden from page reads; masked in screenshots)
 - Detect payment, password and ID fields. The agent never types card
   numbers or passwords itself; the vault fills them.
 - Redact sensitive values in the trace and in anything sent to the model.

@@ -5,6 +5,7 @@
 //! its own thread; its events arrive here over a channel.
 
 mod browser_pane;
+mod explained;
 mod text_input;
 mod theme;
 
@@ -24,7 +25,10 @@ use browsing::{Browsing, HistoryQuery, site_of};
 use text_input::{Changed, Submit, TextInput};
 use trace::{Kind, Trace};
 
-gpui::actions!(shell, [ToggleSidebar, ShowChat, ShowHistory, ShowFocus, ShowTrace, StopAgent]);
+gpui::actions!(
+    shell,
+    [ToggleSidebar, ShowChat, ShowHistory, ShowFocus, ShowTrace, ShowExplained, StopAgent, NewTab, CloseTab, NextTab, PrevTab, FocusAddress, FindInPage]
+);
 
 const KEYRING_SERVICE: &str = "agent-unibrow";
 const KEYRING_API_KEY: &str = "anthropic-api-key";
@@ -50,6 +54,7 @@ enum SidebarTab {
     History,
     Focus,
     Trace,
+    Explained,
 }
 
 /// Width of the open sidebar and of the bumper strip that toggles it.
@@ -61,6 +66,8 @@ struct PendingApproval {
     name: String,
     description: String,
     reason: String,
+    /// Screenshot saved with the trace entry, shown on the card.
+    image: Option<std::path::PathBuf>,
     respond: Option<agent_core::ApprovalSender>,
 }
 
@@ -355,11 +362,14 @@ impl Shell {
                 self.trace.push_with_images(kind, format!("{name}: {summary}"), Some(content), images);
                 self.status = "Thinking…".into();
             }
-            AgentEvent::ApprovalNeeded { id, name, description, reason, respond } => {
+            AgentEvent::ApprovalNeeded { id, name, description, reason, image, respond } => {
                 self.status = "Waiting for your approval".into();
                 self.sidebar_open = true;
                 self.tab = SidebarTab::Chat;
-                self.trace.push(Kind::ApprovalRequested, format!("Approval needed: {reason}"), Some(description.clone()));
+                let shot: Vec<Vec<u8>> = image.iter().filter_map(rail_browser::tools::decode_image).collect();
+                let entry =
+                    self.trace.push_with_images(Kind::ApprovalRequested, format!("Approval needed: {reason}"), Some(description.clone()), shot);
+                let image = entry.images.first().map(std::path::PathBuf::from);
                 let auto = std::env::var("UNIBROW_AUTOAPPROVE").ok();
                 match auto.as_deref() {
                     // Test hook: answer approval cards automatically.
@@ -369,7 +379,7 @@ impl Shell {
                     Some("deny") => {
                         let _ = respond.send(Approval::Deny);
                     }
-                    _ => self.approvals.push(PendingApproval { id, name, description, reason, respond: Some(respond) }),
+                    _ => self.approvals.push(PendingApproval { id, name, description, reason, image, respond: Some(respond) }),
                 }
             }
             AgentEvent::ApprovalDecided { name, approval, .. } => {
@@ -454,6 +464,15 @@ impl Shell {
         cx.notify();
     }
 
+    /// Puts an example request from the guide in the chat box.
+    fn use_example(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.tab = SidebarTab::Chat;
+        self.sidebar_open = true;
+        self.input.update(cx, |i, cx| i.set_text(text, cx));
+        window.focus(&self.input.focus_handle(cx));
+        cx.notify();
+    }
+
     /// Opens the sidebar (if closed) on `tab`.
     fn show_tab(&mut self, tab: SidebarTab, window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_open = true;
@@ -497,7 +516,6 @@ impl Shell {
                 }))
         };
         let pending = (!self.approvals.is_empty() && self.tab != SidebarTab::Chat).then(|| self.approvals.len().to_string());
-        let status: Option<SharedString> = (!self.status.is_empty()).then(|| self.status.clone());
         div()
             .flex()
             .items_end()
@@ -534,9 +552,11 @@ impl Shell {
                             None,
                         )
                         .on_click(cx.listener(|this, _, window, cx| this.select_tab(SidebarTab::Trace, window, cx))),
-                    ),
+                    )
+                    .child(tab("tab-explained", "Explained".into(), self.tab == SidebarTab::Explained, None).on_click(
+                        cx.listener(|this, _, window, cx| this.select_tab(SidebarTab::Explained, window, cx)),
+                    )),
             )
-            .children(status.map(|s| div().pb_2().text_xs().text_color(rgb(theme::MUTED)).child(s)))
     }
 
     /// The strip on the sidebar's edge that opens and closes it.
@@ -587,6 +607,18 @@ impl Shell {
                     .p_3()
                     .overflow_y_scroll()
                     .track_scroll(&self.conv_scroll)
+                    .when(self.items.iter().all(|i| i.kind == ItemKind::System), |d| {
+                        d.child(
+                            div()
+                                .id("explained-hint")
+                                .text_sm()
+                                .text_color(rgb(theme::MUTED))
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(rgb(theme::ACCENT)))
+                                .on_click(cx.listener(|this, _, window, cx| this.select_tab(SidebarTab::Explained, window, cx)))
+                                .child("New here? See how to get the most out of the agent → Explained (Alt+5)"),
+                        )
+                    })
                     .children(self.items.iter().map(Self::render_item))
                     .children(approvals),
             )
@@ -949,9 +981,11 @@ impl Shell {
 
     fn render_backend_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let current = self.settings.backend;
+        let status: Option<SharedString> = (!self.status.is_empty()).then(|| self.status.clone());
         div()
             .flex()
             .flex_wrap()
+            .items_center()
             .gap_1()
             .px_3()
             .py_2()
@@ -973,6 +1007,8 @@ impl Shell {
                     .on_click(cx.listener(move |this, _, _, cx| this.switch_backend(kind, cx)))
                     .child(kind.label())
             }))
+            .child(div().flex_1())
+            .children(status.map(|s| div().text_xs().text_color(rgb(theme::MUTED)).child(s)))
     }
 
     fn render_item(item: &Item) -> impl IntoElement {
@@ -1038,6 +1074,9 @@ impl Shell {
                     .text_color(rgb(theme::FG))
                     .child(a.description.clone()),
             )
+            .children(a.image.clone().map(|p| {
+                gpui::img(p).w_full().rounded_sm().border_1().border_color(rgb(theme::RULE))
+            }))
             .child(
                 div()
                     .flex()
@@ -1046,7 +1085,7 @@ impl Shell {
                     .child(button(format!("approve-{}", a.id), "Approve", true).on_click(
                         cx.listener(move |this, _, _, cx| this.resolve(&id1, Approval::Approve, cx)),
                     ))
-                    .child(button(format!("always-{}", a.id), "Always allow these recipients", false).on_click(
+                    .child(button(format!("always-{}", a.id), if a.name.starts_with("browser_") { "Always allow on this site" } else { "Always allow these recipients" }, false).on_click(
                         cx.listener(move |this, _, _, cx| this.resolve(&id2, Approval::AlwaysAllow, cx)),
                     ))
                     .child(button(format!("deny-{}", a.id), "Deny", false).on_click(
@@ -1139,6 +1178,13 @@ impl Render for Shell {
                 SidebarTab::History => self.render_history(cx).into_any_element(),
                 SidebarTab::Focus => self.render_focus(cx).into_any_element(),
                 SidebarTab::Trace => self.render_trace(cx).into_any_element(),
+                SidebarTab::Explained => {
+                    let me = cx.entity().downgrade();
+                    explained::render(move |text, window, cx| {
+                        let _ = me.update(cx, |this, cx| this.use_example(text, window, cx));
+                    })
+                    .into_any_element()
+                }
             };
             div()
                 .flex()
@@ -1162,10 +1208,19 @@ impl Render for Shell {
                     cx.propagate();
                 }
             }))
+            .on_action(cx.listener(|this, _: &NewTab, window, cx| this.browser.update(cx, |b, cx| b.new_tab(window, cx))))
+            .on_action(cx.listener(|this, _: &CloseTab, _, cx| this.browser.update(cx, |b, cx| b.close_active_tab(cx))))
+            .on_action(cx.listener(|this, _: &NextTab, _, cx| this.browser.update(cx, |b, cx| b.cycle_tab(true, cx))))
+            .on_action(cx.listener(|this, _: &PrevTab, _, cx| this.browser.update(cx, |b, cx| b.cycle_tab(false, cx))))
+            .on_action(cx.listener(|this, _: &FindInPage, window, cx| this.browser.update(cx, |b, cx| b.open_find(window, cx))))
+            .on_action(cx.listener(|this, _: &FocusAddress, window, cx| {
+                this.browser.update(cx, |b, cx| b.focus_address(window, cx))
+            }))
             .on_action(cx.listener(|this, _: &ShowChat, window, cx| this.show_tab(SidebarTab::Chat, window, cx)))
             .on_action(cx.listener(|this, _: &ShowHistory, window, cx| this.show_tab(SidebarTab::History, window, cx)))
             .on_action(cx.listener(|this, _: &ShowFocus, window, cx| this.show_tab(SidebarTab::Focus, window, cx)))
             .on_action(cx.listener(|this, _: &ShowTrace, window, cx| this.show_tab(SidebarTab::Trace, window, cx)))
+            .on_action(cx.listener(|this, _: &ShowExplained, window, cx| this.show_tab(SidebarTab::Explained, window, cx)))
             .flex()
             .flex_row()
             .size_full()
@@ -1259,10 +1314,17 @@ fn main() -> std::process::ExitCode {
         cx.bind_keys([
             gpui::KeyBinding::new("ctrl-b", ToggleSidebar, None),
             gpui::KeyBinding::new("escape", StopAgent, None),
+            gpui::KeyBinding::new("ctrl-t", NewTab, None),
+            gpui::KeyBinding::new("ctrl-w", CloseTab, None),
+            gpui::KeyBinding::new("ctrl-tab", NextTab, None),
+            gpui::KeyBinding::new("ctrl-shift-tab", PrevTab, None),
+            gpui::KeyBinding::new("ctrl-l", FocusAddress, None),
+            gpui::KeyBinding::new("ctrl-f", FindInPage, None),
             gpui::KeyBinding::new("alt-1", ShowChat, None),
             gpui::KeyBinding::new("alt-2", ShowHistory, None),
             gpui::KeyBinding::new("alt-3", ShowFocus, None),
             gpui::KeyBinding::new("alt-4", ShowTrace, None),
+            gpui::KeyBinding::new("alt-5", ShowExplained, None),
         ]);
         let bounds = Bounds::centered(None, size(px(1400.), px(860.)), cx);
         cx.open_window(

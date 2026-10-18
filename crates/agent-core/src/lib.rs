@@ -138,7 +138,15 @@ pub enum AgentEvent {
         /// Screenshots and other images for the trace.
         evidence: Vec<router::ToolImage>,
     },
-    ApprovalNeeded { id: String, name: String, description: String, reason: String, respond: ApprovalSender },
+    ApprovalNeeded {
+        id: String,
+        name: String,
+        description: String,
+        reason: String,
+        /// Screenshot of what's about to happen, when the tool has one.
+        image: Option<router::ToolImage>,
+        respond: ApprovalSender,
+    },
     ApprovalDecided { id: String, name: String, approval: Approval },
     /// The turn is over; it is the user's turn.
     Done { stop_reason: String, model: Option<String>, usage: Value },

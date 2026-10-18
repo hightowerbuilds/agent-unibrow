@@ -4,7 +4,7 @@
 //! in the page area. Mouse, wheel and keyboard input on the page are
 //! forwarded to Chromium. One pump loop drives CEF from the main thread.
 
-use crate::text_input::{Submit, TextInput};
+use crate::text_input::{Changed, Submit, TextInput};
 use crate::theme;
 use gpui::{
     App, Bounds, Context, Corners, CursorStyle, Entity, FocusHandle, Focusable, KeyDownEvent, KeyUpEvent,
@@ -14,7 +14,8 @@ use gpui::{
 use browsing::{Browsing, site_of};
 use gpui::EventEmitter;
 use rail_browser::bridge::Rect;
-use rail_browser::{Cursor, KeyInput, Modifiers, NavAction, Request, WebView, normalize_address};
+use rail_browser::bridge::{TabInfo, TabOp};
+use rail_browser::{Cursor, DialogInfo, KeyInput, Modifiers, NavAction, Request, WebView, normalize_address};
 use std::time::Instant;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -46,6 +47,7 @@ struct Chrome {
     can_go_forward: bool,
     cursor: Cursor,
     load_error: Option<String>,
+    dialog: Option<DialogInfo>,
 }
 
 /// History or focus changed (a visit was recorded, focus toggled).
@@ -58,6 +60,13 @@ pub enum AgentControl {
     TookOver,
 }
 
+/// One open tab: its own Chromium page and toolbar state.
+struct Tab {
+    id: u32,
+    view: WebView,
+    chrome: Chrome,
+}
+
 pub struct BrowserPane {
     store: Arc<Browsing>,
     /// Requests from agent tools (DevTools commands, navigation, highlights).
@@ -68,10 +77,16 @@ pub struct BrowserPane {
     agent_busy: bool,
     /// ...and it has used the browser during this turn.
     agent_driving: bool,
-    view: Option<WebView>,
+    tabs: Vec<Tab>,
+    active: usize,
+    next_tab_id: u32,
+    /// Page size and scale every tab is laid out at.
+    size: Option<(i32, i32, f32)>,
     /// Why Chromium couldn't start, if it couldn't.
     unavailable: Option<String>,
     image: Option<Arc<RenderImage>>,
+    /// An open dropdown list: where it goes (CSS px) and its pixels.
+    popup: Option<(f32, f32, Arc<RenderImage>)>,
     /// Old frames waiting to be released from the GPU atlas.
     retired: Vec<Arc<RenderImage>>,
     last_seq: u64,
@@ -80,6 +95,14 @@ pub struct BrowserPane {
     chrome: Chrome,
     address: Entity<TextInput>,
     editing_address: bool,
+    /// Ctrl+F find bar.
+    find_open: bool,
+    find_input: Entity<TextInput>,
+    /// The desktop file picker is open for a page's file field.
+    file_prompt_open: bool,
+    downloads_open: bool,
+    /// A short notice over the page (blocked permission requests).
+    notice: Option<(String, Instant)>,
     page_focus: FocusHandle,
     _pump: Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -97,10 +120,24 @@ impl BrowserPane {
         cx: &mut Context<Self>,
     ) -> Self {
         let address = cx.new(|cx| TextInput::new("Search or enter address", cx));
+        let find_input = cx.new(|cx| TextInput::new("Find in page", cx));
         let page_focus = cx.focus_handle();
         let address_focus = address.focus_handle(cx);
         let subscriptions = vec![
             cx.subscribe(&address, |this: &mut Self, _, ev: &Submit, cx| this.navigate(&ev.0, cx)),
+            cx.subscribe(&find_input, |this: &mut Self, input, _: &Changed, cx| {
+                let text = input.read(cx).text().to_string();
+                if let Some(v) = this.view() {
+                    if text.is_empty() { v.stop_finding() } else { v.find(&text, true, false) }
+                }
+                cx.notify();
+            }),
+            cx.subscribe(&find_input, |this: &mut Self, _, ev: &Submit, cx| {
+                if let Some(v) = this.view() {
+                    v.find(&ev.0, true, true);
+                }
+                cx.notify();
+            }),
             cx.on_focus(&address_focus, window, |this, _, _| this.editing_address = true),
             cx.on_blur(&address_focus, window, |this, _, cx| {
                 this.editing_address = false;
@@ -108,12 +145,12 @@ impl BrowserPane {
                 this.address.update(cx, |a, cx| a.set_text(&url, cx));
             }),
             cx.on_focus(&page_focus, window, |this, _, _| {
-                if let Some(v) = &this.view {
+                if let Some(v) = this.view() {
                     v.set_focus(true);
                 }
             }),
             cx.on_blur(&page_focus, window, |this, _, _| {
-                if let Some(v) = &this.view {
+                if let Some(v) = this.view() {
                     v.set_focus(false);
                 }
             }),
@@ -139,9 +176,13 @@ impl BrowserPane {
             highlight: None,
             agent_busy: false,
             agent_driving: false,
-            view: None,
+            tabs: Vec::new(),
+            active: 0,
+            next_tab_id: 1,
+            size: None,
             unavailable: cef.err(),
             image: None,
+            popup: None,
             retired: Vec::new(),
             last_seq: 0,
             applied: (0, 0, 0),
@@ -149,6 +190,11 @@ impl BrowserPane {
             chrome: Chrome::default(),
             address,
             editing_address: false,
+            find_open: false,
+            find_input,
+            file_prompt_open: false,
+            downloads_open: false,
+            notice: None,
             page_focus,
             _pump: pump,
             _subscriptions: subscriptions,
@@ -167,27 +213,34 @@ impl BrowserPane {
         let scale = if g.scale > 0.0 { g.scale } else { 1.0 };
         let wanted = (w, h, (scale * 100.0) as u32);
 
-        match &self.view {
-            None => match WebView::create(&std::env::var("UNIBROW_START_URL").unwrap_or_else(|_| HOME.into()), w, h, scale) {
-                Ok(v) => {
-                    self.view = Some(v);
-                    self.applied = wanted;
-                }
-                Err(e) => {
-                    self.unavailable = Some(e);
-                    cx.notify();
-                    return;
-                }
-            },
-            Some(v) if self.applied != wanted => {
-                v.resize(w, h, scale);
-                self.applied = wanted;
+        self.size = Some((w, h, scale));
+        if self.tabs.is_empty() {
+            let start = std::env::var("UNIBROW_START_URL").unwrap_or_else(|_| HOME.into());
+            if let Err(e) = self.open_tab(&start, true, cx) {
+                self.unavailable = Some(e);
+                cx.notify();
+                return;
             }
-            _ => {}
+            self.applied = wanted;
+        } else if self.applied != wanted {
+            for t in &self.tabs {
+                t.view.resize(w, h, scale);
+            }
+            self.applied = wanted;
         }
-        let Some(view) = &self.view else { return };
+
+        // Links that asked for new tabs.
+        let mut opens = Vec::new();
+        for t in &self.tabs {
+            opens.extend(t.view.take_new_tab_requests());
+        }
+        for (url, foreground) in opens {
+            let _ = self.open_tab(&url, foreground, cx);
+        }
 
         let mut changed = false;
+        let mut tab_ops: Vec<(TabOp, rail_browser::bridge::Reply<Vec<TabInfo>>)> = Vec::new();
+        let Some(view) = self.tabs.get(self.active).map(|t| &t.view) else { return };
         while let Ok(req) = self.requests.try_recv() {
             if self.agent_busy && !self.agent_driving {
                 self.agent_driving = true;
@@ -214,12 +267,63 @@ impl BrowserPane {
                     self.highlight = Some((rect, label, Instant::now()));
                     changed = true;
                 }
+                Request::Dialog { accept, text, reply } => {
+                    let r = if view.answer_dialog(accept, text.as_deref()) { Ok(()) } else { Err("No dialog is open.".into()) };
+                    let _ = reply.send(r);
+                    changed = true;
+                }
+                Request::Tabs { op, reply } => tab_ops.push((op, reply)),
+                Request::Downloads { reply } => {
+                    let all: Vec<_> = self.tabs.iter().flat_map(|t| t.view.downloads()).collect();
+                    let _ = reply.send(Ok(all));
+                }
+                Request::SavePdf { path, done } => view.print_to_pdf(&path, done),
             }
+        }
+        for (op, reply) in tab_ops {
+            let r = self.apply_tab_op(op, cx).map(|_| self.tab_infos());
+            let _ = reply.send(r);
+            changed = true;
         }
         if self.highlight.as_ref().is_some_and(|(_, _, at)| at.elapsed() > HIGHLIGHT_FOR) {
             self.highlight = None;
             changed = true;
         }
+        // A page's file field opened its chooser: show the desktop picker.
+        if !self.file_prompt_open {
+            if let Some((tab_id, req)) = self.tabs.iter().find_map(|t| t.view.file_dialog().map(|r| (t.id, r))) {
+                self.file_prompt_open = true;
+                let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+                    files: true,
+                    directories: false,
+                    multiple: req.multiple,
+                    prompt: None,
+                });
+                cx.spawn(async move |this, cx| {
+                    let picked = rx.await.ok().and_then(|r| r.ok()).flatten();
+                    let _ = this.update(cx, |pane, cx| {
+                        pane.file_prompt_open = false;
+                        if let Some(t) = pane.tabs.iter().find(|t| t.id == tab_id) {
+                            t.view.answer_file_dialog(
+                                picked.map(|ps| ps.into_iter().map(|p| p.to_string_lossy().into_owned()).collect()),
+                            );
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+        }
+        let blocked: Vec<String> = self.tabs.iter().flat_map(|t| t.view.take_blocked()).collect();
+        if let Some(last) = blocked.last() {
+            self.notice = Some((format!("Blocked: {last}"), Instant::now()));
+            changed = true;
+        }
+        if self.notice.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(6)) {
+            self.notice = None;
+            changed = true;
+        }
+        let Some(view) = self.tabs.get(self.active).map(|t| &t.view) else { return };
         let seq = view.state().frame_seq;
         if seq != self.last_seq {
             self.last_seq = seq;
@@ -235,41 +339,285 @@ impl BrowserPane {
             }
         }
 
-        let chrome = {
-            let s = view.state();
-            Chrome {
-                url: s.url.clone(),
-                title: s.title.clone(),
-                loading: s.loading,
-                can_go_back: s.can_go_back,
-                can_go_forward: s.can_go_forward,
-                cursor: s.cursor,
-                load_error: s.load_error.clone(),
+        // Open dropdown list (painted separately by Chromium).
+        if let Some((x, y, _w, _h, frame)) = view.take_popup_frame() {
+            if let Some(buf) = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra) {
+                let img = Arc::new(RenderImage::new(vec![image::Frame::new(buf)]));
+                if let Some((_, _, old)) = self.popup.replace((x as f32, y as f32, img)) {
+                    self.retired.push(old);
+                }
+                changed = true;
             }
-        };
-        if chrome != self.chrome {
-            if chrome.url != self.chrome.url {
-                if !self.editing_address {
-                    let url = chrome.url.clone();
+        } else if !view.popup_visible() {
+            if let Some((_, _, old)) = self.popup.take() {
+                self.retired.push(old);
+                changed = true;
+            }
+        }
+
+        // Every tab records history; the active one drives the toolbar.
+        let mut browsing_changed = false;
+        for t in self.tabs.iter_mut() {
+            let chrome = {
+                let s = t.view.state();
+                Chrome {
+                    url: s.url.clone(),
+                    title: s.title.clone(),
+                    loading: s.loading,
+                    can_go_back: s.can_go_back,
+                    can_go_forward: s.can_go_forward,
+                    cursor: s.cursor,
+                    load_error: s.load_error.clone(),
+                    dialog: s.dialog.clone(),
+                }
+            };
+            if chrome != t.chrome {
+                if chrome.url != t.chrome.url {
+                    browsing_changed |= self.store.record_visit(&chrome.url, &chrome.title);
+                } else if chrome.title != t.chrome.title && !chrome.title.is_empty() {
+                    self.store.update_title(&chrome.url, &chrome.title);
+                    browsing_changed = true;
+                }
+                t.chrome = chrome;
+                changed = true;
+            }
+        }
+        if browsing_changed {
+            cx.emit(BrowsingChanged);
+        }
+        if let Some(active) = self.tabs.get(self.active).map(|t| t.chrome.clone()) {
+            if active != self.chrome {
+                if active.url != self.chrome.url && !self.editing_address {
+                    let url = active.url.clone();
                     self.address.update(cx, |a, cx| a.set_text(&url, cx));
                 }
-                if self.store.record_visit(&chrome.url, &chrome.title) {
-                    cx.emit(BrowsingChanged);
-                }
-            } else if chrome.title != self.chrome.title && !chrome.title.is_empty() {
-                self.store.update_title(&chrome.url, &chrome.title);
-                cx.emit(BrowsingChanged);
+                self.chrome = active;
+                changed = true;
             }
-            self.chrome = chrome;
-            changed = true;
         }
         if changed {
             cx.notify();
         }
     }
 
+    /// The active tab's page.
+    fn view(&self) -> Option<&WebView> {
+        self.tabs.get(self.active).map(|t| &t.view)
+    }
+
+    /// Opens a tab at `url`. Background tabs start hidden.
+    fn open_tab(&mut self, url: &str, activate: bool, cx: &mut Context<Self>) -> Result<u32, String> {
+        let (w, h, scale) = self.size.ok_or("The browser isn't laid out yet.")?;
+        let view = WebView::create(url, w, h, scale)?;
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let chrome = Chrome { url: url.to_string(), ..Default::default() };
+        self.tabs.push(Tab { id, view, chrome });
+        if activate {
+            self.activate(self.tabs.len() - 1, cx);
+        } else {
+            self.tabs.last().expect("just pushed").view.set_hidden(true);
+            cx.notify();
+        }
+        Ok(id)
+    }
+
+    fn activate(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        if index != self.active {
+            if let Some(old) = self.tabs.get(self.active) {
+                old.view.set_hidden(true);
+            }
+        }
+        self.active = index;
+        let tab = &self.tabs[index];
+        tab.view.set_hidden(false);
+        // Show the new tab's next frame, not the old tab's last one.
+        if let Some(old) = self.image.take() {
+            self.retired.push(old);
+        }
+        if let Some((_, _, old)) = self.popup.take() {
+            self.retired.push(old);
+        }
+        self.last_seq = u64::MAX;
+        self.chrome = tab.chrome.clone();
+        if !self.editing_address {
+            let url = self.chrome.url.clone();
+            self.address.update(cx, |a, cx| a.set_text(&url, cx));
+        }
+        cx.notify();
+    }
+
+    fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        let closing_active = index == self.active;
+        self.tabs.remove(index); // dropping the WebView closes its page
+        if self.tabs.is_empty() {
+            let _ = self.open_tab(HOME, true, cx);
+            return;
+        }
+        if index < self.active || (closing_active && self.active >= self.tabs.len()) {
+            self.active = self.active.saturating_sub(1);
+        }
+        if closing_active {
+            self.activate(self.active, cx);
+        }
+        cx.notify();
+    }
+
+    fn index_of(&self, id: u32) -> Option<usize> {
+        self.tabs.iter().position(|t| t.id == id)
+    }
+
+    fn apply_tab_op(&mut self, op: TabOp, cx: &mut Context<Self>) -> Result<(), String> {
+        match op {
+            TabOp::List => Ok(()),
+            TabOp::New { url } => {
+                let url = url.map(|u| normalize_address(&u)).unwrap_or_else(|| HOME.to_string());
+                self.open_tab(&url, true, cx).map(|_| ())
+            }
+            TabOp::Switch { id } => {
+                let i = self.index_of(id).ok_or_else(|| format!("No tab {id}."))?;
+                self.activate(i, cx);
+                Ok(())
+            }
+            TabOp::Close { id } => {
+                let i = self.index_of(id).ok_or_else(|| format!("No tab {id}."))?;
+                self.close_tab(i, cx);
+                Ok(())
+            }
+        }
+    }
+
+    fn tab_infos(&self) -> Vec<TabInfo> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| TabInfo {
+                id: t.id,
+                title: t.chrome.title.clone(),
+                url: t.chrome.url.clone(),
+                active: i == self.active,
+            })
+            .collect()
+    }
+
+    // ---------------------------------------------------- tab actions
+
+    pub fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open_tab(HOME, true, cx).is_ok() {
+            window.focus(&self.address.focus_handle(cx));
+            self.address.update(cx, |a, cx| a.set_text("", cx));
+        }
+    }
+
+    pub fn close_active_tab(&mut self, cx: &mut Context<Self>) {
+        self.close_tab(self.active, cx);
+    }
+
+    pub fn cycle_tab(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let n = self.tabs.len();
+        if n > 1 {
+            let next = if forward { (self.active + 1) % n } else { (self.active + n - 1) % n };
+            self.activate(next, cx);
+        }
+    }
+
+    pub fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find_open = true;
+        window.focus(&self.find_input.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn close_find(&mut self, cx: &mut Context<Self>) {
+        self.find_open = false;
+        if let Some(v) = self.view() {
+            v.stop_finding();
+        }
+        self.find_input.update(cx, |i, cx| i.set_text("", cx));
+        cx.notify();
+    }
+
+    pub fn focus_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.address.focus_handle(cx));
+    }
+
+    fn tab_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_end()
+            .gap_1()
+            .px_2()
+            .pt_1()
+            .bg(rgb(theme::BG))
+            .children(self.tabs.iter().enumerate().map(|(i, t)| {
+                let active = i == self.active;
+                let title = if t.chrome.title.is_empty() {
+                    if t.chrome.loading { "Loading…".to_string() } else { t.chrome.url.clone() }
+                } else {
+                    t.chrome.title.clone()
+                };
+                let id = t.id;
+                div()
+                    .id(("tab", t.id as usize))
+                    .group("tab")
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .w(px(190.))
+                    .min_w(px(60.))
+                    .flex_shrink()
+                    .pl_2()
+                    .pr_1()
+                    .py_1()
+                    .rounded_t_md()
+                    .text_xs()
+                    .bg(rgb(if active { theme::PANE } else { theme::BG }))
+                    .text_color(rgb(if active { theme::FG } else { theme::MUTED }))
+                    .when(!active, |d| d.cursor_pointer().hover(|s| s.bg(rgb(theme::RAISED))))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(i) = this.index_of(id) {
+                            this.activate(i, cx);
+                        }
+                    }))
+                    .child(div().flex_1().min_w(px(0.)).truncate().child(SharedString::from(title)))
+                    .child(
+                        div()
+                            .id(("tab-close", t.id as usize))
+                            .px_1()
+                            .rounded_sm()
+                            .text_color(rgb(theme::MUTED))
+                            .hover(|s| s.bg(rgb(theme::RULE)).text_color(rgb(theme::FG)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if let Some(i) = this.index_of(id) {
+                                    this.close_tab(i, cx);
+                                }
+                            }))
+                            .child("×"),
+                    )
+            }))
+            .child(
+                div()
+                    .id("tab-new")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_sm()
+                    .text_color(rgb(theme::MUTED))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(theme::RAISED)).text_color(rgb(theme::FG)))
+                    .on_click(cx.listener(|this, _, window, cx| this.new_tab(window, cx)))
+                    .child("+"),
+            )
+    }
+
     pub fn navigate(&mut self, input: &str, cx: &mut Context<Self>) {
-        if let Some(v) = &self.view {
+        if let Some(v) = self.view() {
             v.navigate(&normalize_address(input));
         }
         cx.notify();
@@ -328,7 +676,7 @@ impl BrowserPane {
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.user_took_over(cx);
         window.focus(&self.page_focus);
-        let Some(v) = &self.view else { return };
+        let Some(v) = self.view() else { return };
         v.set_focus(true);
         let Some(button) = map_button(ev.button) else { return };
         let (x, y) = self.local(ev.position);
@@ -336,19 +684,19 @@ impl BrowserPane {
     }
 
     fn on_mouse_up(&mut self, ev: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
-        let (Some(v), Some(button)) = (&self.view, map_button(ev.button)) else { return };
+        let (Some(v), Some(button)) = (self.view(), map_button(ev.button)) else { return };
         let (x, y) = self.local(ev.position);
         v.mouse_button(x, y, button, true, ev.click_count, mods(&ev.modifiers));
     }
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, _: &mut Context<Self>) {
-        let Some(v) = &self.view else { return };
+        let Some(v) = self.view() else { return };
         let (x, y) = self.local(ev.position);
         v.mouse_move(x, y, mods(&ev.modifiers));
     }
 
     fn on_scroll(&mut self, ev: &ScrollWheelEvent, _: &mut Window, _: &mut Context<Self>) {
-        let Some(v) = &self.view else { return };
+        let Some(v) = self.view() else { return };
         let (x, y) = self.local(ev.position);
         let (dx, dy) = match ev.delta {
             ScrollDelta::Pixels(p) => (f32::from(p.x), f32::from(p.y)),
@@ -359,7 +707,7 @@ impl BrowserPane {
 
     fn on_key_down(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.user_took_over(cx);
-        let Some(v) = &self.view else { return };
+        let Some(v) = self.view() else { return };
         let k = &ev.keystroke;
         if std::env::var_os("UNIBROW_DEBUG_KEYS").is_some() {
             eprintln!("page key down: key={:?} char={:?} mods={:?}", k.key, k.key_char, k.modifiers);
@@ -376,7 +724,7 @@ impl BrowserPane {
     }
 
     fn on_key_up(&mut self, ev: &KeyUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(v) = &self.view else { return };
+        let Some(v) = self.view() else { return };
         let k = &ev.keystroke;
         if v.key(&KeyInput { key: &k.key, text: None, modifiers: mods(&k.modifiers), down: false }) {
             cx.stop_propagation();
@@ -411,18 +759,18 @@ impl BrowserPane {
             .border_b_1()
             .border_color(rgb(theme::RULE))
             .child(nav("back", "←", self.chrome.can_go_back).on_click(cx.listener(|this, _, _, _| {
-                if let Some(v) = &this.view {
+                if let Some(v) = this.view() {
                     v.go_back();
                 }
             })))
             .child(nav("forward", "→", self.chrome.can_go_forward).on_click(cx.listener(|this, _, _, _| {
-                if let Some(v) = &this.view {
+                if let Some(v) = this.view() {
                     v.go_forward();
                 }
             })))
-            .child(nav("reload", if loading { "✕" } else { "↻" }, self.view.is_some()).on_click(cx.listener(
+            .child(nav("reload", if loading { "✕" } else { "↻" }, !self.tabs.is_empty()).on_click(cx.listener(
                 move |this, _, _, _| {
-                    if let Some(v) = &this.view {
+                    if let Some(v) = this.view() {
                         if loading { v.stop() } else { v.reload() }
                     }
                 },
@@ -430,6 +778,109 @@ impl BrowserPane {
             .child(div().flex_1().min_w(px(0.)).child(self.address.clone()))
             .child(self.bookmark_button(cx))
             .child(self.focus_button(cx))
+            .children(self.downloads_button(cx))
+    }
+
+    fn downloads_button(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let all: Vec<_> = self.tabs.iter().flat_map(|t| t.view.downloads()).collect();
+        if all.is_empty() {
+            return None;
+        }
+        let active = all.iter().filter(|d| !d.complete && !d.canceled).count();
+        let label = if active > 0 { format!("↓ {active}") } else { format!("↓ {}", all.len()) };
+        Some(
+            div()
+                .id("downloads")
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .px_2()
+                .rounded_md()
+                .text_xs()
+                .border_1()
+                .border_color(rgb(if active > 0 { theme::ACCENT } else { theme::RULE }))
+                .text_color(rgb(theme::FG))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(theme::RAISED)))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.downloads_open = !this.downloads_open;
+                    cx.notify();
+                }))
+                .child(label),
+        )
+    }
+
+    /// The find bar (Ctrl+F) and the downloads list, under the toolbar.
+    fn panels(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let find = self.find_open.then(|| {
+            let count = self
+                .view()
+                .and_then(|v| v.find_result())
+                .map(|(n, i)| if n == 0 { "No matches".to_string() } else { format!("{i} of {n}") })
+                .unwrap_or_default();
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .bg(rgb(theme::PANE))
+                .border_b_1()
+                .border_color(rgb(theme::RULE))
+                .child(div().w(px(280.)).child(self.find_input.clone()))
+                .child(div().text_xs().text_color(rgb(theme::MUTED)).child(count))
+                .child(
+                    div()
+                        .id("find-close")
+                        .px_2()
+                        .rounded_sm()
+                        .text_sm()
+                        .text_color(rgb(theme::MUTED))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(theme::RAISED)))
+                        .on_click(cx.listener(|this, _, _, cx| this.close_find(cx)))
+                        .child("×"),
+                )
+        });
+        let downloads = self.downloads_open.then(|| {
+            let all: Vec<_> = self.tabs.iter().flat_map(|t| t.view.downloads()).collect();
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .px_3()
+                .py_2()
+                .bg(rgb(theme::PANE))
+                .border_b_1()
+                .border_color(rgb(theme::RULE))
+                .children(all.into_iter().rev().take(8).map(|d| {
+                    let status = if d.complete {
+                        "done".to_string()
+                    } else if d.canceled {
+                        "failed".to_string()
+                    } else {
+                        format!("{}%", d.percent.max(0))
+                    };
+                    div()
+                        .flex()
+                        .gap_2()
+                        .text_xs()
+                        .child(div().flex_1().min_w(px(0.)).truncate().text_color(rgb(theme::FG)).child(d.name))
+                        .child(div().text_color(rgb(theme::MUTED)).child(status))
+                }))
+                .child(
+                    div()
+                        .id("downloads-folder")
+                        .text_xs()
+                        .text_color(rgb(theme::ACCENT))
+                        .cursor_pointer()
+                        .on_click(|_, _, _| {
+                            let _ = std::process::Command::new("xdg-open").arg(rail_browser::downloads_dir()).spawn();
+                        })
+                        .child(SharedString::from(format!("Open folder: {}", rail_browser::downloads_dir().display()))),
+                )
+        });
+        div().flex().flex_col().children(find).children(downloads)
     }
 
     fn bookmark_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -494,6 +945,7 @@ impl BrowserPane {
         }
         let geometry = self.geometry.clone();
         let image = self.image.clone();
+        let popup = self.popup.clone();
         let cursor = match self.chrome.cursor {
             Cursor::Arrow => CursorStyle::Arrow,
             Cursor::Pointer => CursorStyle::PointingHand,
@@ -607,12 +1059,125 @@ impl BrowserPane {
                             size(px(fs.width.0 as f32 / s), px(fs.height.0 as f32 / s));
                         let target = Bounds::new(point(bounds.origin.x, bounds.origin.y), logical);
                         let _ = window.paint_image(target, Corners::default(), img, 0, false);
+                        if let Some((px_, py_, pimg)) = popup {
+                            let ps = pimg.size(0);
+                            let psize = size(px(ps.width.0 as f32 / s), px(ps.height.0 as f32 / s));
+                            let at = point(bounds.origin.x + px(px_), bounds.origin.y + px(py_));
+                            let _ = window.paint_image(Bounds::new(at, psize), Corners::default(), pimg, 0, false);
+                        }
                     },
                 )
                 .size_full(),
             )
             .children(highlight.into_iter().flatten())
             .children(agent_bar)
+            .children(self.dialog_card(cx))
+            .children(self.notice.as_ref().map(|(text, _)| {
+                div()
+                    .absolute()
+                    .bottom(px(12.))
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .rounded_full()
+                            .bg(rgb(theme::PANE))
+                            .border_1()
+                            .border_color(rgb(theme::RULE))
+                            .text_xs()
+                            .text_color(rgb(theme::MUTED))
+                            .child(SharedString::from(text.clone())),
+                    )
+            }))
+    }
+}
+
+impl BrowserPane {
+    /// The page's JavaScript dialog, shown to the user as a card.
+    fn dialog_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let d = self.chrome.dialog.clone()?;
+        let title = match d.kind.as_str() {
+            "confirm" => "The page asks you to confirm",
+            "prompt" => "The page asks for input",
+            "beforeunload" => "Leave this page?",
+            _ => "The page says",
+        };
+        let has_cancel = d.kind != "alert";
+        let default_text = d.default_text.clone();
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .text_sm()
+                .cursor_pointer()
+                .border_1()
+                .border_color(rgb(if primary { theme::ACCENT } else { theme::RULE }))
+                .bg(rgb(if primary { theme::ACCENT } else { theme::PANE }))
+                .text_color(rgb(if primary { theme::BG } else { theme::FG }))
+                .hover(|s| s.opacity(0.85))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(label)
+        };
+        Some(
+            div()
+                .absolute()
+                .top(px(64.))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .w(px(420.))
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_4()
+                        .rounded_md()
+                        .bg(rgb(theme::PANE))
+                        .border_1()
+                        .border_color(rgb(theme::WARN))
+                        .shadow_lg()
+                        .child(div().text_xs().text_color(rgb(theme::WARN)).child(title))
+                        .child(div().text_sm().text_color(rgb(theme::FG)).child(SharedString::from(d.message.clone())))
+                        .when(d.kind == "prompt" && !d.default_text.is_empty(), |c| {
+                            c.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme::MUTED))
+                                    .child(SharedString::from(format!("OK sends: “{}”", d.default_text))),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap_2()
+                                .when(has_cancel, |r| {
+                                    r.child(button("dialog-cancel", "Cancel", false).on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            if let Some(v) = this.view() {
+                                                v.answer_dialog(false, None);
+                                            }
+                                            cx.notify();
+                                        },
+                                    )))
+                                })
+                                .child(button("dialog-ok", "OK", true).on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(v) = this.view() {
+                                        v.answer_dialog(true, Some(&default_text));
+                                    }
+                                    cx.notify();
+                                }))),
+                        ),
+                ),
+        )
     }
 }
 
@@ -635,7 +1200,7 @@ impl Render for BrowserPane {
                     .child(SharedString::from(format!("The browser couldn't start: {reason}"))),
             );
         }
-        root = root.child(self.toolbar(cx));
+        root = root.child(self.tab_strip(cx)).child(self.toolbar(cx)).child(self.panels(cx));
         if let Some(err) = &self.chrome.load_error {
             root = root.child(
                 div()

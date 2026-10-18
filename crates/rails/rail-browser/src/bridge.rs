@@ -21,6 +21,10 @@ pub struct PageState {
     /// Viewport size in CSS pixels.
     pub width: i32,
     pub height: i32,
+    /// A JavaScript dialog is open (the page is frozen until it's answered).
+    pub dialog: Option<crate::DialogInfo>,
+    /// The last page load failed (DNS, offline, refused...).
+    pub load_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,7 +43,26 @@ pub struct Rect {
     pub height: f64,
 }
 
+/// One tab, as the agent sees it.
+#[derive(Clone, Debug)]
+pub struct TabInfo {
+    pub id: u32,
+    pub title: String,
+    pub url: String,
+    pub active: bool,
+}
+
+pub enum TabOp {
+    List,
+    /// Open a tab (at `url`, or the home page) and make it active.
+    New { url: Option<String> },
+    Switch { id: u32 },
+    Close { id: u32 },
+}
+
 pub enum Request {
+    /// List, open, switch or close tabs; replies with the tabs afterwards.
+    Tabs { op: TabOp, reply: Reply<Vec<TabInfo>> },
     /// A raw DevTools Protocol command.
     Cdp { method: String, params: Value, reply: Reply<Value> },
     Navigate { url: String, reply: Reply<()> },
@@ -47,6 +70,12 @@ pub enum Request {
     State { reply: Reply<PageState> },
     /// Outline an element the agent is about to act on.
     Highlight { rect: Rect, label: String },
+    /// Downloads from every tab.
+    Downloads { reply: Reply<Vec<crate::DownloadInfo>> },
+    /// Save the active page as a PDF; `done` gets whether it worked.
+    SavePdf { path: String, done: oneshot::Sender<bool> },
+    /// Answer the open JavaScript dialog.
+    Dialog { accept: bool, text: Option<String>, reply: Reply<()> },
 }
 
 #[derive(Clone)]
@@ -93,6 +122,28 @@ impl BrowserBridge {
 
     pub async fn state(&self) -> Result<PageState, String> {
         self.ask(|reply| Request::State { reply }).await
+    }
+
+    pub async fn downloads(&self) -> Result<Vec<crate::DownloadInfo>, String> {
+        self.ask(|reply| Request::Downloads { reply }).await
+    }
+
+    pub async fn save_pdf(&self, path: String) -> Result<bool, String> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(Request::SavePdf { path, done: tx }).await.map_err(|_| "The browser isn't running.".to_string())?;
+        match tokio::time::timeout(Duration::from_secs(60), rx).await {
+            Ok(Ok(ok)) => Ok(ok),
+            Ok(Err(_)) => Err("The page closed before the PDF was saved.".into()),
+            Err(_) => Err("Saving the PDF took longer than a minute.".into()),
+        }
+    }
+
+    pub async fn tabs(&self, op: TabOp) -> Result<Vec<TabInfo>, String> {
+        self.ask(|reply| Request::Tabs { op, reply }).await
+    }
+
+    pub async fn answer_dialog(&self, accept: bool, text: Option<String>) -> Result<(), String> {
+        self.ask(|reply| Request::Dialog { accept, text, reply }).await
     }
 
     pub fn highlight(&self, rect: Rect, label: impl Into<String>) {
