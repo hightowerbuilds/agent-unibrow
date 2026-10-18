@@ -148,6 +148,8 @@ struct Shell {
     can_continue: bool,
     /// Saved-login form in the Focus tab.
     login_form_open: bool,
+    /// The Focus tab is showing one site's view (roadmap 8.6).
+    site_view: Option<String>,
     login_site: Entity<TextInput>,
     login_user: Entity<TextInput>,
     login_pass: Entity<TextInput>,
@@ -247,6 +249,7 @@ impl Shell {
             history_filter,
             can_continue: false,
             login_form_open: false,
+            site_view: None,
             login_site,
             login_user,
             login_pass,
@@ -414,7 +417,7 @@ impl Shell {
         for tool in browsing::tools(self.store.clone()) {
             registry.add_tool(tool);
         }
-        for tool in rail_browser::tools::tools(self.bridge.clone()) {
+        for tool in rail_browser::tools::tools(self.bridge.clone(), self.store.clone()) {
             registry.add_tool(tool);
         }
         for n in &notes {
@@ -1227,7 +1230,10 @@ impl Shell {
             )
     }
 
-    fn render_focus(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_focus(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if let Some(site) = self.site_view.clone() {
+            return self.render_site_view(&site, cx).into_any_element();
+        }
         let sites = self.store.focus_sites();
         let (current_url, current_title) = self.browser.read(cx).location();
         let current_site = site_of(&current_url);
@@ -1262,6 +1268,17 @@ impl Shell {
                                 .truncate()
                                 .child(format!("{} · added {}", f.label, f.added.format("%b %-d"))),
                         ),
+                )
+                .child(
+                    Self::small_button(SharedString::from(format!("focus-view-{}", f.site)), "View", false).on_click(
+                        cx.listener({
+                            let site = site.clone();
+                            move |this, _, _, cx| {
+                                this.site_view = Some(site.clone());
+                                cx.notify();
+                            }
+                        }),
+                    ),
                 )
                 .child(
                     Self::small_button(SharedString::from(format!("focus-open-{}", f.site)), "Open", false).on_click(
@@ -1331,6 +1348,144 @@ impl Shell {
                         ))
                     }),
             )
+            .into_any_element()
+    }
+
+    /// Everything about one focus site in one place (8.6): its playbooks,
+    /// the site map's pages, the agent's recent actions, and history.
+    fn render_site_view(&self, site: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        let map = self.store.site_map(site);
+        let actions = self.store.site_actions(site, 25);
+        let visits =
+            self.store.history(&HistoryQuery { site: Some(site.to_string()), limit: 40, ..Default::default() });
+        let heading = |t: &'static str| div().pt_2().text_xs().text_color(rgb(theme::ACCENT)).child(t);
+        let muted = |t: String| div().text_xs().text_color(rgb(theme::MUTED)).child(t);
+        let mut col = div()
+            .id("site-view")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .p_3()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Self::small_button("site-view-back".into(), "← Focus sites", false).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.site_view = None;
+                            cx.notify();
+                        },
+                    )))
+                    .child(div().flex_1().text_sm().text_color(rgb(theme::FG)).child(map.site.clone())),
+            );
+
+        col = col.child(heading("PLAYBOOKS"));
+        if map.playbooks.is_empty() {
+            col = col.child(muted(
+                "None yet. After the agent does something here you'll want again, ask it to save that as a playbook.".into(),
+            ));
+        }
+        for p in &map.playbooks {
+            let id = p.id;
+            let record = if p.runs == 0 { "never run".to_string() } else { format!("ran {}×, {} finished", p.runs, p.successes) };
+            let params = if p.params.is_empty() { String::new() } else { format!(" · needs {}", p.params.join(", ")) };
+            let steps: Vec<String> = p.steps.iter().enumerate().map(|(i, s)| format!("{}. {}", i + 1, s.describe())).collect();
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(theme::RULE))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().flex_1().text_sm().text_color(rgb(theme::FG)).child(format!("“{}”", p.name)))
+                            .child(Self::small_button(SharedString::from(format!("playbook-remove-{id}")), "Remove", false).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.store.remove_playbook(id);
+                                    this.trace.push(Kind::Info, format!("Removed playbook #{id}"), None);
+                                    cx.notify();
+                                }),
+                            )),
+                    )
+                    .child(muted(format!("{}{params} · {record}", p.description)))
+                    .children(p.last_error.clone().map(|e| {
+                        div().text_xs().text_color(rgb(theme::WARN)).child(format!("Last run stopped: {e}"))
+                    }))
+                    .children(steps.into_iter().map(|t| div().text_xs().text_color(rgb(theme::FG)).child(t))),
+            );
+        }
+
+        col = col.child(heading("PAGES"));
+        if map.pages.is_empty() {
+            col = col.child(muted("No pages known yet.".into()));
+        }
+        for p in map.pages.iter().take(15) {
+            let extra = if p.visits > 0 { format!(" · {} visits", p.visits) } else { String::new() };
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(div().text_sm().truncate().text_color(rgb(theme::FG)).child(format!("{} ({}){extra}", p.pattern, p.kind)))
+                    .when(!p.elements.is_empty(), |d| {
+                        d.child(muted(format!(
+                            "used: {}",
+                            p.elements.iter().map(|(l, n)| format!("{l} ×{n}")).collect::<Vec<_>>().join(", ")
+                        )))
+                    }),
+            );
+        }
+
+        col = col.child(heading("AGENT'S RECENT ACTIONS"));
+        if actions.is_empty() {
+            col = col.child(muted("None recorded. Actions are recorded while a site is in focus.".into()));
+        }
+        for a in actions.iter().rev() {
+            col = col.child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .text_xs()
+                    .child(div().flex_none().text_color(rgb(theme::MUTED)).child(a.at.format("%b %-d %-I:%M %p").to_string()))
+                    .child(div().flex_1().min_w(px(0.)).truncate().text_color(rgb(theme::FG)).child(format!(
+                        "{} · {} → {}",
+                        a.step.describe(),
+                        a.step.from,
+                        a.step.to
+                    ))),
+            );
+        }
+
+        col = col.child(heading("HISTORY ON THIS SITE"));
+        if visits.is_empty() {
+            col = col.child(muted("No visits yet.".into()));
+        }
+        for v in visits {
+            let url = v.url.clone();
+            let title = if v.title.is_empty() { v.url.clone() } else { v.title.clone() };
+            col = col.child(
+                div()
+                    .id(SharedString::from(format!("site-visit-{}", v.id)))
+                    .flex()
+                    .gap_2()
+                    .text_xs()
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(rgb(theme::ACCENT)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_url(url.clone(), cx)))
+                    .child(div().flex_none().text_color(rgb(theme::MUTED)).child(v.at.format("%b %-d %-I:%M %p").to_string()))
+                    .child(div().flex_1().min_w(px(0.)).truncate().text_color(rgb(theme::FG)).child(title)),
+            );
+        }
+        col
     }
 
     fn save_login(&mut self, cx: &mut Context<Self>) {

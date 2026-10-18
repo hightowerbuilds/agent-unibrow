@@ -27,9 +27,11 @@ watches re-check every few seconds; `autosteer` ("secs|text") types a
 message while the agent works; `env` sets extra environment variables
 (such as `UNIBROW_TEST_PANE` steps that zoom or right-click as the user
 would, see browser_pane.rs); `relaunch` kills the instance after the
-first turn (a crash) and starts it again on the same data with a new task;
+first turn (a crash) and starts it again on the same data with a new task
+(optionally on another `page`, after `mutate`-ing served pages);
 `tools_any` lists groups of tools where any one being called is enough
-(e.g. browser_type or browser_fill_form); `kill_renderer_secs` kills the
+(e.g. browser_type or browser_fill_form), and `reply_any` groups of words
+where any one in the reply is enough; `kill_renderer_secs` kills the
 instance's renderer processes (only ones carrying its data folder) that
 many seconds in; `log_contains` checks the instance's stderr log. `{alt}`
 is the fixture server under 127.0.0.1 (another site), `{tls}` the same
@@ -70,6 +72,11 @@ AUTH_OK = "Basic " + base64.b64encode(b"ada:lovelace").decode()
 class QuietHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *args):
         pass
+
+    def end_headers(self):
+        # Cases change pages mid-run (watches, redesigns); never serve stale copies.
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
 
     def do_GET(self):
         # /auth/<page>: the page behind an HTTP Basic sign-in.
@@ -230,6 +237,12 @@ def run_case(case, port, workdir: Path, site: Path, tls_port=None):
         first.wait()
         time.sleep(1)
         env["UNIBROW_AUTOSEND"] = fill(case["relaunch"]["task"])
+        if "page" in case["relaunch"]:
+            env["UNIBROW_START_URL"] = f"http://localhost:{port}/{case['relaunch']['page']}"
+        # Change served pages between the two runs (a site redesign).
+        for m in case["relaunch"].get("mutate", []):
+            f = site / m["file"]
+            f.write_text(f.read_text().replace(m["from"], m["to"]))
     proc = subprocess.Popen([str(BIN)], env=env, stdout=log, stderr=log, start_new_session=True)
     if "kill_renderer_secs" in case:
         def killer():
@@ -284,6 +297,9 @@ def check(case, trace, data: Path, seconds, log_path=None):
     for s in exp.get("reply_contains", []):
         if s.lower() not in reply.lower():
             failures.append(f"reply is missing “{s}”")
+    for group in exp.get("reply_any", []):
+        if not any(s.lower() in reply.lower() for s in group):
+            failures.append(f"reply has none of {group}")
     for s in exp.get("reply_not_contains", []):
         if s.lower() in reply.lower():
             failures.append(f"reply contains “{s}”")

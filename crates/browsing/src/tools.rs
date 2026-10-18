@@ -8,7 +8,91 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 pub fn tools(store: Arc<Browsing>) -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(History(store.clone())), Arc::new(FocusSites(store.clone())), Arc::new(Watches(store))]
+    vec![
+        Arc::new(History(store.clone())),
+        Arc::new(FocusSites(store.clone())),
+        Arc::new(Watches(store.clone())),
+        Arc::new(SiteMapTool(store)),
+    ]
+}
+
+/// What the agent knows about a focus site (roadmap 8.1).
+pub struct SiteMapTool(Arc<Browsing>);
+
+/// The site map as text for the model.
+pub fn describe_site_map(map: &crate::sitemap::SiteMap) -> String {
+    let visits: usize = map.pages.iter().map(|p| p.visits).sum();
+    if map.pages.is_empty() && map.playbooks.is_empty() {
+        return format!(
+            "Nothing known about {} yet. Its map builds up from visits and from your actions while it's a focus site.",
+            map.site
+        );
+    }
+    let mut out = format!("Site map for {} (from {visits} visits and {} recorded actions).\n", map.site, map.actions);
+    if !map.playbooks.is_empty() {
+        out.push_str("\nPlaybooks (replay with playbook_run; they check every page and stop if anything differs):\n");
+        for p in &map.playbooks {
+            let params = if p.params.is_empty() { "no parameters".to_string() } else { format!("parameters: {}", p.params.join(", ")) };
+            let record = if p.runs == 0 { "never run".to_string() } else { format!("ran {} times, {} finished", p.runs, p.successes) };
+            out.push_str(&format!("- \"{}\" ({params}; {} steps; {record}): {}\n", p.name, p.steps.len(), p.description));
+            if let Some(e) = &p.last_error {
+                out.push_str(&format!("  Last run stopped: {e}\n"));
+            }
+        }
+    }
+    out.push_str("\nPages (URL pattern, kind, title):\n");
+    for p in map.pages.iter().take(25) {
+        let title = if p.title.is_empty() { String::new() } else { format!(" — “{}”", p.title.chars().take(70).collect::<String>()) };
+        let visits = if p.visits == 0 { String::new() } else { format!(", {} visits", p.visits) };
+        out.push_str(&format!("- {} ({}{visits}){title}\n", p.pattern, p.kind));
+        if !p.elements.is_empty() {
+            let used: Vec<String> = p.elements.iter().map(|(l, n)| format!("{l} ×{n}")).collect();
+            out.push_str(&format!("  used here: {}\n", used.join(", ")));
+        }
+    }
+    if !map.paths.is_empty() {
+        out.push_str("\nPaths the agent has taken:\n");
+        for (from, how, to, n) in map.paths.iter().take(15) {
+            out.push_str(&format!("- {from} → {to} by {how} (×{n})\n"));
+        }
+    }
+    out
+}
+
+impl Tool for SiteMapTool {
+    fn name(&self) -> &'static str {
+        "site_map"
+    }
+    fn description(&self) -> &'static str {
+        "What the app knows about a focus site: its kinds of pages (as URL patterns: search, product, cart, \
+         checkout, sign-in…), the buttons and fields used on each, the paths between pages, and saved playbooks \
+         (routes you can replay with playbook_run). Check it before working on a focus site: a playbook that fits \
+         is faster and more reliable than working it out again."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {"site": {"type": "string", "description": "e.g. sweetwater.com"}},
+            "required": ["site"],
+            "additionalProperties": false
+        })
+    }
+    fn effect(&self) -> Effect {
+        Effect::Read
+    }
+    fn describe_call(&self, input: &Value) -> String {
+        format!("Site map for {}", input["site"].as_str().unwrap_or("a site"))
+    }
+    fn call(&self, input: Value) -> BoxFuture<'static, ToolResult> {
+        let store = self.0.clone();
+        Box::pin(async move {
+            let site = input["site"].as_str().map(str::trim).filter(|s| !s.is_empty()).ok_or("Invalid input: `site` is required")?;
+            let site = crate::site_of(site).or_else(|| crate::site_of(&format!("https://{site}"))).unwrap_or_else(|| site.to_string());
+            let map = store.site_map(&site);
+            let summary = format!("{}: {} pages, {} playbooks", map.site, map.pages.len(), map.playbooks.len());
+            Ok(ToolOutput::text(describe_site_map(&map), summary))
+        })
+    }
 }
 
 pub struct Watches(Arc<Browsing>);

@@ -13,6 +13,7 @@
 //! Stored in SQLite at `~/.local/share/agent-unibrow/browsing.sqlite3`.
 //! The store is `Send + Sync`: the UI writes visits, agent tools read.
 
+pub mod sitemap;
 mod tools;
 
 pub use tools::tools;
@@ -230,6 +231,7 @@ impl Browsing {
              );",
         )
         .map_err(|e| format!("can't set up the history database: {e}"))?;
+        sitemap::init(&conn).map_err(|e| format!("can't set up site maps: {e}"))?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -537,7 +539,17 @@ impl Browsing {
     /// One line naming the focus sites, for the context sent with each message.
     pub fn focus_summary(&self) -> Option<String> {
         let sites = self.focus_sites();
-        (!sites.is_empty()).then(|| sites.iter().map(|f| f.site.as_str()).collect::<Vec<_>>().join(", "))
+        let counts = self.playbook_counts();
+        (!sites.is_empty()).then(|| {
+            sites
+                .iter()
+                .map(|f| match counts.get(&f.site) {
+                    Some(n) => format!("{} ({n} playbook{})", f.site, if *n == 1 { "" } else { "s" }),
+                    None => f.site.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
     }
 }
 

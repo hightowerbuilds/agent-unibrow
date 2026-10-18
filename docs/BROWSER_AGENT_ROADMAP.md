@@ -31,7 +31,7 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
 | 5. Accounts and handoff | 5.1, 5.3, 5.4 | 5.2, 5.5 | |
 | 6. Safety and policy | ✅ all | | |
 | 7. Reliability | 7.2, 7.5 | 7.1, 7.3 | 7.4 |
-| 8. Focus sites | | | 8.1–8.6 |
+| 8. Focus sites | 8.1, 8.2, 8.5, 8.6 | 8.3 (slot for Jev) | 8.4 (SubQ) |
 | 9. Extracting | ✅ 9.1, 9.2, 9.3, 9.4 | | |
 | 10. Polish | zoom, reader, context menu, favicons, audio, shortcuts | | translate, spellcheck, region shots; DevTools blocked |
 | 11. Under the hood | throttling, crash recovery, memory caps | | GPU frame path, separate profiles |
@@ -305,7 +305,7 @@ The minimum for the agent to work in the browser at all.
 - Checkpoints, so a task can resume after an app restart.
 - Running tasks in background tabs while the user keeps browsing.
 
-### 7.5 Evals — ✅ **COMPLETED** (`crates/evals/run_evals.py`, 36 cases over local test pages; nightly scheduling todo)
+### 7.5 Evals — ✅ **COMPLETED** (`crates/evals/run_evals.py`, 38 cases over local test pages; nightly scheduling todo)
 - Local test pages for each capability (forms, dropdowns, iframes, drag,
   dialogs, uploads, infinite scroll).
 - Recorded tasks on focus sites, replayed nightly; pass rates tracked in
@@ -318,31 +318,48 @@ The minimum for the agent to work in the browser at all.
 The idea: inside the finite set of focus sites, decision-making follows a
 set path instead of starting from scratch each time.
 
-### 8.1 Site maps — todo
-- Per focus site: its pages, the elements that matter on each, and the
-  paths between them, built from history and traces.
+### 8.1 Site maps — ✅ **COMPLETED**
+- URLs grouped into page patterns (`/dp/B0ABC12345` → `/dp/{id}`, query
+  values dropped, tracking keys ignored), each with a kind: search,
+  product, cart, checkout, sign-in, orders, account, home.
+- Every page-changing action the agent takes on a focus site is recorded
+  by role and name, not ref, with the page before and after (the
+  `Recorded` wrapper in `rail-browser/src/tools/playbooks.rs`). Pages come
+  from history, elements and paths from those actions.
+- `site_map` tool; the focus line sent with each message shows playbook
+  counts. Code: `crates/browsing/src/sitemap.rs`.
 
-### 8.2 Playbooks — todo
-- Recorded, reusable routes ("search a product → open the result → check
-  the price → add to cart") that run step by step and are verified at
-  each step.
+### 8.2 Playbooks — ✅ **COMPLETED**
+- `playbook_save`: the latest run of actions on a site becomes a named
+  route; literal values become parameters (`{query}`), including inside
+  URLs. A search-result click that matched the query is saved as "the
+  result matching the parameters".
+- `playbook_run`: replays without the model through the same tools, so
+  purchases and other commits still ask; site scope applies; at most 40
+  steps. Run stats and the last failure are kept per playbook.
+- Evals: `playbook-replay` (recorded searching "TUSQ nut", replayed for
+  "bone nut" after a crash and restart, picks the bone result).
 
-### 8.3 Fast decisions (Jev) — todo
-- Closed questions inside known pages ("which result matches?", "is this
-  the checkout page?", "is the cart correct?") answered by a fast typed
-  decision model, with its confidence in the trace.
+### 8.3 Fast decisions (Jev) — ◐ partial (the slot)
+- Closed questions during replays ("Which search result matches?") go
+  through the `Decider` trait, with the answer and confidence in the step
+  log. The built-in `WordMatch` stands in until Jev is wired in.
 
 ### 8.4 Long context (SubQ) — todo
 - Whole history, site maps and long pages in one context when a task
-  needs the big picture.
+  needs the big picture. Waiting on SubQ.
 
-### 8.5 Falling off the map — todo
-- When a page doesn't match the site map (a redesign, a new modal), stop
-  following the playbook, fall back to the general model, or hand off.
+### 8.5 Falling off the map — ✅ **COMPLETED**
+- Before each step: is this the kind of page the recording was on? After
+  it: did it land where the recording did (or, for picked results, on the
+  same kind of page)? Otherwise the replay stops, records why, and returns
+  the page so the model carries on.
+- Eval: `playbook-off-map` (the shop's search moves to a new page between
+  runs; the replay stops at the right step and the agent finishes).
 
-### 8.6 Per-site views — todo
-- Filter history and the trace by focus site, to see everything that has
-  happened on one site in one place.
+### 8.6 Per-site views — ✅ **COMPLETED**
+- Focus → View: the site's playbooks (steps, runs, last failure,
+  remove), pages, the agent's recent actions there, and history.
 
 ---
 

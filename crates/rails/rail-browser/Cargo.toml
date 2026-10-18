@@ -17,6 +17,7 @@ async-channel.workspace = true
 tokio.workspace = true
 base64.workspace = true
 router.workspace = true
+browsing.workspace = true
 page-model.workspace = true
 keyring.workspace = true
 serde.workspace = true

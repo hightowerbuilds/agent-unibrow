@@ -95,6 +95,18 @@ const GUIDE: &[Section] = &[
         ],
     },
     Section {
+        title: "Playbooks: your focus sites, learned",
+        blocks: &[Block::Bullets(&[
+            "On focus sites the agent keeps a map: the kinds of pages, the buttons and fields it uses there, and how \
+             pages lead to each other. It checks the map before starting work on the site.",
+            "After it does something you'll want again (\"find a part\", \"reorder my strings\"), ask it to save that \
+             as a playbook. Words that change, like what you searched for, become blanks it fills in next time.",
+            "Next time it replays the playbook step by step, checking each page. If the site has changed or something \
+             unexpected appears, it stops and works it out itself. Purchases still ask you first.",
+            "Focus → View shows one site's playbooks, pages, the agent's recent actions there, and your history.",
+        ])],
+    },
+    Section {
         title: "Chats",
         blocks: &[Block::Bullets(&[
             "Every chat is saved as you go, so a crash or restart doesn't lose it. The app reopens on the chat you used last, \

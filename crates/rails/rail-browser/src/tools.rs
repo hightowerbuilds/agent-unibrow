@@ -135,6 +135,7 @@ mod clipboard;
 mod forms;
 mod frames;
 mod injection;
+mod playbooks;
 mod pointer;
 mod scope;
 mod scrolling;
@@ -142,21 +143,28 @@ mod spend;
 
 pub use extract::watch_value;
 
-pub fn tools(bridge: BrowserBridge) -> Vec<Arc<dyn Tool>> {
+pub use playbooks::{Decider, WordMatch};
+
+/// The browser tools. Page-changing ones on focus sites are recorded in
+/// `store` for site maps and playbooks (Phase 8).
+pub fn tools(bridge: BrowserBridge, store: Arc<browsing::Browsing>) -> Vec<Arc<dyn Tool>> {
     let b = Arc::new(Browser::new(bridge));
+    let rec = |t: Arc<dyn Tool>| playbooks::Recorded::wrap(t, b.clone(), store.clone());
     let mut all: Vec<Arc<dyn Tool>> = extract::tools(b.clone());
     all.extend::<Vec<Arc<dyn Tool>>>(vec![
-        Arc::new(Open(b.clone())),
+        rec(Arc::new(Open(b.clone()))),
         Arc::new(Read(b.clone())),
         Arc::new(Screenshot(b.clone())),
-        Arc::new(Click(b.clone())),
-        Arc::new(Type(b.clone())),
-        Arc::new(Press(b.clone())),
+        rec(Arc::new(Click(b.clone()))),
+        rec(Arc::new(Type(b.clone()))),
+        rec(Arc::new(Press(b.clone()))),
         Arc::new(Scroll(b.clone())),
         Arc::new(Wait(b.clone())),
-        Arc::new(Select(b.clone())),
+        rec(Arc::new(Select(b.clone()))),
         Arc::new(Hover(b.clone())),
-        Arc::new(forms::FillForm(b.clone())),
+        rec(Arc::new(forms::FillForm(b.clone()))),
+        Arc::new(playbooks::PlaybookSave(b.clone(), store.clone())),
+        Arc::new(playbooks::PlaybookRun(b.clone(), store.clone())),
         Arc::new(pointer::Drag(b.clone())),
         Arc::new(clipboard::Clipboard(b.clone())),
         Arc::new(Dialog(b.clone())),
@@ -168,7 +176,7 @@ pub fn tools(bridge: BrowserBridge) -> Vec<Arc<dyn Tool>> {
         Arc::new(SavePdf(b.clone())),
         Arc::new(SignIn(b.clone())),
         Arc::new(Handoff(b.clone())),
-        Arc::new(History(b.clone(), NavAction::Back)),
+        rec(Arc::new(History(b.clone(), NavAction::Back))),
         Arc::new(History(b.clone(), NavAction::Forward)),
         Arc::new(History(b, NavAction::Reload)),
     ]);
