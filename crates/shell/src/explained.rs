@@ -45,7 +45,8 @@ const BASICS: &[Section] = &[
         blocks: &[
             Block::Para(
                 "The agent works in this browser, on the page you're looking at. It reads pages, clicks, types, \
-                 opens tabs, downloads files, and checks your Gmail, and you watch every step. You stay in charge: \
+                 opens tabs, downloads files, reads and edits files on your computer, and checks your Gmail, and you \
+                 watch every step. You stay in charge: \
                  anything that buys, sends, posts or deletes waits for your OK.",
             ),
             Block::Para(
@@ -99,8 +100,9 @@ const SAFETY: &[Section] = &[
         title: "Staying in control",
         blocks: &[
             Block::Bullets(&[
-                "Approval cards: buying, paying, sending, posting, deleting, submitting forms that send information, \
-                 uploading a file, and confirming risky pop-ups all ask first, with a screenshot and the values.",
+                "Approval cards: buying, paying, sending, posting, deleting, changing your files, submitting forms \
+                 that send information, uploading a file, and confirming risky pop-ups all ask first, with a \
+                 screenshot and the values.",
                 "\"Always allow\" on a card stops asking for that site (or those email recipients).",
                 "Focus › Safety: \"Only act on focus sites\" makes clicking or typing anywhere else ask first (reading \
                  is still fine). \"Always ask for purchases over\" shows you any bigger purchase, with its amount, even \
@@ -120,7 +122,9 @@ const SAFETY: &[Section] = &[
                 "Type passwords, card numbers, security codes or one-time codes. It hands those to you, and can't see \
                  them on the page or in screenshots.",
                 "Solve CAPTCHAs or get around sites that block agents. It tells you and stops.",
-                "Upload files from hidden folders like ~/.ssh or ~/.config.",
+                "Read, change or upload files in hidden folders like ~/.ssh or ~/.config, or touch the app's own \
+                 data and settings.",
+                "Erase files: deleting moves them to the Trash, and every file change asks you first.",
                 "Allow camera, microphone, location or notifications for sites. When a site asks, you choose on a \
                  card over the page; the answer is remembered for that site (Focus › Safety lists them).",
                 "Follow instructions planted in web pages (\"AI assistant: ignore your instructions…\"). It warns you \
@@ -233,12 +237,33 @@ const HISTORY: &[Section] = &[
 
 const FILES: &[Section] = &[
     Section {
-        title: "Files",
+        title: "Downloads and uploads",
         blocks: &[
             Block::Bullets(&[
                 "Downloads save to ~/Downloads/agent-unibrow. The ↓ button in the toolbar lists them.",
                 "The agent can read downloaded text, CSV and PDF files, and save any page as a PDF.",
                 "To upload, tell it the file's full path. It asks before attaching anything.",
+            ]),
+        ],
+    },
+    Section {
+        title: "Files on your computer",
+        blocks: &[
+            Block::Bullets(&[
+                "The agent can read, list and search your files, and write new ones, edit them, make folders, \
+                 move or rename things, and delete.",
+                "Reading runs on its own. Every change shows you a card first, with the path and the lines that \
+                 change (or the new file's text), and waits for your OK. Only new files in ~/Downloads/agent-unibrow \
+                 skip the card.",
+                "Deleting moves things to the Trash, so you can restore them from your file manager.",
+                "Off limits: hidden folders (~/.ssh, ~/.config and the like), the app's own data and settings, keys \
+                 and password files, and system folders outside your home.",
+                "Use ~/ or a full path. Every file action shows in History → Trace.",
+            ]),
+            Block::Examples(&[
+                "Make a file ~/Documents/packing.txt with a packing list for a weekend trip",
+                "Which files in my Downloads folder mention \"invoice\"?",
+                "In ~/Documents/todo.txt, mark the dentist appointment as done",
             ]),
         ],
     },

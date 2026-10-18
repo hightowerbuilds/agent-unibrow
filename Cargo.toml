@@ -14,6 +14,7 @@ members = [
     "crates/rails/rail-commerce",
     "crates/rails/rail-aggregator",
     "crates/rails/rail-browser",
+    "crates/rails/rail-files",
 ]
 
 [workspace.package]

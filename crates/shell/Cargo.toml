@@ -22,6 +22,7 @@ async-channel.workspace = true
 chrono.workspace = true
 futures.workspace = true
 rail-browser = { path = "../rails/rail-browser" }
+rail-files = { path = "../rails/rail-files" }
 image = { version = "0.25", default-features = false }
 keyring.workspace = true
 serde_json.workspace = true
