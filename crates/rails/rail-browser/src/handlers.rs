@@ -4,6 +4,7 @@ use crate::{Cursor, Frame as PixelFrame, ViewState};
 use cef::rc::Rc as _;
 use cef::*;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 // ------------------------------------------------------------------- app
@@ -280,4 +281,44 @@ pub fn client(state: Rc<RefCell<ViewState>>) -> cef::Client {
         LoadHandlerBuilder::new(Load { state }),
         LifeSpanHandlerBuilder::new(LifeSpan),
     )
+}
+
+// -------------------------------------------------------------- devtools
+
+/// Replies waiting for DevTools method results, by message id.
+pub type Pending = Rc<RefCell<HashMap<i32, crate::bridge::Reply<serde_json::Value>>>>;
+
+#[derive(Clone)]
+pub struct Cdp {
+    pending: Pending,
+}
+
+wrap_dev_tools_message_observer! {
+    pub struct CdpObserverBuilder {
+        handler: Cdp,
+    }
+
+    impl DevToolsMessageObserver {
+        fn on_dev_tools_method_result(
+            &self,
+            _browser: Option<&mut Browser>,
+            message_id: ::std::os::raw::c_int,
+            success: ::std::os::raw::c_int,
+            result: Option<&[u8]>,
+        ) {
+            let Some(reply) = self.handler.pending.borrow_mut().remove(&message_id) else { return };
+            let parsed: serde_json::Value =
+                result.and_then(|r| serde_json::from_slice(r).ok()).unwrap_or(serde_json::Value::Null);
+            let outcome = if success == 1 {
+                Ok(parsed)
+            } else {
+                Err(parsed["message"].as_str().map(str::to_string).unwrap_or_else(|| parsed.to_string()))
+            };
+            let _ = reply.send(outcome);
+        }
+    }
+}
+
+pub fn cdp_observer(pending: Pending) -> cef::DevToolsMessageObserver {
+    CdpObserverBuilder::new(Cdp { pending })
 }

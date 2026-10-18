@@ -18,7 +18,7 @@ Status: **done** (built and tested) · **partial** (started) · **todo**.
 | History, bookmarks, focus sites | done | SQLite; agents can read history and focus |
 | Agent backends (Claude Code, Codex, OpenCode, API) | done | Tools served over local MCP |
 | Policy, approval cards, trace | done | Every tool call goes through `ToolHost` |
-| Agent tools that act in the browser | **todo** | This roadmap |
+| Agent tools that act in the browser | **partial** | Phase 1 built and tested on a local checkout page |
 
 ## How the agent will see and drive pages
 
@@ -48,13 +48,13 @@ that every agent backend receives the same way.
 
 The minimum for the agent to work in the browser at all.
 
-### 1.1 CDP bridge — todo
+### 1.1 CDP bridge — done
 - Send CDP commands and receive results and events from `rail-browser`.
 - CEF runs on the UI thread and tools run on the agent thread, so
   requests go over a channel and answers come back the same way.
 - Timeouts, and errors that read clearly in the trace.
 
-### 1.2 Page model v1 — todo
+### 1.2 Page model v1 — partial (outline, refs, paging done; diffs between steps todo)
 - Accessibility tree pruned to what matters: interactive elements,
   headings, landmarks, text.
 - Each element gets a short **ref** (`e12`) mapped to its `backendNodeId`, so
@@ -65,7 +65,7 @@ The minimum for the agent to work in the browser at all.
 - A screenshot of the viewport, attached when the model can use images.
 - Diffs between steps: what changed after the last action.
 
-### 1.3 Core browser tools — todo
+### 1.3 Core browser tools — done
 
 | Tool | Does | Effect |
 | --- | --- | --- |
@@ -82,7 +82,7 @@ The minimum for the agent to work in the browser at all.
 \* Clicks are classed by what they hit: a link or tab is Read, a submit,
 "Buy", "Send" or "Delete" button is Commit (see 6.1).
 
-### 1.4 Shared page between you and the agent — todo
+### 1.4 Shared page between you and the agent — done (highlight and agent bar not yet seen on screen)
 - The agent drives the page you're looking at, so you see every step.
 - **Agent overlay**: highlight the element about to be clicked or typed
   into, and show a small "agent is working" bar with **Stop**.
@@ -90,7 +90,7 @@ The minimum for the agent to work in the browser at all.
 - While the agent is driving, your own clicks pause it rather than racing
   it.
 
-### 1.5 Trace with evidence — todo
+### 1.5 Trace with evidence — done (after-action screenshots; before-shots todo)
 - Every browser action logged with the element, the URL, and a small
   before/after screenshot.
 - Click a trace row to see the page as the agent saw it.

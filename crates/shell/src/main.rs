@@ -18,12 +18,13 @@ use policy::Policy;
 use router::Registry;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use browser_pane::{BrowserPane, BrowsingChanged};
+use browser_pane::{AgentControl, BrowserPane, BrowsingChanged};
+use rail_browser::BrowserBridge;
 use browsing::{Browsing, HistoryQuery, site_of};
 use text_input::{Changed, Submit, TextInput};
 use trace::{Kind, Trace};
 
-gpui::actions!(shell, [ToggleSidebar, ShowChat, ShowHistory, ShowFocus, ShowTrace]);
+gpui::actions!(shell, [ToggleSidebar, ShowChat, ShowHistory, ShowFocus, ShowTrace, StopAgent]);
 
 const KEYRING_SERVICE: &str = "agent-unibrow";
 const KEYRING_API_KEY: &str = "anthropic-api-key";
@@ -67,6 +68,7 @@ struct Shell {
     focus_handle: FocusHandle,
     input: Entity<TextInput>,
     browser: Entity<BrowserPane>,
+    bridge: BrowserBridge,
     store: Arc<Browsing>,
     history_filter: Entity<TextInput>,
     items: Vec<Item>,
@@ -93,7 +95,12 @@ struct Shell {
 impl Shell {
     fn new(cef: Result<(), String>, store: Arc<Browsing>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| TextInput::new("Ask Claude to do something…", cx));
-        let browser = cx.new(|cx| BrowserPane::new(cef, store.clone(), window, cx));
+        let (bridge, requests) = rail_browser::bridge::channel();
+        let browser = cx.new(|cx| BrowserPane::new(cef, store.clone(), requests, window, cx));
+        let control_sub = cx.subscribe(&browser, |this: &mut Self, _, ev: &AgentControl, cx| match ev {
+            AgentControl::Stop => this.stop_agent("Stopped.", cx),
+            AgentControl::TookOver => this.stop_agent("You took over the page, so I stopped.", cx),
+        });
         let history_filter = cx.new(|cx| TextInput::new("Search history", cx));
         let subscription = cx.subscribe(&input, |this: &mut Self, _, ev: &Submit, cx| this.submit(ev.0.clone(), cx));
         let browsing_sub = cx.subscribe(&browser, |this: &mut Self, _, _: &BrowsingChanged, cx| {
@@ -108,6 +115,7 @@ impl Shell {
             focus_handle: cx.focus_handle(),
             input,
             browser,
+            bridge,
             store,
             history_filter,
             items: Vec::new(),
@@ -126,13 +134,43 @@ impl Shell {
             needs_key: false,
             conv_scroll: ScrollHandle::new(),
             trace_scroll: ScrollHandle::new(),
-            _subscriptions: vec![subscription, browsing_sub, filter_sub],
+            _subscriptions: vec![subscription, browsing_sub, filter_sub, control_sub],
             _events: None,
         };
         if let Some(p) = shell.trace.path().cloned() {
             shell.trace.push(Kind::Info, "Trace file opened", Some(p.display().to_string()));
         }
         shell.start_backend(cx);
+        // Test hook: press Stop this many seconds after the first message.
+        if let Some(secs) = std::env::var("UNIBROW_AUTOSTOP_SECS").ok().and_then(|s| s.parse::<u64>().ok()) {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(std::time::Duration::from_millis(250)).await;
+                    if this.update(cx, |s, _| s.busy).unwrap_or(false) {
+                        break;
+                    }
+                }
+                cx.background_executor().timer(std::time::Duration::from_secs(secs)).await;
+                let _ = this.update(cx, |s, cx| s.stop_agent("Stopped.", cx));
+            })
+            .detach();
+        }
+        // Test hook: send a task automatically once the page has loaded.
+        if let Ok(task) = std::env::var("UNIBROW_AUTOSEND") {
+            cx.spawn(async move |this, cx| {
+                for _ in 0..80 {
+                    cx.background_executor().timer(std::time::Duration::from_millis(250)).await;
+                    let ready = this
+                        .update(cx, |s, cx| !s.browser.read(cx).location().0.is_empty())
+                        .unwrap_or(false);
+                    if ready {
+                        break;
+                    }
+                }
+                let _ = this.update(cx, |s, cx| s.submit(task, cx));
+            })
+            .detach();
+        }
         shell
     }
 
@@ -190,6 +228,9 @@ impl Shell {
         let mut registry = Registry::new();
         registry.add_rail(&rail);
         for tool in browsing::tools(self.store.clone()) {
+            registry.add_tool(tool);
+        }
+        for tool in rail_browser::tools::tools(self.bridge.clone()) {
             registry.add_tool(tool);
         }
         for n in &notes {
@@ -256,6 +297,25 @@ impl Shell {
         self.busy = busy;
         self.status = status.to_string().into();
         self.input.update(cx, |i, cx| i.set_disabled(busy, cx));
+        self.browser.update(cx, |b, cx| b.set_agent_busy(busy, cx));
+    }
+
+    /// Stops the agent's current turn (Stop button, Esc, or the user taking
+    /// over the page).
+    fn stop_agent(&mut self, note: &str, cx: &mut Context<Self>) {
+        if !self.busy {
+            return;
+        }
+        if let Some(agent) = &self.agent {
+            agent.cancel();
+        }
+        // Dropping the senders answers pending approvals with Deny.
+        self.approvals.clear();
+        self.streaming = None;
+        self.items.push(Item { kind: ItemKind::System, text: note.to_string() });
+        self.trace.push(Kind::Info, note.to_string(), None);
+        self.status = "Stopping…".into();
+        cx.notify();
     }
 
     fn on_event(&mut self, ev: AgentEvent, cx: &mut Context<Self>) {
@@ -289,9 +349,10 @@ impl Shell {
                 let pretty = serde_json::to_string_pretty(&input).unwrap_or_default();
                 self.trace.push(Kind::ToolCall, format!("{name} {}", compact(&input)), Some(pretty));
             }
-            AgentEvent::ToolResult { name, ok, summary, content, .. } => {
+            AgentEvent::ToolResult { name, ok, summary, content, evidence, .. } => {
                 let kind = if ok { Kind::ToolResult } else { Kind::Error };
-                self.trace.push(kind, format!("{name}: {summary}"), Some(content));
+                let images = evidence.iter().filter_map(rail_browser::tools::decode_image).collect();
+                self.trace.push_with_images(kind, format!("{name}: {summary}"), Some(content), images);
                 self.status = "Thinking…".into();
             }
             AgentEvent::ApprovalNeeded { id, name, description, reason, respond } => {
@@ -299,7 +360,17 @@ impl Shell {
                 self.sidebar_open = true;
                 self.tab = SidebarTab::Chat;
                 self.trace.push(Kind::ApprovalRequested, format!("Approval needed: {reason}"), Some(description.clone()));
-                self.approvals.push(PendingApproval { id, name, description, reason, respond: Some(respond) });
+                let auto = std::env::var("UNIBROW_AUTOAPPROVE").ok();
+                match auto.as_deref() {
+                    // Test hook: answer approval cards automatically.
+                    Some("approve") => {
+                        let _ = respond.send(Approval::Approve);
+                    }
+                    Some("deny") => {
+                        let _ = respond.send(Approval::Deny);
+                    }
+                    _ => self.approvals.push(PendingApproval { id, name, description, reason, respond: Some(respond) }),
+                }
             }
             AgentEvent::ApprovalDecided { name, approval, .. } => {
                 let verb = match approval {
@@ -311,16 +382,29 @@ impl Shell {
             }
             AgentEvent::Done { stop_reason, model, usage } => {
                 self.streaming = None;
+                self.approvals.clear();
                 let tokens = format!(
                     "in {} · out {} · cache read {}",
                     usage["input_tokens"].as_u64().unwrap_or(0),
                     usage["output_tokens"].as_u64().unwrap_or(0),
                     usage["cache_read_input_tokens"].as_u64().unwrap_or(0)
                 );
+                // The reply text since the last user message, for the record.
+                let reply: Vec<&str> = self
+                    .items
+                    .iter()
+                    .rev()
+                    .take_while(|i| i.kind != ItemKind::User)
+                    .filter(|i| i.kind == ItemKind::Assistant)
+                    .map(|i| i.text.as_str())
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
                 self.trace.push(
                     Kind::Assistant,
                     format!("Turn finished ({stop_reason})"),
-                    Some(format!("model: {}\n{tokens}", model.unwrap_or_default())),
+                    Some(format!("{}\n\nmodel: {}\n{tokens}", reply.join("\n\n"), model.unwrap_or_default())),
                 );
                 self.set_busy(false, "", cx);
             }
@@ -983,6 +1067,22 @@ impl Shell {
             Kind::Info => ("INFO", theme::MUTED),
         };
         let open = self.expanded.contains(&i);
+        let thumbs: Vec<_> = if open {
+            e.images
+                .iter()
+                .map(|p| {
+                    gpui::img(std::path::PathBuf::from(p))
+                        .w(px(340.))
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(rgb(theme::RULE))
+                        .into_any_element()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let has_images = !e.images.is_empty();
         let detail = e.detail.clone().filter(|_| open).map(|d| {
             let d = if d.chars().count() > DETAIL_CHARS {
                 d.chars().take(DETAIL_CHARS).collect::<String>() + "\n…"
@@ -1004,7 +1104,7 @@ impl Shell {
             .flex_col()
             .px_3()
             .py_1()
-            .when(e.detail.is_some(), |d| d.cursor_pointer().hover(|s| s.bg(rgb(theme::RAISED))))
+            .when(e.detail.is_some() || has_images, |d| d.cursor_pointer().hover(|s| s.bg(rgb(theme::RAISED))))
             .on_click(cx.listener(move |this, _, _, cx| {
                 if !this.expanded.remove(&i) {
                     this.expanded.insert(i);
@@ -1020,6 +1120,7 @@ impl Shell {
                     .child(div().w(px(52.)).flex_none().text_color(rgb(color)).child(label))
                     .child(div().flex_1().min_w(px(0.)).text_color(rgb(theme::FG)).child(e.summary.clone())),
             )
+            .children(thumbs.into_iter().map(|t| div().mt_1().child(t)))
             .children(detail)
     }
 }
@@ -1053,6 +1154,14 @@ impl Render for Shell {
         div()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| this.toggle_sidebar(window, cx)))
+            .on_action(cx.listener(|this, _: &StopAgent, _, cx| {
+                if this.busy {
+                    this.stop_agent("Stopped.", cx);
+                } else {
+                    // Not ours: let Escape reach the page or the focused field.
+                    cx.propagate();
+                }
+            }))
             .on_action(cx.listener(|this, _: &ShowChat, window, cx| this.show_tab(SidebarTab::Chat, window, cx)))
             .on_action(cx.listener(|this, _: &ShowHistory, window, cx| this.show_tab(SidebarTab::History, window, cx)))
             .on_action(cx.listener(|this, _: &ShowFocus, window, cx| this.show_tab(SidebarTab::Focus, window, cx)))
@@ -1149,6 +1258,7 @@ fn main() -> std::process::ExitCode {
         text_input::bind_keys(cx);
         cx.bind_keys([
             gpui::KeyBinding::new("ctrl-b", ToggleSidebar, None),
+            gpui::KeyBinding::new("escape", StopAgent, None),
             gpui::KeyBinding::new("alt-1", ShowChat, None),
             gpui::KeyBinding::new("alt-2", ShowHistory, None),
             gpui::KeyBinding::new("alt-3", ShowFocus, None),
@@ -1159,7 +1269,8 @@ fn main() -> std::process::ExitCode {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions { title: Some("agent-unibrow".into()), ..Default::default() }),
-                app_id: Some("agent-unibrow".into()),
+                // A test instance can run under its own class (window rules).
+                app_id: Some(std::env::var("UNIBROW_APP_ID").unwrap_or_else(|_| "agent-unibrow".into())),
                 ..Default::default()
             },
             |window, cx| {

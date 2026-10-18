@@ -67,7 +67,7 @@ impl Gmail {
         let list = self.get("/threads", &[("q", query), ("maxResults", &max_s)]).await?;
         let threads = list["threads"].as_array().cloned().unwrap_or_default();
         if threads.is_empty() {
-            return Ok(ToolOutput { content: format!("No threads match `{query}`."), summary: "0 threads".into() });
+            return Ok(ToolOutput { content: format!("No threads match `{query}`."), summary: "0 threads".into(), ..Default::default() });
         }
         let mut lines = vec![format!("{} thread(s) for `{query}` (newest first). Your address: {me}", threads.len())];
         for t in &threads {
@@ -93,7 +93,7 @@ impl Gmail {
                 snippet = last["snippet"].as_str().unwrap_or("").replace('\n', " "),
             ));
         }
-        Ok(ToolOutput { summary: format!("{} threads for `{query}`", threads.len()), content: lines.join("\n") })
+        Ok(ToolOutput { summary: format!("{} threads for `{query}`", threads.len()), content: lines.join("\n"), ..Default::default() })
     }
 
     async fn read_thread(&self, id: &str) -> Result<ToolOutput, String> {
@@ -118,7 +118,7 @@ impl Gmail {
                 body.trim()
             ));
         }
-        Ok(ToolOutput { summary: format!("read “{subject}” ({} msgs)", msgs.len()), content: out.join("\n") })
+        Ok(ToolOutput { summary: format!("read “{subject}” ({} msgs)", msgs.len()), content: out.join("\n"), ..Default::default() })
     }
 
     /// Threading headers and default recipients for a reply to `thread_id`.
@@ -184,7 +184,7 @@ impl Gmail {
                 ctx.to.join(", "),
                 if cc.is_empty() { String::new() } else { format!(" Cc: {}", cc.join(", ")) },
                 ctx.subject
-            ),
+            ), ..Default::default()
         })
     }
 
@@ -204,7 +204,7 @@ impl Gmail {
             content: format!(
                 "Draft saved (draft_id={}). It is in the user's Drafts folder and has NOT been sent.",
                 d["id"].as_str().unwrap_or("?")
-            ),
+            ), ..Default::default()
         })
     }
 
@@ -232,7 +232,7 @@ impl Gmail {
         let sent = self.post("/messages/send", &msg).await?;
         Ok(ToolOutput {
             summary: format!("sent to {} — {subject}", a.to.join(", ")),
-            content: format!("Sent (message_id={}).", sent["id"].as_str().unwrap_or("?")),
+            content: format!("Sent (message_id={}).", sent["id"].as_str().unwrap_or("?")), ..Default::default()
         })
     }
 }
@@ -578,7 +578,7 @@ impl Tool for CurrentTime {
         Box::pin(async {
             let now = chrono::Local::now();
             let s = now.format("%A, %B %-d, %Y %-I:%M %p (UTC%:z)").to_string();
-            Ok(ToolOutput { summary: s.clone(), content: s })
+            Ok(ToolOutput { summary: s.clone(), content: s, ..Default::default() })
         })
     }
 }

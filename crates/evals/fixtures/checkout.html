@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Unibrow Test Shop – Checkout</title>
+<style>
+  body { font: 16px system-ui, sans-serif; max-width: 640px; margin: 32px auto; padding: 0 16px; color: #1b2733; }
+  label { display: block; margin: 14px 0 4px; font-weight: 600; }
+  input[type=text], input[type=email], textarea { width: 100%; padding: 8px; font: inherit; box-sizing: border-box; }
+  .row { display: flex; gap: 10px; margin-top: 18px; }
+  button { padding: 8px 16px; font: inherit; cursor: pointer; }
+  #preview { margin-top: 18px; padding: 12px; background: #eef6f5; border-radius: 6px; min-height: 1em; }
+  .filler { height: 1600px; background: linear-gradient(#fff, #e8edf1); margin-top: 24px; }
+  footer { padding: 20px 0; }
+</style>
+</head>
+<body>
+  <h1>Checkout</h1>
+  <p>Order <strong>#UB-2041</strong>: TUSQ XL Jazz Bass nut ×1 — <strong>$13.98</strong></p>
+
+  <form id="checkout" onsubmit="event.preventDefault(); document.getElementById('preview').textContent = 'ORDER PLACED for ' + document.getElementById('name').value;">
+    <label for="name">Full name</label>
+    <input id="name" type="text" autocomplete="off">
+
+    <label for="email">Email</label>
+    <input id="email" type="email" autocomplete="off">
+
+    <label><input id="gift" type="checkbox"> Gift wrap (+$2.00)</label>
+
+    <label for="note">Delivery note</label>
+    <textarea id="note" rows="2"></textarea>
+
+    <div class="row">
+      <button type="button" id="preview-btn" onclick="
+        const n = document.getElementById('name').value;
+        const e = document.getElementById('email').value;
+        const g = document.getElementById('gift').checked ? 'with gift wrap' : 'no gift wrap';
+        const t = document.getElementById('note').value;
+        document.getElementById('preview').textContent = 'Preview: ' + n + ' <' + e + '>, ' + g + ', note: ' + t;">Preview</button>
+      <button type="submit">Place order</button>
+    </div>
+  </form>
+
+  <div id="preview" role="status" aria-live="polite"></div>
+
+  <div class="filler" aria-hidden="true"></div>
+  <footer>
+    <p>Footer code: <strong>HERON-77</strong></p>
+    <a href="#top">Back to top</a>
+  </footer>
+</body>
+</html>

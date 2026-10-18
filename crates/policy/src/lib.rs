@@ -67,6 +67,13 @@ impl Policy {
         }
     }
 
+    /// Whether the user has pre-approved `tool` for every one of `counterparties`.
+    pub fn is_always_allowed(&self, tool: &str, counterparties: &[String]) -> bool {
+        let parties = normalized(counterparties.to_vec());
+        !parties.is_empty()
+            && self.stored.always_allow.get(tool).is_some_and(|a| parties.iter().all(|p| a.contains(p)))
+    }
+
     /// Records "always allow" for this tool and these counterparties.
     pub fn always_allow(&mut self, tool: &str, counterparties: Vec<String>) {
         self.stored

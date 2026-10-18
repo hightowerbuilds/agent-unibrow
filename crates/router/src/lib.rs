@@ -20,13 +20,52 @@ pub enum Effect {
     Commit,
 }
 
-/// What a tool hands back to the model.
+/// An image attached to a tool result.
 #[derive(Clone, Debug)]
+pub struct ToolImage {
+    /// `image/png` or `image/jpeg`.
+    pub mime: String,
+    pub base64: String,
+}
+
+/// What a tool hands back to the model.
+#[derive(Clone, Debug, Default)]
 pub struct ToolOutput {
     /// Text returned to the model as the tool_result.
     pub content: String,
     /// One line for the trace pane.
     pub summary: String,
+    /// Images the model should see (e.g. a screenshot it asked for).
+    pub images: Vec<ToolImage>,
+    /// Images kept for the trace only (before/after screenshots).
+    pub evidence: Vec<ToolImage>,
+}
+
+impl ToolOutput {
+    pub fn text(content: impl Into<String>, summary: impl Into<String>) -> Self {
+        Self { content: content.into(), summary: summary.into(), ..Default::default() }
+    }
+}
+
+/// Lets a tool ask the user to approve something it only discovers while
+/// running (for example, that the button it was asked to click says
+/// "Place order"). Implemented by the agent's tool host.
+pub trait Approver: Send + Sync {
+    /// Resolves to true if the user approves (or has pre-approved this tool
+    /// for these counterparties).
+    fn approve(
+        &self,
+        tool: &'static str,
+        description: String,
+        reason: String,
+        counterparties: Vec<String>,
+    ) -> BoxFuture<'static, bool>;
+}
+
+/// Passed to [`Tool::call_with`].
+#[derive(Clone)]
+pub struct ToolContext {
+    pub approver: std::sync::Arc<dyn Approver>,
 }
 
 pub type ToolResult = Result<ToolOutput, String>;
@@ -47,6 +86,11 @@ pub trait Tool: Send + Sync {
         Vec::new()
     }
     fn call(&self, input: Value) -> BoxFuture<'static, ToolResult>;
+    /// Like [`Tool::call`], with access to mid-call approval. Tools that only
+    /// need up-front policy can ignore this.
+    fn call_with(&self, input: Value, _ctx: ToolContext) -> BoxFuture<'static, ToolResult> {
+        self.call(input)
+    }
 }
 
 /// A source of tools: an API rail, a commerce protocol, the browser.

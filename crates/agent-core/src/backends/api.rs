@@ -14,6 +14,8 @@ pub struct ApiBackend {
     tools: Vec<Value>,
     /// Append-only conversation history in wire format.
     messages: Vec<Value>,
+    /// History length before the current turn, to undo a cancelled turn.
+    turn_start: usize,
     events: async_channel::Sender<AgentEvent>,
 }
 
@@ -29,6 +31,7 @@ impl ApiBackend {
             tools: host.registry().definitions(true),
             host,
             messages: Vec::new(),
+            turn_start: 0,
             events,
         }
     }
@@ -37,7 +40,14 @@ impl ApiBackend {
         let _ = self.events.try_send(ev);
     }
 
+    /// Stop: drop the unfinished turn so history stays a valid alternation
+    /// (no tool_use without its tool_result). Only the tail is removed.
+    pub fn on_cancel(&mut self) {
+        self.messages.truncate(self.turn_start);
+    }
+
     pub async fn run_turn(&mut self, text: String) {
+        self.turn_start = self.messages.len();
         self.messages.push(json!({
             "role": "user",
             "content": [{"type": "text", "text": prompt::stamp(&text)}],
@@ -129,12 +139,24 @@ impl ApiBackend {
                         ok: false,
                         summary: "invalid tool input JSON".into(),
                         content: content.clone(),
+                        evidence: Vec::new(),
                     });
                     results.push(tool_result(&block["id"], &content, true));
                     continue;
                 }
                 let out = self.host.execute(id, name, block["input"].clone()).await;
-                results.push(tool_result(&block["id"], &out.content, out.is_error));
+                let mut result = tool_result(&block["id"], &out.content, out.is_error);
+                if !out.images.is_empty() {
+                    let mut blocks = vec![json!({"type": "text", "text": out.content})];
+                    for img in &out.images {
+                        blocks.push(json!({
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": img.mime, "data": img.base64},
+                        }));
+                    }
+                    result["content"] = Value::Array(blocks);
+                }
+                results.push(result);
             }
             // Every result for this assistant turn goes back in one message.
             self.messages.push(json!({"role": "user", "content": results}));

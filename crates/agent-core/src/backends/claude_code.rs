@@ -210,6 +210,12 @@ impl ClaudeCode {
         }
     }
 
+    /// Stop: kill the process. The next message restarts it with
+    /// `--resume`, so the conversation continues.
+    pub fn on_cancel(&mut self) {
+        self.running = None; // kill_on_drop
+    }
+
     async fn crashed(&mut self) {
         let msg = match self.running.take() {
             Some(mut r) => {

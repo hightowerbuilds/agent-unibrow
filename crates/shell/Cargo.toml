@@ -16,6 +16,7 @@ policy.workspace = true
 agent-core.workspace = true
 rail-api.workspace = true
 browsing.workspace = true
+async-channel.workspace = true
 chrono.workspace = true
 rail-browser = { path = "../rails/rail-browser" }
 image = { version = "0.25", default-features = false }

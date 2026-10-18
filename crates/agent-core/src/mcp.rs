@@ -115,7 +115,11 @@ async fn dispatch(state: &AppState, msg: Value) -> Option<Value> {
             };
             let call_id = state.host.fresh_id("mcp");
             let out = state.host.execute(call_id, name, args).await;
-            json!({"content": [{"type": "text", "text": out.content}], "isError": out.is_error})
+            let mut content = vec![json!({"type": "text", "text": out.content})];
+            for img in out.images {
+                content.push(json!({"type": "image", "data": img.base64, "mimeType": img.mime}));
+            }
+            json!({"content": content, "isError": out.is_error})
         }
         "resources/list" => json!({"resources": []}),
         "prompts/list" => json!({"prompts": []}),

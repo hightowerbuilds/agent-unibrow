@@ -40,6 +40,16 @@ impl Backend {
         })
     }
 
+    /// Cleans up after a turn was cut short by Stop.
+    pub async fn on_cancel(&mut self) {
+        match self {
+            Backend::Api(b) => b.on_cancel(),
+            Backend::ClaudeCode(b) => b.on_cancel(),
+            // Their per-turn processes were dropped (and killed) with the turn.
+            Backend::Codex(_) | Backend::OpenCode(_) => {}
+        }
+    }
+
     pub async fn run_turn(&mut self, text: String) {
         match self {
             Backend::Api(b) => b.run_turn(text).await,

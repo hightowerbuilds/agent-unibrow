@@ -94,9 +94,9 @@ fn when(ts: i64) -> DateTime<Local> {
 
 impl Browsing {
     pub fn default_path() -> PathBuf {
-        dirs::data_local_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("agent-unibrow")
+        std::env::var_os("UNIBROW_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| dirs::data_local_dir().unwrap_or_else(std::env::temp_dir).join("agent-unibrow"))
             .join("browsing.sqlite3")
     }
 

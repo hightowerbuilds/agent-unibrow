@@ -28,7 +28,7 @@ impl Tool for FakeSend {
         input["to"].as_str().map(|s| vec![s.to_string()]).unwrap_or_default()
     }
     fn call(&self, _: Value) -> BoxFuture<'static, ToolResult> {
-        Box::pin(async { Ok(ToolOutput { content: "sent".into(), summary: "sent".into() }) })
+        Box::pin(async { Ok(ToolOutput::text("sent", "sent")) })
     }
 }
 

@@ -10,15 +10,18 @@
 //! every [`pump`] call happen on the main thread (the GPUI thread), so all
 //! CEF callbacks arrive there too and the view state needs no locking.
 
+pub mod bridge;
 mod handlers;
 pub mod keys;
+pub mod tools;
 
 use cef::args::Args;
 use cef::{CefString, ImplBrowser, ImplBrowserHost, ImplCommandLine, ImplFrame};
-use std::cell::{Ref, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
+pub use bridge::{BrowserBridge, NavAction, PageState, Request};
 pub use keys::KeyInput;
 
 /// Directory holding libcef.so, the .pak resources and locales. Set by the
@@ -103,10 +106,15 @@ pub fn run_subprocess_if_needed() -> Option<i32> {
 
 /// Where cookies, logins and site data persist between launches.
 pub fn profile_dir() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("agent-unibrow")
-        .join("browser")
+    data_dir().join("browser")
+}
+
+/// App data root: `~/.local/share/agent-unibrow`, or `$UNIBROW_DATA_DIR`
+/// (used to run an isolated test instance next to the user's).
+pub fn data_dir() -> PathBuf {
+    std::env::var_os("UNIBROW_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs::data_local_dir().unwrap_or_else(std::env::temp_dir).join("agent-unibrow"))
 }
 
 /// Starts CEF in the browser (main) process. Call once on the main thread,
@@ -151,6 +159,9 @@ pub fn shutdown() {
 pub struct WebView {
     browser: cef::Browser,
     state: Rc<RefCell<ViewState>>,
+    cdp_pending: handlers::Pending,
+    cdp_next_id: Cell<i32>,
+    _cdp_registration: Option<cef::Registration>,
 }
 
 impl WebView {
@@ -164,7 +175,10 @@ impl WebView {
             ..Default::default()
         }));
         let window_info = cef::WindowInfo { windowless_rendering_enabled: 1, ..Default::default() };
-        let browser_settings = cef::BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
+        // Opaque white, like Chrome, so pages without a background aren't
+        // transparent (they'd screenshot as black).
+        let browser_settings =
+            cef::BrowserSettings { windowless_frame_rate: 60, background_color: 0xFFFF_FFFF, ..Default::default() };
         let mut client = handlers::client(state.clone());
         let browser = cef::browser_host_create_browser_sync(
             Some(&window_info),
@@ -175,7 +189,42 @@ impl WebView {
             None,
         )
         .ok_or("Chromium couldn't create the page view")?;
-        Ok(Self { browser, state })
+        let cdp_pending: handlers::Pending = Rc::default();
+        let registration = browser
+            .host()
+            .and_then(|h| h.add_dev_tools_message_observer(Some(&mut handlers::cdp_observer(cdp_pending.clone()))));
+        Ok(Self { browser, state, cdp_pending, cdp_next_id: Cell::new(1), _cdp_registration: registration })
+    }
+
+    /// Sends a DevTools Protocol command; `reply` gets the `result` object.
+    pub fn cdp(&self, method: &str, params: serde_json::Value, reply: bridge::Reply<serde_json::Value>) {
+        let id = self.cdp_next_id.get();
+        self.cdp_next_id.set(id.wrapping_add(1).max(1));
+        let msg = serde_json::json!({"id": id, "method": method, "params": params}).to_string();
+        let Some(host) = self.host() else {
+            let _ = reply.send(Err("the page is closed".into()));
+            return;
+        };
+        self.cdp_pending.borrow_mut().insert(id, reply);
+        if host.send_dev_tools_message(Some(msg.as_bytes())) == 0 {
+            if let Some(reply) = self.cdp_pending.borrow_mut().remove(&id) {
+                let _ = reply.send(Err("Chromium rejected the DevTools message".into()));
+            }
+        }
+    }
+
+    /// The page state tools can read without a DevTools round trip.
+    pub fn page_state(&self) -> PageState {
+        let s = self.state.borrow();
+        PageState {
+            url: s.url.clone(),
+            title: s.title.clone(),
+            loading: s.loading,
+            can_go_back: s.can_go_back,
+            can_go_forward: s.can_go_forward,
+            width: s.width,
+            height: s.height,
+        }
     }
 
     pub fn state(&self) -> Ref<'_, ViewState> {

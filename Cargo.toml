@@ -47,3 +47,4 @@ policy = { path = "crates/policy" }
 agent-core = { path = "crates/agent-core" }
 rail-api = { path = "crates/rails/rail-api" }
 browsing = { path = "crates/browsing" }
+page-model = { path = "crates/page-model" }

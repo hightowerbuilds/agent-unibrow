@@ -68,7 +68,7 @@ impl Tool for History {
             };
             let visits = store.history(&q);
             if visits.is_empty() {
-                return Ok(ToolOutput { content: "No matching history.".into(), summary: "0 visits".into() });
+                return Ok(ToolOutput { content: "No matching history.".into(), summary: "0 visits".into(), ..Default::default() });
             }
             let lines: Vec<String> = visits
                 .iter()
@@ -79,7 +79,7 @@ impl Tool for History {
                 .collect();
             Ok(ToolOutput {
                 summary: format!("{} visits", visits.len()),
-                content: format!("{} visit(s), newest first:\n{}", visits.len(), lines.join("\n")),
+                content: format!("{} visit(s), newest first:\n{}", visits.len(), lines.join("\n")), ..Default::default()
             })
         })
     }
@@ -107,13 +107,13 @@ impl Tool for FocusSites {
         Box::pin(async move {
             let sites = store.focus_sites();
             if sites.is_empty() {
-                return Ok(ToolOutput { content: "No sites are in focus.".into(), summary: "none".into() });
+                return Ok(ToolOutput { content: "No sites are in focus.".into(), summary: "none".into(), ..Default::default() });
             }
             let lines: Vec<String> = sites
                 .iter()
                 .map(|f| format!("- {} ({}), added {}", f.site, f.label, f.added.format("%b %-d")))
                 .collect();
-            Ok(ToolOutput { summary: format!("{} sites", sites.len()), content: lines.join("\n") })
+            Ok(ToolOutput { summary: format!("{} sites", sites.len()), content: lines.join("\n"), ..Default::default() })
         })
     }
 }

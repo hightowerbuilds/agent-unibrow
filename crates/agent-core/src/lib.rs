@@ -129,7 +129,15 @@ pub enum AgentEvent {
     /// A short progress note or reasoning summary.
     Note(String),
     ToolCall { id: String, name: String, input: Value },
-    ToolResult { id: String, name: String, ok: bool, summary: String, content: String },
+    ToolResult {
+        id: String,
+        name: String,
+        ok: bool,
+        summary: String,
+        content: String,
+        /// Screenshots and other images for the trace.
+        evidence: Vec<router::ToolImage>,
+    },
     ApprovalNeeded { id: String, name: String, description: String, reason: String, respond: ApprovalSender },
     ApprovalDecided { id: String, name: String, approval: Approval },
     /// The turn is over; it is the user's turn.
@@ -139,12 +147,19 @@ pub enum AgentEvent {
 
 pub struct AgentHandle {
     tx: async_channel::Sender<String>,
+    cancel: async_channel::Sender<()>,
 }
 
 impl AgentHandle {
     /// Queues a user message. Returns false if the agent thread has exited.
     pub fn send(&self, text: String) -> bool {
         self.tx.try_send(text).is_ok()
+    }
+
+    /// Stops the turn in progress, if any. The agent reports
+    /// `Done { stop_reason: "cancelled" }` once it has stopped.
+    pub fn cancel(&self) {
+        let _ = self.cancel.try_send(());
     }
 }
 
@@ -158,6 +173,7 @@ pub fn spawn(
 ) -> (AgentHandle, async_channel::Receiver<AgentEvent>) {
     let (in_tx, in_rx) = async_channel::unbounded::<String>();
     let (ev_tx, ev_rx) = async_channel::unbounded::<AgentEvent>();
+    let (cancel_tx, cancel_rx) = async_channel::bounded::<()>(1);
     std::thread::Builder::new()
         .name("agent-core".into())
         .spawn(move || {
@@ -176,12 +192,25 @@ pub fn spawn(
                     }
                 };
                 while let Ok(text) = in_rx.recv().await {
-                    backend.run_turn(text).await;
+                    // A Stop pressed while idle shouldn't cancel the next turn.
+                    while cancel_rx.try_recv().is_ok() {}
+                    let cancelled = tokio::select! {
+                        _ = backend.run_turn(text) => false,
+                        _ = cancel_rx.recv() => true,
+                    };
+                    if cancelled {
+                        backend.on_cancel().await;
+                        let _ = ev_tx.try_send(AgentEvent::Done {
+                            stop_reason: "cancelled".into(),
+                            model: None,
+                            usage: Value::Null,
+                        });
+                    }
                 }
             });
         })
         .expect("spawn agent thread");
-    (AgentHandle { tx: in_tx }, ev_rx)
+    (AgentHandle { tx: in_tx, cancel: cancel_tx }, ev_rx)
 }
 
 /// Directory the CLI agents run in: empty, so no project files or

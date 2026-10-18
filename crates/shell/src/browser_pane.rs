@@ -13,13 +13,17 @@ use gpui::{
 };
 use browsing::{Browsing, site_of};
 use gpui::EventEmitter;
-use rail_browser::{Cursor, KeyInput, Modifiers, WebView, normalize_address};
+use rail_browser::bridge::Rect;
+use rail_browser::{Cursor, KeyInput, Modifiers, NavAction, Request, WebView, normalize_address};
+use std::time::Instant;
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 const HOME: &str = "https://duckduckgo.com/";
+/// How long the agent's highlight box stays on screen.
+const HIGHLIGHT_FOR: Duration = Duration::from_millis(1600);
 /// How often CEF gets to run. 8 ms keeps input and video smooth.
 const PUMP_INTERVAL: Duration = Duration::from_millis(8);
 /// Wheel "lines" to pixels. Chromium scrolls about this far per notch.
@@ -47,8 +51,23 @@ struct Chrome {
 /// History or focus changed (a visit was recorded, focus toggled).
 pub struct BrowsingChanged;
 
+/// The user wants the agent to stop: the Stop button, or they started
+/// using the page themselves while the agent was driving it.
+pub enum AgentControl {
+    Stop,
+    TookOver,
+}
+
 pub struct BrowserPane {
     store: Arc<Browsing>,
+    /// Requests from agent tools (DevTools commands, navigation, highlights).
+    requests: async_channel::Receiver<Request>,
+    /// The element the agent is about to act on.
+    highlight: Option<(Rect, String, Instant)>,
+    /// An agent turn is running.
+    agent_busy: bool,
+    /// ...and it has used the browser during this turn.
+    agent_driving: bool,
     view: Option<WebView>,
     /// Why Chromium couldn't start, if it couldn't.
     unavailable: Option<String>,
@@ -67,11 +86,13 @@ pub struct BrowserPane {
 }
 
 impl EventEmitter<BrowsingChanged> for BrowserPane {}
+impl EventEmitter<AgentControl> for BrowserPane {}
 
 impl BrowserPane {
     pub fn new(
         cef: Result<(), String>,
         store: Arc<Browsing>,
+        requests: async_channel::Receiver<Request>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -114,6 +135,10 @@ impl BrowserPane {
 
         Self {
             store,
+            requests,
+            highlight: None,
+            agent_busy: false,
+            agent_driving: false,
             view: None,
             unavailable: cef.err(),
             image: None,
@@ -143,7 +168,7 @@ impl BrowserPane {
         let wanted = (w, h, (scale * 100.0) as u32);
 
         match &self.view {
-            None => match WebView::create(HOME, w, h, scale) {
+            None => match WebView::create(&std::env::var("UNIBROW_START_URL").unwrap_or_else(|_| HOME.into()), w, h, scale) {
                 Ok(v) => {
                     self.view = Some(v);
                     self.applied = wanted;
@@ -163,6 +188,38 @@ impl BrowserPane {
         let Some(view) = &self.view else { return };
 
         let mut changed = false;
+        while let Ok(req) = self.requests.try_recv() {
+            if self.agent_busy && !self.agent_driving {
+                self.agent_driving = true;
+                changed = true;
+            }
+            match req {
+                Request::Cdp { method, params, reply } => view.cdp(&method, params, reply),
+                Request::Navigate { url, reply } => {
+                    view.navigate(&url);
+                    let _ = reply.send(Ok(()));
+                }
+                Request::Nav { action, reply } => {
+                    match action {
+                        NavAction::Back => view.go_back(),
+                        NavAction::Forward => view.go_forward(),
+                        NavAction::Reload => view.reload(),
+                    }
+                    let _ = reply.send(Ok(()));
+                }
+                Request::State { reply } => {
+                    let _ = reply.send(Ok(view.page_state()));
+                }
+                Request::Highlight { rect, label } => {
+                    self.highlight = Some((rect, label, Instant::now()));
+                    changed = true;
+                }
+            }
+        }
+        if self.highlight.as_ref().is_some_and(|(_, _, at)| at.elapsed() > HIGHLIGHT_FOR) {
+            self.highlight = None;
+            changed = true;
+        }
         let seq = view.state().frame_seq;
         if seq != self.last_seq {
             self.last_seq = seq;
@@ -218,6 +275,23 @@ impl BrowserPane {
         cx.notify();
     }
 
+    /// Tells the pane whether an agent turn is running (for the agent bar).
+    pub fn set_agent_busy(&mut self, busy: bool, cx: &mut Context<Self>) {
+        self.agent_busy = busy;
+        if !busy {
+            self.agent_driving = false;
+            self.highlight = None;
+        }
+        cx.notify();
+    }
+
+    /// The user is acting on the page while the agent drives it.
+    fn user_took_over(&mut self, cx: &mut Context<Self>) {
+        if self.agent_busy && self.agent_driving {
+            cx.emit(AgentControl::TookOver);
+        }
+    }
+
     /// The page's current URL and title.
     pub fn location(&self) -> (String, String) {
         (self.chrome.url.clone(), self.chrome.title.clone())
@@ -251,7 +325,8 @@ impl BrowserPane {
         (f32::from(p.x - origin.x), f32::from(p.y - origin.y))
     }
 
-    fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, _: &mut Context<Self>) {
+    fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.user_took_over(cx);
         window.focus(&self.page_focus);
         let Some(v) = &self.view else { return };
         v.set_focus(true);
@@ -283,6 +358,7 @@ impl BrowserPane {
     }
 
     fn on_key_down(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.user_took_over(cx);
         let Some(v) = &self.view else { return };
         let k = &ev.keystroke;
         if std::env::var_os("UNIBROW_DEBUG_KEYS").is_some() {
@@ -429,8 +505,76 @@ impl BrowserPane {
             Cursor::ResizeColumn => CursorStyle::ResizeLeftRight,
             Cursor::ResizeRow => CursorStyle::ResizeUpDown,
         };
+        let highlight = self.highlight.as_ref().map(|(r, label, _)| {
+            let (x, y, w, h) = (r.x as f32, r.y as f32, r.width.max(4.) as f32, r.height.max(4.) as f32);
+            vec![
+                div()
+                    .absolute()
+                    .left(px(x - 2.))
+                    .top(px(y - 2.))
+                    .w(px(w + 4.))
+                    .h(px(h + 4.))
+                    .border_2()
+                    .rounded_sm()
+                    .border_color(rgb(theme::ACCENT))
+                    .bg(gpui::rgba(0x5fc8c022))
+                    .into_any_element(),
+                div()
+                    .absolute()
+                    .left(px(x - 2.))
+                    .top(px((y - 22.).max(0.)))
+                    .px_1()
+                    .rounded_sm()
+                    .bg(rgb(theme::ACCENT))
+                    .text_xs()
+                    .text_color(rgb(theme::BG))
+                    .child(SharedString::from(label.clone()))
+                    .into_any_element(),
+            ]
+        });
+        let agent_bar = (self.agent_busy && self.agent_driving).then(|| {
+            div()
+                .absolute()
+                .top(px(8.))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .pl_3()
+                        .pr_1()
+                        .py_1()
+                        .rounded_full()
+                        .bg(rgb(theme::PANE))
+                        .border_1()
+                        .border_color(rgb(theme::ACCENT))
+                        .text_xs()
+                        .text_color(rgb(theme::FG))
+                        .child(div().text_color(rgb(theme::ACCENT)).child("●"))
+                        .child("Agent is using the browser")
+                        .child(
+                            div()
+                                .id("agent-stop")
+                                .px_2()
+                                .py(px(2.))
+                                .rounded_full()
+                                .bg(rgb(theme::ERROR))
+                                .text_color(rgb(theme::BG))
+                                .cursor_pointer()
+                                .hover(|s| s.opacity(0.85))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(|_, _, _, cx| cx.emit(AgentControl::Stop)))
+                                .child("Stop · Esc"),
+                        ),
+                )
+        });
         div()
             .id("page")
+            .relative()
             .flex_1()
             .min_h(px(0.))
             .w_full()
@@ -467,6 +611,8 @@ impl BrowserPane {
                 )
                 .size_full(),
             )
+            .children(highlight.into_iter().flatten())
+            .children(agent_bar)
     }
 }
 

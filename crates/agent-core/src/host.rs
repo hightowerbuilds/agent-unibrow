@@ -6,7 +6,8 @@
 use crate::{AgentEvent, Approval};
 use futures::channel::oneshot;
 use policy::{Decision, Policy};
-use router::Registry;
+use futures::future::BoxFuture;
+use router::{Approver, Registry, ToolContext, ToolImage};
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -23,6 +24,7 @@ pub struct ToolHost {
 pub struct Outcome {
     pub content: String,
     pub is_error: bool,
+    pub images: Vec<ToolImage>,
 }
 
 impl ToolHost {
@@ -53,8 +55,9 @@ impl ToolHost {
                 ok: false,
                 summary: crate::first_line(&content),
                 content: content.clone(),
+                evidence: Vec::new(),
             });
-            Outcome { content, is_error: true }
+            Outcome { content, is_error: true, images: Vec::new() }
         };
 
         let Some(tool) = self.registry.get(&name) else {
@@ -82,16 +85,20 @@ impl ToolHost {
             }
         }
 
-        match tool.call(input).await {
+        let ctx = ToolContext { approver: std::sync::Arc::new(self.clone()) };
+        match tool.call_with(input, ctx).await {
             Ok(out) => {
+                let mut evidence = out.evidence;
+                evidence.extend(out.images.iter().cloned());
                 self.emit(AgentEvent::ToolResult {
                     id,
                     name,
                     ok: true,
                     summary: out.summary,
                     content: out.content.clone(),
+                    evidence,
                 });
-                Outcome { content: out.content, is_error: false }
+                Outcome { content: out.content, is_error: false, images: out.images }
             }
             Err(e) => fail(e),
         }
@@ -110,5 +117,41 @@ impl ToolHost {
                 })
             })
             .collect()
+    }
+}
+
+impl Approver for ToolHost {
+    fn approve(
+        &self,
+        tool: &'static str,
+        description: String,
+        reason: String,
+        counterparties: Vec<String>,
+    ) -> BoxFuture<'static, bool> {
+        let host = self.clone();
+        Box::pin(async move {
+            if host.policy.lock().expect("policy lock").is_always_allowed(tool, &counterparties) {
+                return true;
+            }
+            let id = host.fresh_id("approval");
+            let (tx, rx) = oneshot::channel();
+            host.emit(AgentEvent::ApprovalNeeded {
+                id: id.clone(),
+                name: tool.to_string(),
+                description,
+                reason,
+                respond: tx,
+            });
+            let approval = rx.await.unwrap_or(Approval::Deny);
+            host.emit(AgentEvent::ApprovalDecided { id, name: tool.to_string(), approval });
+            match approval {
+                Approval::Deny => false,
+                Approval::Approve => true,
+                Approval::AlwaysAllow => {
+                    host.policy.lock().expect("policy lock").always_allow(tool, counterparties);
+                    true
+                }
+            }
+        })
     }
 }
