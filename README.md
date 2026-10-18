@@ -34,6 +34,9 @@ registers it, so no rail knows about another.
 - **M3** Policy layer + commerce and aggregator rails; first one-step purchase.
 - **M4** Long tail via browser, auth handoff, evals, Plaid.
 
+The full list of browser-agent capabilities, phased, is in
+[docs/BROWSER_AGENT_ROADMAP.md](docs/BROWSER_AGENT_ROADMAP.md).
+
 ## Run
 
 ```

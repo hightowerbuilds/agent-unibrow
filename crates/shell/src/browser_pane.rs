@@ -223,6 +223,17 @@ impl BrowserPane {
         (self.chrome.url.clone(), self.chrome.title.clone())
     }
 
+    /// Bookmarks the current page, or removes its bookmark.
+    pub fn toggle_bookmark_current(&mut self, cx: &mut Context<Self>) {
+        let (url, title) = (self.chrome.url.clone(), self.chrome.title.clone());
+        if site_of(&url).is_some() {
+            let label = if title.is_empty() { url.clone() } else { title };
+            self.store.toggle_bookmark(&url, &label);
+            cx.emit(BrowsingChanged);
+            cx.notify();
+        }
+    }
+
     /// Puts the current page's site in focus, or takes it out.
     pub fn toggle_focus_current(&mut self, cx: &mut Context<Self>) {
         if let Some(site) = site_of(&self.chrome.url) {
@@ -341,7 +352,35 @@ impl BrowserPane {
                 },
             )))
             .child(div().flex_1().min_w(px(0.)).child(self.address.clone()))
+            .child(self.bookmark_button(cx))
             .child(self.focus_button(cx))
+    }
+
+    fn bookmark_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let can = site_of(&self.chrome.url).is_some();
+        let marked = can && self.store.is_bookmarked(&self.chrome.url);
+        div()
+            .id("bookmark-page")
+            .w(px(28.))
+            .h(px(28.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .text_base()
+            .text_color(rgb(if !can {
+                theme::RULE
+            } else if marked {
+                theme::WARN
+            } else {
+                theme::MUTED
+            }))
+            .when(can, |d| {
+                d.cursor_pointer()
+                    .hover(|s| s.bg(rgb(theme::RAISED)))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_bookmark_current(cx)))
+            })
+            .child(if marked { "★" } else { "☆" })
     }
 
     fn focus_button(&self, cx: &mut Context<Self>) -> impl IntoElement {

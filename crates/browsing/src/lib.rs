@@ -35,6 +35,14 @@ pub struct Visit {
 }
 
 #[derive(Clone, Debug)]
+pub struct Bookmark {
+    pub url: String,
+    pub title: String,
+    pub site: String,
+    pub added: DateTime<Local>,
+}
+
+#[derive(Clone, Debug)]
 pub struct FocusSite {
     pub site: String,
     /// A readable name (the page title when it was added, or the user's).
@@ -116,6 +124,12 @@ impl Browsing {
              );
              CREATE INDEX IF NOT EXISTS visits_at ON visits(at DESC);
              CREATE INDEX IF NOT EXISTS visits_site ON visits(site, at DESC);
+             CREATE TABLE IF NOT EXISTS bookmarks (
+                 url TEXT PRIMARY KEY,
+                 title TEXT NOT NULL DEFAULT '',
+                 site TEXT NOT NULL,
+                 added INTEGER NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS focus_sites (
                  site TEXT PRIMARY KEY,
                  label TEXT NOT NULL DEFAULT '',
@@ -242,6 +256,56 @@ impl Browsing {
         let _ = self.conn().execute("DELETE FROM visits", []);
     }
 
+    /// Bookmarks, newest first.
+    pub fn bookmarks(&self) -> Vec<Bookmark> {
+        let c = self.conn();
+        let Ok(mut stmt) = c.prepare("SELECT url, title, site, added FROM bookmarks ORDER BY added DESC") else {
+            return Vec::new();
+        };
+        stmt.query_map([], |r| {
+            Ok(Bookmark { url: r.get(0)?, title: r.get(1)?, site: r.get(2)?, added: when(r.get(3)?) })
+        })
+        .map(|rows| rows.filter_map(Result::ok).collect())
+        .unwrap_or_default()
+    }
+
+    pub fn is_bookmarked(&self, url: &str) -> bool {
+        self.conn()
+            .query_row("SELECT 1 FROM bookmarks WHERE url = ?1", params![history_url(url)], |_| Ok(()))
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    /// Bookmarks `url`. Returns false for pages that can't be bookmarked
+    /// (internal pages).
+    pub fn add_bookmark(&self, url: &str, title: &str) -> bool {
+        let Some(site) = site_of(url) else { return false };
+        self.conn()
+            .execute(
+                "INSERT INTO bookmarks (url, title, site, added) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(url) DO UPDATE SET title = excluded.title",
+                params![history_url(url), title, site, Local::now().timestamp()],
+            )
+            .is_ok()
+    }
+
+    pub fn remove_bookmark(&self, url: &str) {
+        let _ = self.conn().execute("DELETE FROM bookmarks WHERE url = ?1", params![history_url(url)]);
+    }
+
+    /// Bookmarks `url` if it isn't, removes the bookmark if it is. Returns
+    /// whether it's bookmarked now.
+    pub fn toggle_bookmark(&self, url: &str, title: &str) -> bool {
+        if self.is_bookmarked(url) {
+            self.remove_bookmark(url);
+            false
+        } else {
+            self.add_bookmark(url, title)
+        }
+    }
+
     pub fn focus_sites(&self) -> Vec<FocusSite> {
         let c = self.conn();
         let Ok(mut stmt) = c.prepare("SELECT site, label, added FROM focus_sites ORDER BY added") else {
@@ -361,6 +425,20 @@ mod tests {
         let all = b.history(&HistoryQuery { limit: 10, ..Default::default() });
         assert_eq!(all.len(), 1, "{all:?}");
         assert_eq!(all[0].url, "https://talk.example.io/");
+    }
+
+    #[test]
+    fn bookmarks() {
+        let b = Browsing::in_memory();
+        assert!(b.toggle_bookmark("https://www.sweetwater.com/item#reviews", "TUSQ nut"));
+        assert!(b.is_bookmarked("https://www.sweetwater.com/item"));
+        assert!(!b.add_bookmark("about:blank", "blank"));
+        b.add_bookmark("https://bradwoods.io/", "Brad Woods");
+        let all = b.bookmarks();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.iter().find(|m| m.site == "sweetwater.com").unwrap().url, "https://www.sweetwater.com/item");
+        assert!(!b.toggle_bookmark("https://www.sweetwater.com/item", ""));
+        assert_eq!(b.bookmarks().len(), 1);
     }
 
     #[test]

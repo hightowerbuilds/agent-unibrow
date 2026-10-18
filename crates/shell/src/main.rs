@@ -82,6 +82,7 @@ struct Shell {
     status: SharedString,
     sidebar_open: bool,
     tab: SidebarTab,
+    bookmarks_open: bool,
     needs_key: bool,
     conv_scroll: ScrollHandle,
     trace_scroll: ScrollHandle,
@@ -121,6 +122,7 @@ impl Shell {
             status: "".into(),
             sidebar_open: true,
             tab: SidebarTab::Chat,
+            bookmarks_open: false,
             needs_key: false,
             conv_scroll: ScrollHandle::new(),
             trace_scroll: ScrollHandle::new(),
@@ -527,6 +529,95 @@ impl Shell {
             .child(label)
     }
 
+    /// The "Bookmarks" dropdown at the top of the History tab.
+    fn render_bookmarks(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let marks = self.store.bookmarks();
+        let open = self.bookmarks_open;
+        let header = div()
+            .id("bookmarks-toggle")
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(theme::RAISED)))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.bookmarks_open = !this.bookmarks_open;
+                cx.notify();
+            }))
+            .child(div().text_color(rgb(theme::WARN)).child("★"))
+            .child(div().flex_1().text_sm().text_color(rgb(theme::FG)).child(match marks.len() {
+                0 => "Bookmarks".to_string(),
+                n => format!("Bookmarks · {n}"),
+            }))
+            .child(div().text_xs().text_color(rgb(theme::MUTED)).child(if open { "▴" } else { "▾" }));
+
+        let list = open.then(|| {
+            let empty = marks.is_empty();
+            div()
+                .id("bookmarks-list")
+                .flex()
+                .flex_col()
+                .max_h(px(280.))
+                .overflow_y_scroll()
+                .pb_1()
+                .when(empty, |d| {
+                    d.child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .text_xs()
+                            .text_color(rgb(theme::MUTED))
+                            .child("No bookmarks yet. Use ☆ in the browser toolbar to bookmark the page you're on."),
+                    )
+                })
+                .children(marks.into_iter().enumerate().map(|(i, m)| {
+                    let url = m.url.clone();
+                    let remove = m.url.clone();
+                    let title = if m.title.is_empty() { m.url.clone() } else { m.title.clone() };
+                    div()
+                        .id(("bookmark", i))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .pl(px(34.))
+                        .pr_3()
+                        .py_1()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(theme::RAISED)))
+                        .on_click(cx.listener(move |this, _, _, cx| this.open_url(url.clone(), cx)))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .child(div().text_sm().text_color(rgb(theme::FG)).truncate().child(title))
+                                .child(div().text_xs().text_color(rgb(theme::MUTED)).truncate().child(m.site)),
+                        )
+                        .child(
+                            div()
+                                .id(("bookmark-remove", i))
+                                .px_1()
+                                .rounded_sm()
+                                .text_xs()
+                                .text_color(rgb(theme::MUTED))
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(rgb(theme::ERROR)).bg(rgb(theme::PANE)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.store.remove_bookmark(&remove);
+                                    cx.notify();
+                                }))
+                                .child("✕"),
+                        )
+                }))
+        });
+
+        div().flex().flex_col().border_b_1().border_color(rgb(theme::RULE)).child(header).children(list)
+    }
+
     fn render_history(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let filter = self.history_filter.read(cx).text().to_string();
         let visits = self.store.history(&HistoryQuery {
@@ -614,6 +705,7 @@ impl Shell {
             .flex_col()
             .flex_1()
             .min_h(px(0.))
+            .child(self.render_bookmarks(cx))
             .child(
                 div()
                     .flex()
