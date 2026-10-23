@@ -72,6 +72,11 @@ fn target_for(lines: &[String], r: &str) -> Option<Target> {
     Some(Target { role: el.role.clone(), name: el.name.clone(), nth, matches_params: false })
 }
 
+/// The role and name `r` had in the outline `lines`.
+pub(super) fn seen_as(lines: &[String], r: &str) -> Option<(String, String)> {
+    target_for(lines, r).map(|t| (t.role, t.name))
+}
+
 /// Where the element `r` from the outline `before` is in the outline
 /// `after`, for a ref that went stale because the page re-rendered (7.3):
 /// the element with the same role and name, found the way replays find

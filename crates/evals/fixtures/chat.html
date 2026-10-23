@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Unibrow Test Chat</title>
+<style>
+  body { font-family: sans-serif; margin: 24px; }
+  #log { border: 1px solid #d5dce2; border-radius: 8px; min-height: 80px; padding: 8px; margin-bottom: 12px; }
+  .composer { display: flex; gap: 8px; }
+  textarea { flex: 1; font: inherit; }
+</style>
+</head>
+<body>
+  <h1>Support chat</h1>
+  <div id="log" role="log">Agent: Hi! How can we help?</div>
+  <div class="composer">
+    <textarea id="msg" aria-label="Message" rows="2"></textarea>
+    <button id="send" type="button">Send</button>
+  </div>
+  <script>
+    // No form: script sends on Enter (Shift+Enter is a new line), like most chat boxes.
+    const msg = document.getElementById('msg');
+    const send = () => {
+      if (!msg.value.trim()) return;
+      document.getElementById('log').textContent += '\nMESSAGE SENT: ' + msg.value;
+      msg.value = '';
+    };
+    document.getElementById('send').onclick = send;
+    msg.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
+  </script>
+</body>
+</html>

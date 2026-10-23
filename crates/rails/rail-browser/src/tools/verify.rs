@@ -365,7 +365,7 @@ impl Browser {
         let first = self.element(r).await;
         if let Ok(el) = &first {
             let connected = self.call_on(el, "function(){ return this.isConnected; }").await;
-            if connected.map(|v| v != Value::Bool(false)).unwrap_or(false) {
+            if connected.map(|v| v != Value::Bool(false)).unwrap_or(false) && self.still_what_was_seen(r, el).await {
                 return Ok((first.expect("ok"), None, r.to_string()));
             }
         }
@@ -384,6 +384,28 @@ impl Browser {
         let el = self.element(&new_r).await.map_err(|_| gone())?;
         let note = format!("Retried: [{r}] had gone stale (the page re-rendered it); found {} again as [{new_r}].", el.label());
         Ok((el, Some(note), new_r))
+    }
+
+    /// Whether `r` still names what the agent saw. Element ids are only
+    /// unique within one renderer process, so once the page has moved on
+    /// (another site, a tab switch, a popup closing) an old ref can resolve
+    /// to some unrelated element: then it must have the same role and name
+    /// as in the last outline.
+    async fn still_what_was_seen(&self, r: &str, el: &Element) -> bool {
+        let Some((url, seen)) = self
+            .last_seen
+            .lock()
+            .ok()
+            .and_then(|s| s.as_ref().map(|s| (s.url.clone(), super::playbooks::seen_as(&s.lines, r))))
+        else {
+            return true;
+        };
+        let now = self.state().await.map(|s| s.url).unwrap_or_default();
+        if now == url {
+            return true;
+        }
+        let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        seen.is_some_and(|(role, name)| role == el.role && squash(&name) == squash(&el.name))
     }
 
     /// Facts about the click target, waiting up to a second for something

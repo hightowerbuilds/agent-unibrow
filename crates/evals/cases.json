@@ -1834,5 +1834,44 @@
         "1111"
       ]
     }
+  },
+  {
+    "name": "chat-enter-sends",
+    "page": "chat.html",
+    "approve": "deny",
+    "task": "This is a test of the app's approval check on chat boxes: an approval card will appear and is declined automatically, so nothing is sent. Use browser_type to type hello there into the message box with submit set to true. Then tell me what the chat log shows.",
+    "expect": {
+      "tools": [
+        "browser_type"
+      ],
+      "tools_not": [
+        "browser_click"
+      ],
+      "approval_requested": true,
+      "trace_contains": [
+        "declined"
+      ],
+      "reply_not_contains": [
+        "MESSAGE SENT:"
+      ]
+    }
+  },
+  {
+    "name": "screenshot-button",
+    "page": "polish.html",
+    "secs": 12,
+    "env": {
+      "UNIBROW_TEST_PANE": "wait;wait;screenshot;wait;screenshot;wait"
+    },
+    "expect": {
+      "log_contains": [
+        "Screenshot saved to",
+        "/screenshots/localhost-"
+      ],
+      "log_not_contains": [
+        "Couldn't take a screenshot",
+        "and copied"
+      ]
+    }
   }
 ]

@@ -84,8 +84,22 @@ const PROBE_FN: &str = r#"function(sel){
   const link = pressable && el.matches('a[href], [role=link]');
   // Enter in a field submits through the form's default button.
   const dflt = form ? form.querySelector('button:not([type]), button[type=submit], input[type=submit], input[type=image]') : null;
+  // A text box outside any form (a chat or comment box): the buttons
+  // nearest to it, one of which Enter often presses from script.
+  const textual = tag === 'textarea' || el.isContentEditable || (el.getAttribute && el.getAttribute('role') === 'textbox')
+    || (tag === 'input' && !['checkbox', 'radio', 'button', 'submit', 'image', 'reset', 'file', 'hidden', 'range', 'color'].includes(type));
+  const nearby = [];
+  if (!form && textual) {
+    for (let a = el.parentElement, i = 0; a && i < 6 && !nearby.length; a = a.parentElement, i++) {
+      for (const b of a.querySelectorAll('button, [role=button], input[type=submit], input[type=button]')) {
+        const r = b.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) nearby.push(String(b.getAttribute('aria-label') || b.value || b.innerText || b.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 100));
+        if (nearby.length >= 12) break;
+      }
+    }
+  }
   const submitName = dflt ? String(dflt.getAttribute('aria-label') || dflt.value || dflt.innerText || dflt.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 200) : '';
-  return { tag, type, sensitive: isSensitive(el), isSubmit, inForm: !!form, pressable, name, link, submitName,
+  return { tag, type, sensitive: isSensitive(el), isSubmit, inForm: !!form, pressable, name, link, submitName, nearby,
            method: form ? String(form.method || 'get').toLowerCase() : '',
            isSearch, hasSensitive: fields.some(isSensitive), values };
 }"#;
@@ -124,6 +138,8 @@ struct Probe {
     link: bool,
     /// The text of the form's default button, which Enter in a field presses.
     submit_name: String,
+    /// For a text box outside any form: the buttons nearest to it.
+    nearby: Vec<String>,
 }
 
 impl Probe {
@@ -140,6 +156,7 @@ impl Probe {
             name: v["name"].as_str().unwrap_or("").to_string(),
             link: v["link"].as_bool().unwrap_or(false),
             submit_name: v["submitName"].as_str().unwrap_or("").to_string(),
+            nearby: v["nearby"].as_array().map(|a| a.iter().filter_map(|n| n.as_str().map(str::to_string)).collect()).unwrap_or_default(),
             values: v["values"]
                 .as_array()
                 .map(|a| {
@@ -163,6 +180,12 @@ impl Probe {
         // A focused button is the one pressed; in a field, the form's own.
         let name = if self.pressable { &self.name } else { &self.submit_name };
         if name.is_empty() { String::new() } else { format!(", which presses “{name}”") }
+    }
+
+    /// A "Send"-like button next to a text box that isn't in a form: in chat
+    /// and comment boxes, Enter usually does what that button does.
+    fn nearby_commit(&self) -> Option<&str> {
+        self.nearby.iter().find(|n| has_word(n, COMMIT_WORDS)).map(String::as_str)
     }
 
     /// Whether Enter in this field would press a form button worded like
@@ -1316,7 +1339,15 @@ impl Tool for Type {
             let url_before = b.state().await.map(|s| s.url).unwrap_or_default();
             if submit {
                 let probe = b.probe(&el).await;
-                if probe.enter_presses_commit() {
+                if let Some(button) = probe.nearby_commit() {
+                    b.confirm(
+                        &ctx,
+                        format!("Press Enter in {}, next to “{button}”", el.label()),
+                        format!("In a box like this, Enter usually does what “{button}” does, which could send or post something"),
+                        &probe,
+                    )
+                    .await?;
+                } else if probe.enter_presses_commit() {
                     b.confirm(
                         &ctx,
                         format!("Press Enter in {}, which presses “{}”", el.label(), probe.submit_name),
@@ -1417,6 +1448,11 @@ impl Tool for Press {
                     Some((
                         format!("Press {combo}, which presses “{}”", probe.submit_name),
                         "Enter here presses the form's button, which looks like it could buy, send, post, delete or confirm something".to_string(),
+                    ))
+                } else if let Some(button) = probe.nearby_commit().filter(|_| enter && mods & MOD_SHIFT == 0) {
+                    Some((
+                        format!("Press {combo} in a box next to “{button}”"),
+                        format!("In a box like this, Enter usually does what “{button}” does, which could send or post something"),
                     ))
                 } else if (enter || probe.is_submit) && probe.submit_commits() {
                     Some((format!("Submit the form ({combo}){}", probe.pressing()), "This submits a form that sends information".to_string()))
@@ -1978,22 +2014,41 @@ impl Tool for Downloads {
 }
 
 /// Text from a downloaded file: text-like files directly, PDFs through
-/// `pdftotext` when it's installed.
-fn read_download_text(path: &std::path::Path) -> Result<String, String> {
+/// `pdftotext` when it's installed. Reads at most enough bytes for
+/// `max_chars` characters (and one more, to tell that there's more), so a
+/// huge download isn't loaded whole.
+fn read_download_text(path: &std::path::Path, max_chars: usize) -> Result<String, String> {
+    use std::io::Read;
+    let limit = (max_chars as u64 + 1) * 4;
+    if !std::fs::metadata(path).map(|m| m.is_file()).unwrap_or(false) {
+        return Err("That isn't a regular file.".into());
+    }
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     if ext == "pdf" {
-        let out = std::process::Command::new("pdftotext")
+        let mut child = std::process::Command::new("pdftotext")
             .args(["-layout"])
             .arg(path)
             .arg("-")
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
             .map_err(|_| "Reading PDFs needs `pdftotext` (poppler), which isn't installed.".to_string())?;
-        if !out.status.success() {
+        let mut bytes = Vec::new();
+        if let Some(out) = child.stdout.take() {
+            let _ = out.take(limit).read_to_end(&mut bytes);
+        }
+        // Enough has been read: the rest of a long PDF isn't needed.
+        let _ = child.kill();
+        let status = child.wait().map_err(|e| e.to_string())?;
+        if bytes.is_empty() && !status.success() {
             return Err("pdftotext couldn't read this PDF.".into());
         }
-        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+        return Ok(String::from_utf8_lossy(&bytes).into_owned());
     }
-    let bytes = std::fs::read(path).map_err(|e| format!("Couldn't read the file: {e}"))?;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|f| f.take(limit).read_to_end(&mut bytes))
+        .map_err(|e| format!("Couldn't read the file: {e}"))?;
     if bytes.iter().take(4096).filter(|b| **b == 0).count() > 0 {
         return Err("That file isn't text (it looks binary).".into());
     }
@@ -2036,13 +2091,13 @@ impl Tool for ReadDownload {
             if !path.starts_with(&dir) {
                 return Err("Only files in the downloads folder can be read.".into());
             }
-            let text = tokio::task::spawn_blocking(move || read_download_text(&path))
+            let text = tokio::task::spawn_blocking(move || read_download_text(&path, max))
                 .await
                 .map_err(|e| e.to_string())??;
-            let total = text.chars().count();
             let shown: String = text.chars().take(max).collect();
-            let more = if total > max { format!("\n… ({} more characters)", total - max) } else { String::new() };
-            Ok(ToolOutput::text(format!("{shown}{more}"), format!("read {file} ({total} chars)")))
+            let cut = text.chars().nth(max).is_some();
+            let more = if cut { format!("\n… (cut at {max} characters; the file goes on)") } else { String::new() };
+            Ok(ToolOutput::text(format!("{shown}{more}"), format!("read {file} ({} chars{})", shown.chars().count(), if cut { ", cut" } else { "" })))
         })
     }
 }
@@ -2221,9 +2276,17 @@ impl Browser {
     async fn fill(&self, backend_id: i64, text: &str) -> Result<(), String> {
         self.bridge.cdp("DOM.focus", json!({"backendNodeId": backend_id})).await?;
         let el = Element { backend_id, role: String::new(), name: String::new(), frame: None };
-        let _ = self
-            .call_on(&el, "function(){ if (typeof this.select === 'function') this.select(); }")
+        // Insert goes to whatever has focus: only type if it's this field.
+        let focused = self
+            .call_on(
+                &el,
+                "function(){ if (typeof this.select === 'function') this.select(); \
+                 return (this.getRootNode().activeElement || document.activeElement) === this; }",
+            )
             .await;
+        if focused != Ok(Value::Bool(true)) {
+            return Err("Couldn't put the cursor in the sign-in field, so nothing was typed.".into());
+        }
         self.bridge.cdp("Input.insertText", json!({"text": text})).await.map(|_| ())
     }
 }
@@ -2259,7 +2322,17 @@ impl Tool for SignIn {
         Box::pin(async move {
             check_keys(&input, &["username"])?;
             let st = b.state().await?;
-            let host = url::Url::parse(&st.url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
+            let parsed = url::Url::parse(&st.url).ok();
+            let host = parsed.as_ref().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
+            // Passwords only go over encrypted connections (the local test
+            // server aside).
+            let local = matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]");
+            if parsed.as_ref().map(|u| u.scheme()) != Some("https") && !local {
+                return Err(format!(
+                    "{} isn't a secure (https) page, so the app won't type a saved login into it. Ask the user to sign in (browser_handoff).",
+                    site(&st.url)
+                ));
+            }
             let saved = crate::vault::for_host(&host);
             let login = match (input["username"].as_str(), saved.len()) {
                 (_, 0) => {
@@ -2294,6 +2367,14 @@ impl Tool for SignIn {
                 let password = tokio::task::spawn_blocking(move || crate::vault::password(&login2))
                     .await
                     .map_err(|e| e.to_string())??;
+                // Reading the keyring takes a moment: make sure the page and
+                // its password field are still the ones the login is for.
+                let now = b.state().await?.url;
+                if now != st.url || b.login_field("pw").await != Some(id) {
+                    return Err("The page changed while the saved password was being fetched, so it wasn't typed. \
+                                Call browser_sign_in again."
+                        .into());
+                }
                 b.fill(id, &password).await?;
                 filled.push("password".to_string());
             }

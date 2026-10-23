@@ -1497,6 +1497,33 @@ impl BrowserPane {
         window.focus(&self.address.focus_handle(cx));
     }
 
+    // ------------------------------------------------------- screenshots
+
+    /// Saves what the page shows as a PNG and copies it to the clipboard,
+    /// for the user (the agent has its own browser_screenshot).
+    pub fn take_screenshot(&mut self, cx: &mut Context<Self>) {
+        let Some(v) = self.view() else { return };
+        let rx = v.cdp_call("Page.captureScreenshot", serde_json::json!({"format": "png"}));
+        let site = site_of(&self.chrome.url).unwrap_or_else(|| "page".into());
+        cx.spawn(async move |this, cx| {
+            let shot = match rx.await {
+                Ok(Ok(r)) => Ok(r),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err("the page went away".to_string()),
+            };
+            let result = cx.background_executor().spawn(async move { save_screenshot(&shot?, &site) }).await;
+            let text = result.unwrap_or_else(|e| format!("Couldn't take a screenshot: {e}"));
+            if crate::test_hooks::var("UNIBROW_TEST_PANE").is_some() {
+                eprintln!("pane test: {text}");
+            }
+            let _ = this.update(cx, |pane, cx| {
+                pane.notice = Some((text, Instant::now()));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     // ------------------------------------------------- zoom, sound, reader
 
     /// Zooms the active tab's site in (`direction` > 0), out (< 0) or back
@@ -2051,6 +2078,7 @@ impl BrowserPane {
             .child(div().flex_1().min_w(px(0.)).child(self.address.clone()))
             .children(self.zoom_badge(cx))
             .child(self.reader_button(cx))
+            .child(self.screenshot_button(cx))
             // Nothing to bookmark or focus on the app's own pages.
             .when(!rail_browser::app_pages::is_app_page(&self.chrome.url), |d| {
                 d.child(self.bookmark_button(cx)).child(self.focus_button(cx))
@@ -2337,6 +2365,40 @@ impl BrowserPane {
                 )
         });
         div().flex().flex_col().children(find).children(downloads)
+    }
+
+    /// Saves a picture of the page (and copies it). The icon is a small
+    /// camera drawn with boxes, so it doesn't depend on the font.
+    fn screenshot_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let can = self.view().is_some();
+        let ink = rgb(if can { theme::MUTED } else { theme::RULE });
+        div()
+            .id("screenshot-page")
+            .w(px(28.))
+            .h(px(28.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .when(can, |d| {
+                d.cursor_pointer()
+                    .hover(|s| s.bg(rgb(theme::RAISED)))
+                    .on_click(cx.listener(|this, _, _, cx| this.take_screenshot(cx)))
+            })
+            .child(
+                div()
+                    .relative()
+                    .w(px(16.))
+                    .h(px(12.))
+                    .border_1()
+                    .border_color(ink)
+                    .rounded(px(3.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(div().w(px(6.)).h(px(6.)).border_1().border_color(ink).rounded_full())
+                    .child(div().absolute().top(px(-3.)).left(px(3.)).w(px(5.)).h(px(2.)).bg(ink).rounded_sm()),
+            )
     }
 
     fn bookmark_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3038,6 +3100,7 @@ impl BrowserPane {
                 }
             }
             "reader" => self.toggle_reader(cx),
+            "screenshot" => self.take_screenshot(cx),
             // Types text into the focused field (as committed keyboard input).
             "type" => {
                 if let Some(v) = self.view() {
@@ -3455,6 +3518,60 @@ fn map_button(b: MouseButton) -> Option<rail_browser::MouseButton> {
         MouseButton::Right => Some(rail_browser::MouseButton::Right),
         MouseButton::Navigate(_) => None,
     }
+}
+
+/// Writes a `Page.captureScreenshot` result to the Pictures folder (a test
+/// instance's own folder in tests) and copies it. Returns what to tell the
+/// user.
+fn save_screenshot(shot: &serde_json::Value, site: &str) -> Result<String, String> {
+    use base64::Engine;
+    let data = shot["data"].as_str().ok_or("the page sent no picture")?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data).map_err(|e| e.to_string())?;
+    let test = crate::test_hooks::var("UNIBROW_DATA_DIR");
+    let dir = match &test {
+        Some(d) => std::path::PathBuf::from(d).join("screenshots"),
+        None => dirs::picture_dir().or_else(dirs::home_dir).unwrap_or_else(std::env::temp_dir).join("agent-unibrow"),
+    };
+    std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't make {}: {e}", dir.display()))?;
+    let stem: String = site.chars().map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
+    let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
+    let mut path = dir.join(format!("{stem}-{stamp}.png"));
+    for n in 2.. {
+        if !path.exists() {
+            break;
+        }
+        path = dir.join(format!("{stem}-{stamp}-{n}.png"));
+    }
+    std::fs::write(&path, &bytes).map_err(|e| format!("couldn't save it: {e}"))?;
+    // Never the user's clipboard from a test instance.
+    let copied = test.is_none() && copy_png(&bytes);
+    let shown = match dirs::home_dir().and_then(|h| path.strip_prefix(&h).ok().map(|p| p.to_path_buf())) {
+        Some(rel) => format!("~/{}", rel.display()),
+        None => path.display().to_string(),
+    };
+    Ok(format!("Screenshot saved to {shown}{}", if copied { " and copied" } else { "" }))
+}
+
+/// Puts a PNG on the clipboard with wl-copy (Wayland) or xclip (X11). GPUI's
+/// own clipboard only offers text on Linux.
+fn copy_png(bytes: &[u8]) -> bool {
+    use std::io::Write;
+    let (cmd, args): (&str, &[&str]) = if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        ("wl-copy", &["--type", "image/png"])
+    } else {
+        ("xclip", &["-selection", "clipboard", "-t", "image/png", "-i"])
+    };
+    let Ok(mut child) = std::process::Command::new(cmd)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let wrote = child.stdin.take().is_some_and(|mut i| i.write_all(bytes).is_ok());
+    child.wait().map(|s| s.success()).unwrap_or(false) && wrote
 }
 
 #[cfg(test)]

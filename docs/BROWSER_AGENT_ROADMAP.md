@@ -419,6 +419,7 @@ set path instead of starting from scratch each time.
 
 - Zoom (Ctrl+= / Ctrl+- / Ctrl+0, Ctrl+wheel, per site, toolbar badge; agent clicks stay accurate) — ✅ **COMPLETED**
 - Reader mode (toolbar Reader button, clean article view) — ✅ **COMPLETED**
+- Screenshot button (toolbar camera: saves the visible page as a PNG in ~/Pictures/agent-unibrow and copies it with wl-copy/xclip; eval `screenshot-button`) — ✅ **COMPLETED**
 - Translate page — skipped: Chromium's translate sends page text to Google. Option: the agent translates the extracted article into chat or reader view — todo
 - Spellcheck in fields — blocked: CEF 154 off-screen browsers never report misspellings (dictionary downloads, prefs set); menu wiring ready if it ever does
 - Right-click context menus rendered in-app (links, images, editing, navigation, save as PDF, view source) — ✅ **COMPLETED**
