@@ -2,3 +2,4 @@
 /.cef
 /crates/evals/results
 __pycache__/
+/.claude/worktrees/
