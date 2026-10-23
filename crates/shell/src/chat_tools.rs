@@ -244,10 +244,7 @@ impl Shell {
     /// `UNIBROW_TEST_SHELL` (see the module docs): runs the steps once the
     /// first message's turn is over.
     pub(crate) fn spawn_chat_test(&mut self, cx: &mut Context<Self>) {
-        if std::env::var_os("UNIBROW_DATA_DIR").is_none() {
-            return;
-        }
-        let Ok(spec) = std::env::var("UNIBROW_TEST_SHELL") else { return };
+        let Some(spec) = crate::test_hooks::var("UNIBROW_TEST_SHELL") else { return };
         let steps: Vec<String> = spec.split(';').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
         cx.spawn(async move |this, cx| {
             loop {

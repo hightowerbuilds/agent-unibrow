@@ -125,9 +125,13 @@ function draw(s) {
     row(el('span', { class: 'rowmain' }, icon(p.site), el('span', { class: 'main' }, p.site), el('span', { class: 'meta' }, plural(p.count, 'playbook'))),
       button('Run…', { cmd: 'fill_chat', text: `Run my playbook on ${p.site} for ` }))));
 
-  section('chats', 'Recent chats', 'Your chats with the agent show up here.', s.chats.map((c) =>
-    row(el('span', { class: 'rowmain' }, el('span', { class: 'main' }, c.title || 'Untitled chat'), el('span', { class: 'meta' }, `${plural(c.items, 'message')} · ${ago(c.updated)}`)),
-      button('Open', { cmd: 'show', tab: 'chat' }))));
+  section('chats', 'Recent chats', 'Your chats with the agent show up here.', s.chats.map((c) => {
+    const open = () => cmd({ cmd: 'open_chat', id: c.id });
+    const main = el('a', { href: '#', class: 'rowmain', onclick: (ev) => { ev.preventDefault(); open(); } },
+      el('span', { class: 'main' }, c.title || 'Untitled chat'),
+      el('span', { class: 'meta' }, [plural(c.items, 'message'), ago(c.updated), c.current ? 'open now' : null].filter(Boolean).join(' · ')));
+    return row(main, c.current ? null : button('Open', { cmd: 'open_chat', id: c.id }));
+  }));
 
   drawStatus(s.status);
   drawGuide(s.guide);

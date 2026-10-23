@@ -24,7 +24,7 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
 | --- | --- | --- | --- |
 | H1. A local home page | H1.1–H1.5 | | |
 | H2. Live data | H2.1–H2.4 | | |
-| H3. Acting from the page | H3.1–H3.5 | | |
+| H3. Acting from the page | H3.1–H3.6 | | |
 | H4. The tinkering hub | H4.1–H4.4 | | |
 | H5. Making it yours | H5.1, H5.3–H5.5 | H5.2 | |
 
@@ -307,6 +307,14 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial (started; what is le
 - Eval: `home-jev-learn` (Learn with Jev on home, starting from the test
   shop through the `UNIBROW_TEST_JEV_START` hook: the row turns "Jev
   ready: find…" with no reload).
+
+### H3.6 Open a recent chat — ✅ **COMPLETED**
+- Clicking a chat under Recent chats (or its Open button) shows that
+  conversation in the sidebar (`open_chat`, the same path as the chat
+  strip). The chat in the sidebar is marked "open now". Refused while
+  the agent is working in another chat.
+- Eval: `home-chats` (two chats seeded through `UNIBROW_TEST_CHATS`; one
+  click opens the second).
 
 ### H3.5 Watches and playbooks — ✅ **COMPLETED**
 - Watches show the last value and check, with Check now (marks it due;

@@ -48,8 +48,10 @@ wrap_app! {
             cl.append_switch_with_value(Some(&"password-store".into()), Some(&"basic".into()));
             // Test instances: extra Chromium switches, comma-separated
             // (`mute-audio`, `name=value`), so real sites can be checked
-            // without sound on the user's speakers.
-            if let Ok(extra) = std::env::var("UNIBROW_TEST_SWITCHES") {
+            // without sound on the user's speakers. Only with
+            // `$UNIBROW_DATA_DIR` set, like the shell's other test hooks.
+            let extra = std::env::var_os("UNIBROW_DATA_DIR").and_then(|_| std::env::var("UNIBROW_TEST_SWITCHES").ok());
+            if let Some(extra) = extra {
                 for s in extra.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                     match s.split_once('=') {
                         Some((k, v)) => cl.append_switch_with_value(Some(&k.into()), Some(&v.into())),

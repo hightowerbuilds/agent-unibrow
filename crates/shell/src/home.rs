@@ -56,6 +56,8 @@ pub struct Status {
     pub trace: Vec<(String, String, i64)>,
     /// The settings as saved (no keys are in them).
     pub settings: Value,
+    /// The chat showing in the sidebar.
+    pub chat_id: i64,
 }
 
 /// What the home page can ask the app to do. Anything else is refused.
@@ -68,6 +70,8 @@ pub enum Cmd {
     Show { tab: String, site: Option<String>, page: Option<usize> },
     /// Open one of the app's folders in the file manager.
     OpenFolder { which: String },
+    /// Show a saved chat in the sidebar.
+    OpenChat { id: i64 },
     /// Put text in the chat box without sending it.
     FillChat { text: String },
     /// Send a chat message, as if typed.
@@ -127,6 +131,7 @@ pub fn parse_cmd(v: &Value) -> Result<Cmd, String> {
             Cmd::Show { tab, site, page }
         }
         "fill_chat" => Cmd::FillChat { text: text("text")? },
+        "open_chat" => Cmd::OpenChat { id: id("id")? },
         "ask" => Cmd::Ask { text: text("text")? },
         "set_agent" => {
             let backend = text("backend")?;
@@ -550,7 +555,9 @@ pub fn state(store: &Browsing, chats: Option<&chats::Chats>, status: &Status) ->
         .into_iter()
         .filter(|c| c.items > 0)
         .take(6)
-        .map(|c| json!({"title": c.title, "updated": c.updated.timestamp(), "items": c.items}))
+        .map(|c| {
+            json!({"id": c.id, "title": c.title, "updated": c.updated.timestamp(), "items": c.items, "current": c.id == status.chat_id})
+        })
         .collect();
     let k = status.keys;
     let choices: Vec<Value> = status
@@ -699,6 +706,8 @@ mod tests {
             Cmd::Show { tab: "site".into(), site: Some("sweetwater.com".into()), page: None }
         );
         assert!(p(json!({"cmd": "show", "tab": "explained", "page": 99})).is_err());
+        assert_eq!(p(json!({"cmd": "open_chat", "id": 7})).unwrap(), Cmd::OpenChat { id: 7 });
+        assert!(p(json!({"cmd": "open_chat", "id": "7; drop"})).is_err());
         assert!(p(json!({"cmd": "open_folder", "which": "traces"})).is_ok());
         assert!(p(json!({"cmd": "open_folder", "which": "/etc"})).is_err());
         assert!(p(json!({"cmd": "set_focus_only", "on": false})).is_err());

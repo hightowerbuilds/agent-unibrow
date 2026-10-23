@@ -1704,5 +1704,24 @@
         "Home: removed watch #1"
       ]
     }
+  },
+  {
+    "name": "home-chats",
+    "page": "home",
+    "secs": 18,
+    "env": {
+      "UNIBROW_TEST_CHATS": "Bass nut prices|How much is the bone nut?;Roof shingles|Find architectural shingles",
+      "UNIBROW_TEST_PANE": "wait;wait;js:document.getElementById('chats').scrollIntoView({block:'center'});wait;js:document.getElementById('chats').textContent;clicksel:#chats li:nth-child(2) .rowmain;wait;wait;js:document.getElementById('chats').textContent"
+    },
+    "expect": {
+      "log_contains": [
+        "Roof shingles1 message",
+        "js => Recent chatsRoof shingles1 message · just nowOpenBass nut prices1 message · just now · open now"
+      ],
+      "trace_contains": [
+        "Home: opened the chat “Bass nut prices”",
+        "Opened chat “Bass nut prices”"
+      ]
+    }
   }
 ]

@@ -13,6 +13,7 @@ mod jev_worker;
 mod safety;
 mod site_icons;
 mod task_plan;
+mod test_hooks;
 mod text_input;
 mod theme;
 mod watcher;
@@ -361,6 +362,14 @@ impl Shell {
         if let Some(p) = shell.trace.path().cloned() {
             shell.trace.push(Kind::Info, "Trace file opened", Some(p.display().to_string()));
         }
+        // Test hook: saved chats to start with, "title|message;title|message".
+        if let Some(spec) = test_hooks::var("UNIBROW_TEST_CHATS") {
+            for (title, text) in spec.split(';').filter_map(|c| c.split_once('|')) {
+                let id = shell.chats.create();
+                shell.chats.append(id, "user", text);
+                shell.chats.rename(id, title);
+            }
+        }
         // The home page (homepage H2) reads the stores and the shell's status.
         home::attach(shell.store.clone(), shell.chats.clone());
         shell.check_home_keys(cx);
@@ -401,7 +410,7 @@ impl Shell {
         .detach();
         shell.start_backend(cx);
         // Test hook: press Stop this many seconds after the first message.
-        if let Some(secs) = std::env::var("UNIBROW_AUTOSTOP_SECS").ok().and_then(|s| s.parse::<u64>().ok()) {
+        if let Some(secs) = test_hooks::var("UNIBROW_AUTOSTOP_SECS").and_then(|s| s.parse::<u64>().ok()) {
             cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor().timer(std::time::Duration::from_millis(250)).await;
@@ -415,7 +424,7 @@ impl Shell {
             .detach();
         }
         // Test hook: steer the agent ("secs|text") that long after it starts working.
-        if let Ok(spec) = std::env::var("UNIBROW_AUTOSTEER") {
+        if let Some(spec) = test_hooks::var("UNIBROW_AUTOSTEER") {
             if let Some((secs, text)) = spec.split_once('|').and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.to_string()))) {
                 cx.spawn(async move |this, cx| {
                     loop {
@@ -430,17 +439,15 @@ impl Shell {
                 .detach();
             }
         }
-        // Test hook (isolated test instances only): learn a site with Jev
-        // first, as "site|start address"; an automatic task waits for it.
-        let jev_learn = std::env::var("UNIBROW_TEST_JEV_LEARN")
-            .ok()
-            .filter(|_| std::env::var_os("UNIBROW_DATA_DIR").is_some())
+        // Test hook: learn a site with Jev first, as "site|start address";
+        // an automatic task waits for it.
+        let jev_learn = test_hooks::var("UNIBROW_TEST_JEV_LEARN")
             .and_then(|v| v.split_once('|').map(|(a, b)| (a.to_string(), b.to_string())));
         if let Some((site, start)) = jev_learn.clone() {
             shell.learn_with_jev_from(site, Some(start), cx);
         }
         // Test hook: send a task automatically once the page has loaded.
-        if let Ok(task) = std::env::var("UNIBROW_AUTOSEND") {
+        if let Some(task) = test_hooks::var("UNIBROW_AUTOSEND") {
             let learning = jev_learn.map(|(site, _)| site);
             cx.spawn(async move |this, cx| {
                 if let Some(site) = learning {
@@ -586,11 +593,9 @@ impl Shell {
     }
 
     fn learn_with_jev_from(&mut self, site: String, start: Option<String>, cx: &mut Context<Self>) {
-        // Test hook (isolated test instances only): where learning starts
-        // when nothing else says, since test sites aren't at https://site/.
-        let start = start.or_else(|| {
-            std::env::var_os("UNIBROW_DATA_DIR").and(std::env::var("UNIBROW_TEST_JEV_START").ok())
-        });
+        // Test hook: where learning starts when nothing else says, since
+        // test sites aren't at https://site/.
+        let start = start.or_else(|| test_hooks::var("UNIBROW_TEST_JEV_START"));
         self.jev_progress.insert(site.clone(), "Starting…".into());
         self.trace.push(Kind::Info, format!("Jev is learning {site}"), None);
         let _ = self.jev_jobs.try_send(jev_worker::Job::Learn { site, start });
@@ -675,7 +680,7 @@ impl Shell {
         let mut codes: Option<Arc<dyn router::CodeSource>> = None;
         let notes = if test_instance {
             // Test hook: a fake inbox file stands in for Gmail's codes.
-            if let Ok(path) = std::env::var("UNIBROW_TEST_INBOX") {
+            if let Some(path) = test_hooks::var("UNIBROW_TEST_INBOX") {
                 codes = Some(Arc::new(rail_api::codes::FileCodes(path.into())));
             }
             vec!["Gmail tools off in this test instance".to_string()]
@@ -932,6 +937,7 @@ impl Shell {
                 })
                 .collect(),
             settings: serde_json::to_value(&self.settings).unwrap_or_default(),
+            chat_id: self.chat_id,
         });
         self.browser.update(cx, |b, _| b.refresh_home());
     }
@@ -992,6 +998,19 @@ impl Shell {
                 }
                 Ok(format!("showed {tab}"))
             }
+            Cmd::OpenChat { id } => match self.chats.get(id) {
+                None => Err(format!("there's no chat {id}")),
+                Some(_) if self.busy && id != self.chat_id => {
+                    Err("the agent is working in this chat; let it finish or press Stop first".into())
+                }
+                Some(chat) => {
+                    self.tab = SidebarTab::Chat;
+                    self.sidebar_open = true;
+                    self.switch_chat(id, cx);
+                    self.focus_chat_pending = true;
+                    Ok(format!("opened the chat “{}”", chat.title))
+                }
+            },
             Cmd::FillChat { text } => {
                 self.tab = SidebarTab::Chat;
                 self.sidebar_open = true;
@@ -1199,7 +1218,7 @@ impl Shell {
                 let entry =
                     self.trace.push_with_images(Kind::ApprovalRequested, format!("Approval needed: {reason}"), Some(description.clone()), shot);
                 let image = entry.images.first().map(std::path::PathBuf::from);
-                let auto = std::env::var("UNIBROW_AUTOAPPROVE").ok();
+                let auto = test_hooks::var("UNIBROW_AUTOAPPROVE");
                 match auto.as_deref() {
                     // Test hook: answer approval cards automatically.
                     Some("approve") => {
@@ -2641,6 +2660,7 @@ impl Shell {
         self.trace.push(Kind::Info, format!("Opened chat “{title}”"), None);
         self.start_backend(cx);
         self.scroll_to_bottom();
+        self.publish_home(cx);
         cx.notify();
     }
 
@@ -3061,40 +3081,38 @@ fn main() -> std::process::ExitCode {
         eprintln!("agent-unibrow: history unavailable ({e}); using a temporary store");
         Browsing::in_memory()
     }));
-    // Test hooks (isolated test instances only): pre-save a login,
-    // "site|user|password"; put sites in focus, "site,site".
-    if std::env::var_os("UNIBROW_DATA_DIR").is_some() {
-        if let Ok(sites) = std::env::var("UNIBROW_TEST_FOCUS") {
-            for site in sites.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                store.add_focus(site, site);
+    // Test hooks: pre-save a login, "site|user|password"; put sites in
+    // focus, "site,site".
+    if let Some(sites) = test_hooks::var("UNIBROW_TEST_FOCUS") {
+        for site in sites.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            store.add_focus(site, site);
+        }
+    }
+    // A watch that has been checked once: "url|label|value".
+    if let Some(spec) = test_hooks::var("UNIBROW_TEST_WATCH") {
+        let parts: Vec<&str> = spec.splitn(3, '|').collect();
+        if let [url, label, value] = parts[..] {
+            let w = browsing::NewWatch {
+                url: url.into(),
+                label: label.into(),
+                kind: "text".into(),
+                when: "changes".into(),
+                every_min: 60,
+                ..Default::default()
+            };
+            match store.add_watch(&w) {
+                Ok(id) => {
+                    store.record_watch_check(id, Ok(value.to_string()));
+                }
+                Err(e) => eprintln!("agent-unibrow: test watch not added: {e}"),
             }
         }
-        // A watch that has been checked once: "url|label|value".
-        if let Ok(spec) = std::env::var("UNIBROW_TEST_WATCH") {
-            let parts: Vec<&str> = spec.splitn(3, '|').collect();
-            if let [url, label, value] = parts[..] {
-                let w = browsing::NewWatch {
-                    url: url.into(),
-                    label: label.into(),
-                    kind: "text".into(),
-                    when: "changes".into(),
-                    every_min: 60,
-                    ..Default::default()
-                };
-                match store.add_watch(&w) {
-                    Ok(id) => {
-                        store.record_watch_check(id, Ok(value.to_string()));
-                    }
-                    Err(e) => eprintln!("agent-unibrow: test watch not added: {e}"),
-                }
-            }
-        }
-        if let Ok(spec) = std::env::var("UNIBROW_TEST_LOGIN") {
-            let parts: Vec<&str> = spec.splitn(3, '|').collect();
-            if let [site, user, pass] = parts[..] {
-                if let Err(e) = rail_browser::vault::save(site, user, pass) {
-                    eprintln!("agent-unibrow: test login not saved: {e}");
-                }
+    }
+    if let Some(spec) = test_hooks::var("UNIBROW_TEST_LOGIN") {
+        let parts: Vec<&str> = spec.splitn(3, '|').collect();
+        if let [site, user, pass] = parts[..] {
+            if let Err(e) = rail_browser::vault::save(site, user, pass) {
+                eprintln!("agent-unibrow: test login not saved: {e}");
             }
         }
     }

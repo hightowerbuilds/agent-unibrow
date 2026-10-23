@@ -569,7 +569,7 @@ impl BrowserPane {
             zoom_wheel: 0.0,
             menu: None,
             user_right_click: None,
-            test_steps: std::env::var("UNIBROW_TEST_PANE")
+            test_steps: crate::test_hooks::var("UNIBROW_TEST_PANE")
                 .map(|s| s.split(';').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
                 .unwrap_or_default(),
             test_next: Instant::now() + Duration::from_secs(2),
@@ -771,7 +771,7 @@ impl BrowserPane {
                 }
                 Request::Handoff { message, reply } => {
                     // Test hook: finish handoffs automatically.
-                    let auto = std::env::var("UNIBROW_AUTOHANDOFF").ok();
+                    let auto = crate::test_hooks::var("UNIBROW_AUTOHANDOFF");
                     if let Some(answer) = auto.as_deref().filter(|a| *a == "done" || *a == "later") {
                         let _ = reply.send(Ok(answer == "done"));
                     } else {
@@ -3296,7 +3296,7 @@ impl BrowserPane {
                 ];
                 self.auth = Some(AuthPrompt { tab_id, request: req, user: user.clone(), pass: pass.clone(), _subscriptions: subs });
                 // Test hook: sign in as `user:password` without the UI.
-                if let Some((u, p)) = std::env::var("UNIBROW_TEST_AUTH").ok().as_deref().and_then(|v| v.split_once(':')) {
+                if let Some((u, p)) = crate::test_hooks::var("UNIBROW_TEST_AUTH").as_deref().and_then(|v| v.split_once(':')) {
                     user.update(cx, |t, cx| t.set_text(u, cx));
                     pass.update(cx, |t, cx| t.set_text(p, cx));
                     self.answer_auth(true, cx);
