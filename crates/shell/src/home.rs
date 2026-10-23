@@ -805,9 +805,9 @@ mod tests {
     #[test]
     fn state_has_the_stores_and_no_secrets() {
         let store = Browsing::in_memory();
-        store.record_visit("https://www.sweetwater.com/store/detail/x", "TUSQ nut");
-        store.record_visit("https://www.sweetwater.com/store/detail/y", "Bone nut");
-        store.record_visit("https://example.com/", "Example");
+        store.record_visit(1, "https://www.sweetwater.com/store/detail/x", "TUSQ nut", false);
+        store.record_visit(1, "https://www.sweetwater.com/store/detail/y", "Bone nut", false);
+        store.record_visit(1, "https://example.com/", "Example", false);
         store.add_focus("www.sweetwater.com", "Sweetwater");
         store.toggle_bookmark("https://example.com/", "Example");
         let status = Status {

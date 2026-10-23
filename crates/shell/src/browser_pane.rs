@@ -210,6 +210,9 @@ struct Tab {
     /// The page the tab opened on is in history (later ones are recorded
     /// as the address changes).
     recorded: bool,
+    /// The page at the current address has finished loading. Leaving one
+    /// that hasn't is a redirect, which history folds into the visit.
+    loaded: bool,
 }
 
 /// A tab's sound indicator.
@@ -952,12 +955,14 @@ impl BrowserPane {
             let first_page = !t.recorded && (!chrome.title.is_empty() || (!chrome.loading && chrome != t.chrome));
             if first_page {
                 t.recorded = true;
-                browsing_changed |= self.store.record_visit(&chrome.url, &chrome.title);
+                browsing_changed |= self.store.record_visit(t.id, &chrome.url, &chrome.title, false);
             }
             if chrome != t.chrome {
                 if chrome.url != t.chrome.url {
                     t.recorded = true;
-                    browsing_changed |= self.store.record_visit(&chrome.url, &chrome.title);
+                    let redirect = !t.loaded;
+                    t.loaded = false;
+                    browsing_changed |= self.store.record_visit(t.id, &chrome.url, &chrome.title, redirect);
                 } else if chrome.title != t.chrome.title && !chrome.title.is_empty() {
                     self.store.update_title(&chrome.url, &chrome.title);
                     browsing_changed = true;
@@ -965,6 +970,7 @@ impl BrowserPane {
                 t.chrome = chrome;
                 changed = true;
             }
+            t.loaded |= !t.chrome.loading;
         }
         if browsing_changed {
             cx.emit(BrowsingChanged);
@@ -1231,6 +1237,7 @@ impl BrowserPane {
             audio: Audio::default(),
             reader: None,
             recorded: false,
+            loaded: false,
         });
         if activate {
             self.activate(self.tabs.len() - 1, cx);

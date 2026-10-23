@@ -30,9 +30,9 @@ use std::sync::Mutex;
 /// Revisiting the same URL within this window updates the existing entry
 /// instead of adding a new one (reloads, redirects, title arriving late).
 const MERGE_WINDOW_SECS: i64 = 30 * 60;
-/// A URL change on the same site this soon after the previous visit is a
-/// redirect or an in-page URL rewrite, not a new visit.
-const REDIRECT_WINDOW_SECS: i64 = 5;
+/// A redirect on the same site this soon after the tab's previous visit
+/// replaces that visit instead of adding a new one.
+const REDIRECT_WINDOW_SECS: i64 = 2;
 
 #[derive(Clone, Debug)]
 pub struct Visit {
@@ -148,6 +148,9 @@ pub struct Browsing {
     conn: Mutex<Connection>,
     /// Bumped when a site icon is saved (see [`favicons`]).
     favicon_version: std::sync::atomic::AtomicU64,
+    /// Each tab's latest visit (tab id → visit id), so a redirect replaces
+    /// the visit in its own tab and not another tab's.
+    tab_visits: Mutex<std::collections::HashMap<u32, i64>>,
 }
 
 /// The site a URL belongs to: its host without a leading `www.`.
@@ -241,29 +244,34 @@ impl Browsing {
         jev_sites::init(&conn).map_err(|e| format!("can't set up Jev sites: {e}"))?;
         favicons::init(&conn).map_err(|e| format!("can't set up site icons: {e}"))?;
         home_pins::init(&conn).map_err(|e| format!("can't set up home pins: {e}"))?;
-        Ok(Self { conn: Mutex::new(conn), favicon_version: Default::default() })
+        Ok(Self { conn: Mutex::new(conn), favicon_version: Default::default(), tab_visits: Default::default() })
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().expect("browsing db lock")
     }
 
-    /// Records that `url` is showing. Returns false for pages that aren't
-    /// kept (internal pages).
-    pub fn record_visit(&self, url: &str, title: &str) -> bool {
+    /// Records that `url` is showing in tab `tab`. `redirect` says the page
+    /// the tab is leaving never finished loading (a script or server sent
+    /// it on): then, on the same site and within a moment, the new address
+    /// replaces that tab's previous visit. Returns false for pages that
+    /// aren't kept (internal pages).
+    pub fn record_visit(&self, tab: u32, url: &str, title: &str, redirect: bool) -> bool {
         let Some(site) = site_of(url) else { return false };
         let url = history_url(url);
         let url = url.as_str();
         let now = Local::now().timestamp();
         let c = self.conn();
-        let latest: Option<(i64, String, i64)> = c
-            .query_row("SELECT id, site, at FROM visits ORDER BY at DESC, id DESC LIMIT 1", [], |r| {
+        let mut tab_visits = self.tab_visits.lock().expect("tab visits lock");
+        let previous: Option<(i64, String, i64)> = tab_visits.get(&tab).and_then(|id| {
+            c.query_row("SELECT id, site, at FROM visits WHERE id = ?1", params![id], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })
             .optional()
-            .unwrap_or(None);
-        if let Some((id, last_site, at)) = latest {
-            if last_site == site && now - at <= REDIRECT_WINDOW_SECS {
+            .unwrap_or(None)
+        });
+        if let Some((id, last_site, at)) = previous {
+            if redirect && last_site == site && now - at <= REDIRECT_WINDOW_SECS {
                 // If the page is changing back to a URL that already has a
                 // recent entry, fold into that entry instead of duplicating it.
                 let existing: Option<i64> = c
@@ -276,6 +284,7 @@ impl Browsing {
                     .unwrap_or(None);
                 if let Some(keep) = existing {
                     let _ = c.execute("DELETE FROM visits WHERE id = ?1", params![id]);
+                    tab_visits.insert(tab, keep);
                     let res = if title.is_empty() {
                         c.execute("UPDATE visits SET at = ?1 WHERE id = ?2", params![now, keep])
                     } else {
@@ -310,6 +319,9 @@ impl Browsing {
                 params![url, title, site, now],
             ),
         };
+        if res.is_ok() {
+            tab_visits.insert(tab, recent.unwrap_or_else(|| c.last_insert_rowid()));
+        }
         res.is_ok()
     }
 
@@ -543,7 +555,7 @@ impl Browsing {
 
     /// Makes a watch due now (the agent asked for a fresh check).
     pub fn check_watch_soon(&self, id: i64) {
-        let _ = self.conn().execute("UPDATE watches SET last_checked = NULL WHERE id = ?1 AND last_value IS NOT NULL", params![id]);
+        let _ = self.conn().execute("UPDATE watches SET last_checked = NULL WHERE id = ?1", params![id]);
     }
 
     /// One line naming the focus sites, for the context sent with each message.
@@ -578,11 +590,11 @@ mod tests {
     #[test]
     fn visits_merge_and_search() {
         let b = Browsing::in_memory();
-        assert!(b.record_visit("https://www.sweetwater.com/item", ""));
+        assert!(b.record_visit(1, "https://www.sweetwater.com/item", "", false));
         b.update_title("https://www.sweetwater.com/item", "TUSQ nut | Sweetwater");
-        assert!(b.record_visit("https://www.sweetwater.com/item", "")); // reload: merged
-        assert!(b.record_visit("https://duckduckgo.com/?q=bass", "bass at DuckDuckGo"));
-        assert!(!b.record_visit("about:blank", ""));
+        assert!(b.record_visit(1, "https://www.sweetwater.com/item", "", false)); // reload: merged
+        assert!(b.record_visit(1, "https://duckduckgo.com/?q=bass", "bass at DuckDuckGo", false));
+        assert!(!b.record_visit(1, "about:blank", "", false));
         let all = b.history(&HistoryQuery { limit: 50, ..Default::default() });
         assert_eq!(all.len(), 2);
         let tusq = b.history(&HistoryQuery { text: Some("tusq".into()), limit: 50, ..Default::default() });
@@ -595,37 +607,64 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_on_same_site_merge() {
+    fn redirects_on_same_site_merge() {
         let b = Browsing::in_memory();
-        b.record_visit("https://duckduckgo.com/?q=nut", "nut at DuckDuckGo");
-        b.record_visit("https://duckduckgo.com/?q=nut&ia=web", "nut at DuckDuckGo");
+        b.record_visit(1, "https://duckduckgo.com/?q=nut", "nut at DuckDuckGo", false);
+        b.record_visit(1, "https://duckduckgo.com/?q=nut&ia=web", "nut at DuckDuckGo", true);
         let all = b.history(&HistoryQuery { limit: 10, ..Default::default() });
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].url, "https://duckduckgo.com/?q=nut&ia=web");
         // A different site right after is a new visit.
-        b.record_visit("https://sweetwater.com/x", "");
+        b.record_visit(1, "https://sweetwater.com/x", "", true);
         assert_eq!(b.history(&HistoryQuery { limit: 10, ..Default::default() }).len(), 2);
+    }
+
+    #[test]
+    fn tabs_on_one_site_keep_their_own_visits() {
+        let b = Browsing::in_memory();
+        b.record_visit(1, "https://amazon.com/s?k=nut", "Amazon.com : nut", false);
+        b.record_visit(2, "https://amazon.com/dp/B0", "", true);
+        let all = b.history(&HistoryQuery { limit: 10, ..Default::default() });
+        assert_eq!(all.len(), 2, "{all:?}");
+    }
+
+    #[test]
+    fn clicks_dont_replace_the_page_they_came_from() {
+        let b = Browsing::in_memory();
+        b.record_visit(1, "https://amazon.com/s?k=nut", "Amazon.com : nut", false);
+        // A click on a result right away: the search page had loaded.
+        b.record_visit(1, "https://amazon.com/dp/B0", "", false);
+        assert_eq!(b.history(&HistoryQuery { limit: 10, ..Default::default() }).len(), 2);
+        // A result 3 s later, even one the tab left before it loaded.
+        {
+            let c = b.conn();
+            c.execute("UPDATE visits SET at = at - 3", []).unwrap();
+        }
+        b.record_visit(1, "https://amazon.com/dp/B1", "", true);
+        let all = b.history(&HistoryQuery { limit: 10, ..Default::default() });
+        assert_eq!(all.len(), 3, "{all:?}");
+        assert!(all.iter().any(|v| v.url == "https://amazon.com/s?k=nut"));
     }
 
     #[test]
     fn fragments_and_round_trips_dont_duplicate() {
         let b = Browsing::in_memory();
-        b.record_visit("https://talk.example.io/", "Talk");
+        b.record_visit(1, "https://talk.example.io/", "Talk", false);
         {
             // Pretend that was a minute ago.
             let c = b.conn();
             c.execute("UPDATE visits SET at = at - 60", []).unwrap();
         }
         // In-page anchor: same page.
-        b.record_visit("https://talk.example.io/#a", "Talk");
+        b.record_visit(1, "https://talk.example.io/#a", "Talk", false);
         assert_eq!(b.history(&HistoryQuery { limit: 10, ..Default::default() }).len(), 1);
         // Path change and quick return.
         {
             let c = b.conn();
             c.execute("UPDATE visits SET at = at - 60", []).unwrap();
         }
-        b.record_visit("https://talk.example.io/x", "Talk");
-        b.record_visit("https://talk.example.io/", "Talk");
+        b.record_visit(1, "https://talk.example.io/x", "Talk", false);
+        b.record_visit(1, "https://talk.example.io/", "Talk", true);
         let all = b.history(&HistoryQuery { limit: 10, ..Default::default() });
         assert_eq!(all.len(), 1, "{all:?}");
         assert_eq!(all[0].url, "https://talk.example.io/");
@@ -681,6 +720,26 @@ mod tests {
         assert_eq!(w.last_error.as_deref(), Some("offline"));
         assert!(b.remove_watch(id));
         assert!(b.watches().is_empty());
+    }
+
+    #[test]
+    fn a_failing_watch_can_be_checked_soon() {
+        let b = Browsing::in_memory();
+        let id = b
+            .add_watch(&NewWatch {
+                url: "https://x.test/nut".into(),
+                label: "TUSQ nut".into(),
+                kind: "price".into(),
+                when: "drops".into(),
+                every_min: 60,
+                ..Default::default()
+            })
+            .unwrap();
+        // Every check so far failed: there's no value yet.
+        assert!(b.record_watch_check(id, Err("offline".into())).is_none());
+        assert!(b.due_watches(Local::now().timestamp()).is_empty());
+        b.check_watch_soon(id);
+        assert_eq!(b.due_watches(Local::now().timestamp()).len(), 1);
     }
 
     #[test]
