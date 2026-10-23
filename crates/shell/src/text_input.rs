@@ -524,10 +524,11 @@ impl EntityInputHandler for TextInput {
         self.content = (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..]).into();
         self.marked_range =
             if new_text.is_empty() { None } else { Some(range.start..range.start + new_text.len()) };
+        // The new selection is in UTF-16 units within `new_text`, not the
+        // whole content.
         self.selected_range = new_selected_range_utf16
             .as_ref()
-            .map(|r| self.range_from_utf16(r))
-            .map(|new_range| new_range.start + range.start..new_range.end + range.end)
+            .map(|r| range.start + utf8_offset_in(new_text, r.start)..range.start + utf8_offset_in(new_text, r.end))
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
         cx.notify();
     }
@@ -900,9 +901,29 @@ impl Focusable for TextInput {
     }
 }
 
+/// The byte offset in `text` of a UTF-16 offset, clamped to its end.
+fn utf8_offset_in(text: &str, utf16: usize) -> usize {
+    let mut units = 0;
+    for (i, ch) in text.char_indices() {
+        if units >= utf16 {
+            return i;
+        }
+        units += ch.len_utf16();
+    }
+    text.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ime_selection_is_within_the_new_text() {
+        assert_eq!(utf8_offset_in("日本", 1), 3);
+        assert_eq!(utf8_offset_in("日本", 2), 6);
+        assert_eq!(utf8_offset_in("a😀b", 3), 5);
+        assert_eq!(utf8_offset_in("ab", 9), 2);
+    }
 
     #[test]
     fn pasted_line_breaks_become_spaces() {

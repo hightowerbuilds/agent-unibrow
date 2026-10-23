@@ -15,7 +15,7 @@
 //! The note starts with [`router::INJECTION_MARK`]; the tool host copies
 //! that line into the trace.
 
-use crate::bridge::BrowserBridge;
+use super::Browser;
 use serde_json::{Value, json};
 
 /// Collects candidate texts: words that might start an instruction to an
@@ -46,27 +46,36 @@ const SCAN_JS: &str = r#"(() => {
     if (fg && (fg.a < 0.1 || Math.abs(fg.r - bg.r) + Math.abs(fg.g - bg.g) + Math.abs(fg.b - bg.b) < 40)) return 'same color as the background';
     return '';
   };
+  // The word list is loose (the strict check is done after), so the caps
+  // are generous: a page can't push a hidden instruction past them with a
+  // few harmless mentions of "AI" first.
   const seen = new Set(), out = [];
-  const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
-  let n, budget = 20000;
-  while ((n = walker.nextNode()) && budget-- > 0 && out.length < 40) {
-    const t = n.nodeValue;
-    if (!t || t.length < 6 || !pre.test(t)) continue;
-    let e = n.parentElement;
-    if (!e || ['SCRIPT', 'STYLE'].includes(e.tagName)) continue;
-    // A sentence split by <b> or <a> belongs to its block.
-    while (e.parentElement && e.parentElement !== body && (e.textContent || '').length < 40) e = e.parentElement;
-    if (seen.has(e)) continue;
-    seen.add(e);
-    out.push({ text: (e.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 600), hidden: how(e) });
-  }
-  for (const e of document.querySelectorAll('[aria-label], [alt], [title]')) {
-    if (out.length >= 50) break;
-    for (const a of ['aria-label', 'alt', 'title']) {
-      const v = e.getAttribute(a);
-      if (v && v.length >= 12 && pre.test(v)) out.push({ text: v.replace(/\s+/g, ' ').trim().slice(0, 600), hidden: 'in the ' + a + ' attribute' });
+  let budget = 100000;
+  const scan = (root) => {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+    let n;
+    while ((n = walker.nextNode()) && budget-- > 0 && out.length < 400) {
+      // Open shadow roots are part of the page a person sees.
+      if (n.nodeType === 1) { if (n.shadowRoot) scan(n.shadowRoot); continue; }
+      const t = n.nodeValue;
+      if (!t || t.length < 6 || !pre.test(t)) continue;
+      let e = n.parentElement;
+      if (!e || ['SCRIPT', 'STYLE'].includes(e.tagName)) continue;
+      // A sentence split by <b> or <a> belongs to its block.
+      while (e.parentElement && e.parentElement !== body && (e.textContent || '').length < 40) e = e.parentElement;
+      if (seen.has(e)) continue;
+      seen.add(e);
+      out.push({ text: (e.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 600), hidden: how(e) });
     }
-  }
+    for (const e of root.querySelectorAll('[aria-label], [alt], [title]')) {
+      if (out.length >= 450) break;
+      for (const a of ['aria-label', 'alt', 'title']) {
+        const v = e.getAttribute(a);
+        if (v && v.length >= 12 && pre.test(v)) out.push({ text: v.replace(/\s+/g, ' ').trim().slice(0, 600), hidden: 'in the ' + a + ' attribute' });
+      }
+    }
+  };
+  scan(body);
   return JSON.stringify(out);
 })()"#;
 
@@ -82,24 +91,22 @@ pub(super) struct Finding {
     pub recipients: Vec<String>,
 }
 
-/// The page note for the user's page (`page` = None) or a background page.
-pub(super) async fn note(bridge: &BrowserBridge, page: Option<u32>, url: &str) -> String {
-    let params = json!({"expression": SCAN_JS, "returnByValue": true, "timeout": 3000});
-    let r = match page {
-        Some(id) => bridge.bg_cdp(id, "Runtime.evaluate", params).await,
-        None => bridge.cdp("Runtime.evaluate", params).await,
+/// The page note for the user's page (`page` = None), scanning every frame,
+/// or a background page (its main document).
+pub(super) async fn note(b: &Browser, page: Option<u32>, url: &str) -> String {
+    let results: Vec<Value> = match page {
+        Some(id) => {
+            let params = json!({"expression": SCAN_JS, "returnByValue": true, "timeout": 3000});
+            b.bridge.bg_cdp(id, "Runtime.evaluate", params).await.map(|r| r["result"]["value"].clone()).into_iter().collect()
+        }
+        None => b.eval_in_frames(SCAN_JS, false).await,
     };
-    let candidates: Vec<(String, String)> = r
-        .ok()
-        .and_then(|r| r["result"]["value"].as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()))
-        .and_then(|v| {
-            v.as_array().map(|a| {
-                a.iter()
-                    .filter_map(|c| Some((c["text"].as_str()?.to_string(), c["hidden"].as_str().unwrap_or("").to_string())))
-                    .collect()
-            })
-        })
-        .unwrap_or_default();
+    let candidates: Vec<(String, String)> = results
+        .iter()
+        .filter_map(|v| v.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()))
+        .flat_map(|v| v.as_array().cloned().unwrap_or_default())
+        .filter_map(|c| Some((c["text"].as_str()?.to_string(), c["hidden"].as_str().unwrap_or("").to_string())))
+        .collect();
     let host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
     render(&findings(&candidates, &host))
 }

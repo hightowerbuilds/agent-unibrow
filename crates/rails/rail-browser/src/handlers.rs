@@ -493,7 +493,7 @@ wrap_request_handler! {
             frame: Option<&mut Frame>,
             request: Option<&mut Request>,
             _user_gesture: ::std::os::raw::c_int,
-            _is_redirect: ::std::os::raw::c_int,
+            is_redirect: ::std::os::raw::c_int,
         ) -> ::std::os::raw::c_int {
             let Some(request) = request else { return 0 };
             let url = CefString::from(&request.url()).to_string();
@@ -501,7 +501,7 @@ wrap_request_handler! {
                 return 0;
             }
             let (from, main) = frame.map(|f| (CefString::from(&f.url()).to_string(), f.is_main() == 1)).unwrap_or_default();
-            if crate::app_pages::may_open(&from, main, request.transition_type().get_raw()) {
+            if crate::app_pages::may_open(&from, main, request.transition_type().get_raw(), is_redirect == 1) {
                 return 0;
             }
             eprintln!("agent-unibrow: refused a page's navigation from {from:?} to {url}");

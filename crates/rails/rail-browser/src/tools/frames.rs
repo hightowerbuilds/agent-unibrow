@@ -91,7 +91,7 @@ fn marks_js() -> String {
     )
 }
 
-/// Most frames masked for a screenshot.
+/// Most frames looked into for masking and the injection scan.
 const MASK_FRAMES: usize = 40;
 
 /// Adds (`true`) or removes the style that shows sensitive fields as dots,
@@ -217,14 +217,23 @@ impl Browser {
     /// has, in or out of its process, and in their open shadow roots: for
     /// screenshots, which see what the outline hides (6.4).
     pub(super) async fn mask_sensitive(&self, on: bool) {
-        if on {
+        self.eval_in_frames(&format!("({})({on})", mask_fn()), on).await;
+    }
+
+    /// Runs `expr` in a private script world in every frame the page has
+    /// (up to [`MASK_FRAMES`]), in or out of its process, and returns each
+    /// frame's result value. `attach` first looks for frames attached since
+    /// the last outline.
+    pub(super) async fn eval_in_frames(&self, expr: &str, attach: bool) -> Vec<Value> {
+        if attach {
             self.attach_frames().await;
         }
         let mut sessions: Vec<Option<String>> = vec![None];
         if let Ok(reg) = self.frames.lock() {
             sessions.extend(reg.sessions.values().map(|(s, _)| Some(s.clone())));
         }
-        let expr = format!("({})({on})", mask_fn());
+        let mut out = Vec::new();
+        let mut budget = MASK_FRAMES;
         for session in sessions {
             let Ok(tree) = self.cdp_in(session.as_deref(), "Page.getFrameTree", json!({})).await else { continue };
             let mut ids = Vec::new();
@@ -235,7 +244,10 @@ impl Browser {
                 }
                 stack.extend(node["childFrames"].as_array().into_iter().flatten());
             }
-            for id in ids.into_iter().take(MASK_FRAMES) {
+            for id in ids {
+                if budget == 0 {
+                    return out;
+                }
                 // A frame from another process fails here; its own session
                 // covers it.
                 let Ok(w) = self
@@ -245,9 +257,14 @@ impl Browser {
                     continue;
                 };
                 let Some(ctx) = w["executionContextId"].as_i64() else { continue };
-                let _ = self.cdp_in(session.as_deref(), "Runtime.evaluate", json!({"expression": expr, "contextId": ctx})).await;
+                budget -= 1;
+                let params = json!({"expression": expr, "contextId": ctx, "returnByValue": true, "timeout": 3000});
+                if let Ok(r) = self.cdp_in(session.as_deref(), "Runtime.evaluate", params).await {
+                    out.push(r["result"]["value"].clone());
+                }
             }
         }
+        out
     }
 
     /// Keeps the child-session list current from DevTools events, and asks

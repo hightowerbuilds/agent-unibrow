@@ -588,7 +588,13 @@ impl WebView {
             let _ = reply.send(Err("the page is closed".into()));
             return;
         };
-        self.cdp_pending.borrow_mut().insert(id, reply);
+        {
+            let mut pending = self.cdp_pending.borrow_mut();
+            // Callers that gave up waiting (the bridge's timeout) dropped
+            // their end: forget those instead of keeping them forever.
+            pending.retain(|_, r| !r.is_canceled());
+            pending.insert(id, reply);
+        }
         if host.send_dev_tools_message(Some(msg.as_bytes())) == 0 {
             if let Some(reply) = self.cdp_pending.borrow_mut().remove(&id) {
                 let _ = reply.send(Err("Chromium rejected the DevTools message".into()));

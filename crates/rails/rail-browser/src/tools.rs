@@ -577,7 +577,19 @@ impl Browser {
         let st = self.state().await?;
         let mut params = json!({"format": "jpeg", "quality": quality, "captureBeyondViewport": false});
         if scale < 1.0 {
-            params["clip"] = json!({"x": 0, "y": 0, "width": st.width.max(1), "height": st.height.max(1), "scale": scale});
+            // The clip is in page coordinates: start where the page is
+            // scrolled to, or a scrolled page gives a picture of its top.
+            let at = self
+                .bridge
+                .cdp("Runtime.evaluate", json!({"expression": "[visualViewport.pageLeft, visualViewport.pageTop]", "returnByValue": true}))
+                .await
+                .ok()
+                .and_then(|r| r["result"]["value"].as_array().map(|a| a.iter().filter_map(Value::as_f64).collect::<Vec<_>>()));
+            let (x, y) = match at.as_deref() {
+                Some([x, y]) => (*x, *y),
+                _ => (0.0, 0.0),
+            };
+            params["clip"] = json!({"x": x, "y": y, "width": st.width.max(1), "height": st.height.max(1), "scale": scale});
         }
         // Sensitive fields are masked as dots for the capture (6.4).
         let data = self.capture_masked(params).await?;
@@ -766,7 +778,7 @@ impl Browser {
             .and_then(|r| r["result"]["value"].as_str().and_then(|s| serde_json::from_str(s).ok()))
             .unwrap_or(Value::Null);
         // Text planted for AI agents (6.5); never removes anything.
-        let mut notes = injection::note(&self.bridge, None, url).await;
+        let mut notes = injection::note(self, None, url).await;
         // A permission request waits for the user (4.2); the agent can't answer it.
         if let Some(p) = self.state().await.ok().and_then(|s| s.permission_prompt) {
             notes.push_str(&format!(

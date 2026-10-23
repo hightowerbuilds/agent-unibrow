@@ -28,13 +28,16 @@ pub fn is_app_page(url: &str) -> bool {
 /// navigation's CEF transition type. The app's own loads (address bar, new
 /// tab, the shell: explicit), reloads and Back/Forward may; so may the
 /// app's pages themselves. Links, scripts, forms and redirects from web
-/// pages may not, and no subframe may.
-pub fn may_open(from: &str, main_frame: bool, transition: u32) -> bool {
+/// pages may not, and no subframe may. A server redirect never may: app
+/// pages don't redirect, so one always comes from a website (and `from`,
+/// the page still showing, says nothing about where it came from).
+pub fn may_open(from: &str, main_frame: bool, transition: u32, server_redirect: bool) -> bool {
     const SOURCE_MASK: u32 = 0xFF;
     const EXPLICIT: u32 = 1;
     const RELOAD: u32 = 8;
     const FORWARD_BACK: u32 = 0x0100_0000;
-    if !main_frame {
+    const SERVER_REDIRECT: u32 = 0x4000_0000;
+    if !main_frame || server_redirect || transition & SERVER_REDIRECT != 0 {
         return false;
     }
     is_app_page(from) || matches!(transition & SOURCE_MASK, EXPLICIT | RELOAD) || transition & FORWARD_BACK != 0
@@ -329,13 +332,17 @@ mod tests {
     #[test]
     fn only_the_app_navigates_to_its_pages() {
         let (link, explicit, form, back_link) = (0, 1, 7, 0x0100_0000);
-        assert!(may_open("https://example.com/", true, explicit));
-        assert!(may_open("https://example.com/", true, back_link));
-        assert!(may_open("unibrow://home/", true, link));
-        assert!(!may_open("https://example.com/", true, link));
-        assert!(!may_open("https://example.com/", true, form));
-        assert!(!may_open("about:blank", true, link));
-        assert!(!may_open("https://example.com/", false, explicit));
+        assert!(may_open("https://example.com/", true, explicit, false));
+        assert!(may_open("https://example.com/", true, back_link, false));
+        assert!(may_open("unibrow://home/", true, link, false));
+        assert!(!may_open("https://example.com/", true, link, false));
+        assert!(!may_open("https://example.com/", true, form, false));
+        assert!(!may_open("about:blank", true, link, false));
+        assert!(!may_open("https://example.com/", false, explicit, false));
+        // A website's 302 to an app page, even during a load the user
+        // started from the home page.
+        assert!(!may_open("unibrow://home/", true, explicit, true));
+        assert!(!may_open("https://example.com/", true, explicit | 0x4000_0000, false));
     }
 
     #[test]

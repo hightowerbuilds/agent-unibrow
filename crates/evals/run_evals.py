@@ -92,6 +92,13 @@ class QuietHandler(http.server.SimpleHTTPRequestHandler):
         super().end_headers()
 
     def do_GET(self):
+        # /redirect-home: a website redirecting to the app's own page.
+        if self.path == "/redirect-home":
+            self.send_response(302)
+            self.send_header("Location", "unibrow://home/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         # /auth/<page>: the page behind an HTTP Basic sign-in.
         if self.path.startswith("/auth/"):
             if self.headers.get("Authorization") != AUTH_OK:

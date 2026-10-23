@@ -450,12 +450,12 @@ impl Tool for Extract {
                     let url = http_url(raw)?;
                     let page = BgPage::open(&b.bridge, &url).await?;
                     let v = page.eval(args).await?;
-                    (v, super::injection::note(&b.bridge, Some(page.id), &url).await)
+                    (v, super::injection::note(&b, Some(page.id), &url).await)
                 }
                 None => {
                     let v = b.extract_here(args).await?;
                     let url = s(&v, "url").to_string();
-                    (v, super::injection::note(&b.bridge, None, &url).await)
+                    (v, super::injection::note(&b, None, &url).await)
                 }
             };
             let count = match what.as_str() {
