@@ -83,7 +83,7 @@ impl Gmail {
             let subject = mime::header(&first["payload"], "Subject").unwrap_or("(no subject)");
             let last_from = mime::header(&last["payload"], "From").unwrap_or("?");
             let last_date = mime::header(&last["payload"], "Date").unwrap_or("?");
-            let last_is_me = last_from.to_lowercase().contains(&me);
+            let last_is_me = is_me(last_from, &me);
             let unread = last["labelIds"].as_array().is_some_and(|l| l.iter().any(|x| x == "UNREAD"));
             lines.push(format!(
                 "- thread_id={id} | subject: {subject} | {n} msg | last from: {last_from} | {last_date}{who}{unread} | snippet: {snippet}",
@@ -142,13 +142,13 @@ impl Gmail {
         let msgs = t["messages"].as_array().cloned().unwrap_or_default();
         let last = msgs.last().ok_or("thread has no messages")?;
         let p = &last["payload"];
-        let from = mime::header(p, "Reply-To").or_else(|| mime::header(p, "From")).unwrap_or("").to_string();
-        let to = if from.to_lowercase().contains(&me) {
-            // Following up on our own message: keep its recipients.
-            mime::header(p, "To").unwrap_or("").to_string()
-        } else {
-            from
-        };
+        let (to, cc) = reply_recipients(
+            &me,
+            mime::header(p, "From").unwrap_or(""),
+            mime::header(p, "Reply-To"),
+            mime::header(p, "To").unwrap_or(""),
+            mime::header(p, "Cc").unwrap_or(""),
+        );
         let subject = mime::header(p, "Subject").unwrap_or("").to_string();
         let subject = if subject.to_lowercase().starts_with("re:") { subject } else { format!("Re: {subject}") };
         let message_id = mime::header(p, "Message-ID").map(str::to_string);
@@ -157,10 +157,7 @@ impl Gmail {
             (None, Some(id)) => Some(id.clone()),
             _ => None,
         };
-        let cc: Vec<String> = mime::header(p, "Cc")
-            .map(|c| split_addresses(c).into_iter().filter(|a| !a.to_lowercase().contains(&me)).collect())
-            .unwrap_or_default();
-        Ok(ReplyContext { to: split_addresses(&to), cc, subject, message_id, references })
+        Ok(ReplyContext { to, cc, subject, message_id, references })
     }
 
     async fn create_reply_draft(&self, a: ReplyDraftArgs) -> Result<ToolOutput, String> {
@@ -332,6 +329,49 @@ fn check_recipients(to: &[String], cc: &[String]) -> Result<(), String> {
         )),
         None => Ok(()),
     }
+}
+
+/// The address in one entry of a header someone else wrote, for comparing:
+/// lowercased, the part in `<…>` when there is one. Looser than
+/// [`single_address`], which is for what the agent sends.
+fn entry_address(entry: &str) -> String {
+    single_address(entry).unwrap_or_else(|| {
+        let s = entry.trim();
+        match (s.rfind('<'), s.rfind('>')) {
+            (Some(a), Some(b)) if b > a => s[a + 1..b].trim().to_lowercase(),
+            _ => s.to_lowercase(),
+        }
+    })
+}
+
+/// Whether an address header names the user's address `me` exactly
+/// (`ryan@x.com` is not `an@x.com`).
+fn is_me(header: &str, me: &str) -> bool {
+    split_addresses(header).iter().any(|e| entry_address(e) == me)
+}
+
+/// Default `to` and `cc` of a reply to a message with these headers.
+/// Replying to someone else: to the sender (or their Reply-To), Cc the
+/// message's other To and Cc recipients. Following up on the user's own
+/// message: to its To, Cc its Cc. The user is left out (unless they wrote
+/// only to themselves), and so is anyone already listed.
+fn reply_recipients(me: &str, from: &str, reply_to: Option<&str>, to: &str, cc: &str) -> (Vec<String>, Vec<String>) {
+    let mine = is_me(from, me);
+    let (to_list, others) = if mine {
+        (split_addresses(to), split_addresses(cc))
+    } else {
+        let sender = reply_to.filter(|r| !r.trim().is_empty()).unwrap_or(from);
+        (split_addresses(sender), split_addresses(to).into_iter().chain(split_addresses(cc)).collect())
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut to_out: Vec<String> =
+        to_list.iter().filter(|e| entry_address(e) != me && seen.insert(entry_address(e))).cloned().collect();
+    if to_out.is_empty() {
+        // A note to self.
+        to_out = to_list.into_iter().filter(|e| seen.insert(entry_address(e))).collect();
+    }
+    let cc_out = others.into_iter().filter(|e| entry_address(e) != me && seen.insert(entry_address(e))).collect();
+    (to_out, cc_out)
 }
 
 // ---------------------------------------------------------------- tool args
@@ -630,6 +670,48 @@ mod tests {
         let v = split_addresses("\"Hightower, Luke\" <luke@x.com>, zack@y.com");
         assert_eq!(v, vec!["\"Hightower, Luke\" <luke@x.com>", "zack@y.com"]);
         assert_eq!(single_address(&v[0]).as_deref(), Some("luke@x.com"));
+    }
+
+    #[test]
+    fn recognises_the_user_exactly() {
+        let me = "an@gmail.com";
+        assert!(is_me("an@gmail.com", me));
+        assert!(is_me("An <AN@gmail.com>", me));
+        assert!(is_me("\"Hightower, An\" <an@gmail.com>", me));
+        assert!(!is_me("ryan@gmail.com", me));
+        assert!(!is_me("Ryan <ryan@gmail.com>", me));
+        assert!(!is_me("an@gmail.com.evil.net", me));
+        assert!(!is_me("", me));
+    }
+
+    #[test]
+    fn reply_all_keeps_everyone_but_the_user() {
+        let me = "me@x.com";
+        // From someone else: to the sender, Cc the rest of To and Cc.
+        let (to, cc) = reply_recipients(
+            me,
+            "Ann <ann@x.com>",
+            None,
+            "Me <me@x.com>, Bob <bob@x.com>, ann@x.com",
+            "Cat <cat@x.com>, BOB@x.com, ryan@x.com",
+        );
+        assert_eq!(to, vec!["Ann <ann@x.com>"]);
+        assert_eq!(cc, vec!["Bob <bob@x.com>", "Cat <cat@x.com>", "ryan@x.com"]);
+        // Reply-To wins over From.
+        let (to, cc) = reply_recipients(me, "ann@x.com", Some("list@x.com"), "me@x.com", "");
+        assert_eq!(to, vec!["list@x.com"]);
+        assert!(cc.is_empty());
+        // Following up on the user's own message: its To and Cc.
+        let (to, cc) = reply_recipients(me, "Me <me@x.com>", None, "bob@x.com, me@x.com", "cat@x.com, bob@x.com");
+        assert_eq!(to, vec!["bob@x.com"]);
+        assert_eq!(cc, vec!["cat@x.com"]);
+        // A note to self stays one.
+        let (to, cc) = reply_recipients(me, "me@x.com", None, "Me <me@x.com>", "");
+        assert_eq!(to, vec!["Me <me@x.com>"]);
+        assert!(cc.is_empty());
+        // `an@` is not the user `ryan@` sent to.
+        let (to, _) = reply_recipients("an@x.com", "ryan@x.com", None, "an@x.com", "");
+        assert_eq!(to, vec!["ryan@x.com"]);
     }
 
     #[test]

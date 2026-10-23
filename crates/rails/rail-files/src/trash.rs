@@ -24,15 +24,22 @@ fn encode(path: &Path) -> String {
     out
 }
 
-/// `report.pdf`, then `report.2.pdf`, `report.3.pdf`...
+/// Longest name for an item in the Trash: its `<name>.trashinfo` must fit
+/// in a file name too (255 bytes on Linux file systems).
+const MAX_NAME: usize = 255 - ".trashinfo".len();
+
+/// `report.pdf`, then `report.2.pdf`, `report.3.pdf`... A name too long
+/// for the Trash keeps its extension and number and loses the end of its
+/// stem.
 fn candidate(name: &str, n: u32) -> String {
-    if n < 2 {
-        return name.to_string();
-    }
-    match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => format!("{stem}.{n}.{ext}"),
-        _ => format!("{name}.{n}"),
-    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && ext.len() <= 32 => (stem, format!(".{ext}")),
+        _ => (name, String::new()),
+    };
+    let number = if n < 2 { String::new() } else { format!(".{n}") };
+    let room = MAX_NAME.saturating_sub(number.len() + ext.len());
+    let stem = &stem[..stem.floor_char_boundary(room)];
+    format!("{stem}{number}{ext}")
 }
 
 /// Where an item went.
@@ -153,5 +160,32 @@ mod tests {
         assert_eq!(candidate("Makefile", 2), "Makefile.2");
         assert_eq!(candidate(".env", 2), ".env.2");
         assert_eq!(encode(Path::new("/home/a b/ü.txt")), "/home/a%20b/%C3%BC.txt");
+        // Long names are cut on a character boundary, keeping the number
+        // and extension.
+        let long = format!("{}.txt", "é".repeat(125));
+        for n in [1, 2, 300] {
+            let c = candidate(&long, n);
+            assert!(c.len() <= MAX_NAME, "{n}: {} bytes", c.len());
+            assert!(c.ends_with(&if n < 2 { ".txt".to_string() } else { format!(".{n}.txt") }), "{c}");
+        }
+        assert_ne!(candidate(&long, 2), candidate(&long, 3));
+    }
+
+    #[test]
+    fn long_names_fit_in_the_trash() {
+        let dir = scratch("trash-long");
+        let trash_dir = dir.join("Trash");
+        // 254 bytes: fits as a file name, but not with ".trashinfo" added.
+        let name = format!("{}.txt", "é".repeat(125));
+        for round in 0..2 {
+            let file = dir.join(&name);
+            std::fs::write(&file, format!("v{round}")).unwrap();
+            let Trashed::At(dest) = trash(&file, &trash_dir, false).unwrap() else { panic!("gio") };
+            assert!(!file.exists());
+            assert_eq!(std::fs::read_to_string(&dest).unwrap(), format!("v{round}"));
+            let item = dest.file_name().unwrap().to_str().unwrap().to_string();
+            assert!(trash_dir.join("info").join(format!("{item}.trashinfo")).exists());
+        }
+        assert_eq!(std::fs::read_dir(trash_dir.join("files")).unwrap().count(), 2);
     }
 }

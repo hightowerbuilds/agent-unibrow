@@ -57,6 +57,23 @@ struct TokenResponse {
     refresh_token: Option<String>,
 }
 
+/// Why a refresh didn't give an access token.
+enum Refresh {
+    /// Google no longer accepts the refresh token; only signing in again helps.
+    Revoked,
+    /// Anything else: no connection, a server error, a bad response.
+    Failed(String),
+}
+
+/// Whether a failed refresh means the refresh token is no good (revoked,
+/// expired, or for another client) rather than a passing problem.
+fn refresh_token_revoked(status: u16, body: &str) -> bool {
+    let error = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["error"].as_str().map(str::to_string));
+    status == 401 || (status == 400 && error.as_deref().map_or(body.contains("invalid_grant"), |e| e == "invalid_grant"))
+}
+
 struct Cached {
     token: String,
     expires: Instant,
@@ -98,7 +115,10 @@ impl GoogleAuth {
             Some(refresh) => match self.refresh(&refresh).await {
                 Ok(t) => t,
                 // Revoked or expired refresh token: sign in again.
-                Err(_) => self.consent().await?,
+                Err(Refresh::Revoked) => self.consent().await?,
+                // Offline, or Google having trouble: signing in again
+                // wouldn't help, so say so instead of opening the browser.
+                Err(Refresh::Failed(e)) => return Err(format!("Couldn't reach Google to refresh sign-in: {e}; try again.")),
             },
             None => self.consent().await?,
         };
@@ -126,7 +146,7 @@ impl GoogleAuth {
         Ok(())
     }
 
-    async fn refresh(&self, refresh_token: &str) -> Result<TokenResponse, String> {
+    async fn refresh(&self, refresh_token: &str) -> Result<TokenResponse, Refresh> {
         let resp = self
             .http
             .post(&self.client.token_uri)
@@ -138,11 +158,17 @@ impl GoogleAuth {
             ])
             .send()
             .await
-            .map_err(|e| format!("token refresh failed: {e}"))?;
+            .map_err(|e| Refresh::Failed(e.to_string()))?;
+        let status = resp.status().as_u16();
         if !resp.status().is_success() {
-            return Err(format!("token refresh rejected: {}", resp.text().await.unwrap_or_default()));
+            let body = resp.text().await.unwrap_or_default();
+            return Err(if refresh_token_revoked(status, &body) {
+                Refresh::Revoked
+            } else {
+                Refresh::Failed(format!("HTTP {status}: {}", body.trim().chars().take(300).collect::<String>()))
+            });
         }
-        resp.json().await.map_err(|e| format!("bad token response: {e}"))
+        resp.json().await.map_err(|e| Refresh::Failed(format!("bad token response: {e}")))
     }
 
     /// Opens the browser to Google's consent screen and waits for the redirect.
@@ -205,28 +231,20 @@ impl GoogleAuth {
     }
 }
 
-/// Serves the loopback redirect until a request carries `code` (or `error`).
+/// Serves the loopback redirect until a request carries our `state` and
+/// either `code` or `error`. Anything else (a stray path, a bad request, a
+/// wrong or missing state) gets an error page and is otherwise ignored, so
+/// it can't end the sign-in; the caller's timeout bounds the wait.
 async fn wait_for_code(listener: &tokio::net::TcpListener, state: &str) -> Result<String, String> {
     loop {
         let (mut sock, _) = listener.accept().await.map_err(|e| e.to_string())?;
         let mut buf = vec![0u8; 8192];
-        let n = sock.read(&mut buf).await.unwrap_or(0);
-        let req = String::from_utf8_lossy(&buf[..n]);
-        let path = req.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("/");
-        let url = url::Url::parse(&format!("http://localhost{path}")).map_err(|e| e.to_string())?;
-        let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
-
-        let (status, body, outcome) = if let Some(err) = q.get("error") {
-            ("400 Bad Request", format!("Sign-in failed: {err}. You can close this tab."), Some(Err(format!("Google sign-in failed: {err}"))))
-        } else if let Some(code) = q.get("code") {
-            if q.get("state").map(String::as_str) != Some(state) {
-                ("400 Bad Request", "State mismatch. Close this tab and try again.".to_string(), Some(Err("sign-in state mismatch".to_string())))
-            } else {
-                ("200 OK", "agent-unibrow is signed in to Gmail. You can close this tab.".to_string(), Some(Ok(code.clone())))
-            }
-        } else {
-            ("404 Not Found", String::new(), None) // favicon and the like
+        // A connection that never sends a request mustn't hold up the rest.
+        let n = match tokio::time::timeout(Duration::from_secs(10), sock.read(&mut buf)).await {
+            Ok(Ok(n)) => n,
+            _ => continue,
         };
+        let (status, body, outcome) = redirect_outcome(&String::from_utf8_lossy(&buf[..n]), state);
         let html = format!(
             "<!doctype html><meta charset=utf-8><title>agent-unibrow</title><body style=\"font:16px system-ui;padding:40px\">{body}</body>"
         );
@@ -239,6 +257,34 @@ async fn wait_for_code(listener: &tokio::net::TcpListener, state: &str) -> Resul
         if let Some(outcome) = outcome {
             return outcome;
         }
+    }
+}
+
+/// The reply to one request at the loopback redirect (status line and page
+/// text) and, for the redirect itself, how the sign-in ended.
+fn redirect_outcome(req: &str, state: &str) -> (&'static str, String, Option<Result<String, String>>) {
+    let target = req.lines().next().and_then(|l| match l.split_whitespace().collect::<Vec<_>>()[..] {
+        [_, target, version] if version.starts_with("HTTP/") && target.starts_with('/') => Some(target),
+        _ => None,
+    });
+    let Some(url) = target.and_then(|t| url::Url::parse(&format!("http://localhost{t}")).ok()) else {
+        return ("400 Bad Request", String::new(), None);
+    };
+    if url.path() != "/" {
+        return ("404 Not Found", String::new(), None); // favicon and the like
+    }
+    let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+    if q.get("state").map(String::as_str) != Some(state) {
+        return ("400 Bad Request", "This isn't the sign-in agent-unibrow is waiting for. Close this tab.".into(), None);
+    }
+    if let Some(err) = q.get("error") {
+        // Shown on the page, so only plain characters.
+        let shown: String = err.chars().filter(|c| c.is_ascii_alphanumeric() || "_-. ".contains(*c)).take(100).collect();
+        ("400 Bad Request", format!("Sign-in failed: {shown}. You can close this tab."), Some(Err(format!("Google sign-in failed: {err}"))))
+    } else if let Some(code) = q.get("code") {
+        ("200 OK", "agent-unibrow is signed in to Gmail. You can close this tab.".into(), Some(Ok(code.clone())))
+    } else {
+        ("400 Bad Request", String::new(), None)
     }
 }
 
@@ -258,4 +304,64 @@ fn load_refresh_token() -> Option<String> {
 
 fn store_refresh_token(token: &str) -> Result<(), String> {
     entry()?.set_password(token).map_err(|e| format!("could not save the Google token to the keyring: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_revoked_token_means_signing_in_again() {
+        assert!(refresh_token_revoked(400, r#"{"error": "invalid_grant", "error_description": "Token has been expired or revoked."}"#));
+        assert!(refresh_token_revoked(401, r#"{"error": "unauthorized_client"}"#));
+        assert!(refresh_token_revoked(400, "invalid_grant"));
+        assert!(!refresh_token_revoked(400, r#"{"error": "invalid_request"}"#));
+        assert!(!refresh_token_revoked(500, r#"{"error": "internal_failure"}"#));
+        assert!(!refresh_token_revoked(503, "invalid_grant"));
+        assert!(!refresh_token_revoked(429, ""));
+    }
+
+    #[test]
+    fn redirect_requests() {
+        let get = |target: &str| format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        let ok = redirect_outcome(&get("/?state=s1&code=abc&scope=x"), "s1");
+        assert_eq!((ok.0, ok.2), ("200 OK", Some(Ok("abc".to_string()))));
+        let denied = redirect_outcome(&get("/?state=s1&error=access_denied"), "s1");
+        assert!(matches!(denied.2, Some(Err(e)) if e.contains("access_denied")));
+        // None of these end the sign-in.
+        for req in [
+            get("/?state=other&code=abc"),
+            get("/?code=abc"),
+            get("/?state=other&error=access_denied"),
+            get("/favicon.ico"),
+            get("/x?state=s1&code=abc"),
+            get("/?state=s1"),
+            "garbage".to_string(),
+            "GET http://[::1 HTTP/1.1\r\n".to_string(),
+            String::new(),
+        ] {
+            assert!(redirect_outcome(&req, "s1").2.is_none(), "{req:?} ended the sign-in");
+        }
+    }
+
+    #[tokio::test]
+    async fn stray_requests_dont_end_the_wait() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let send = |req: &'static str| async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            s.write_all(req.as_bytes()).await.unwrap();
+            let mut reply = String::new();
+            let _ = s.read_to_string(&mut reply).await;
+            reply
+        };
+        let client = async {
+            assert!(send("GET /?state=wrong&code=evil HTTP/1.1\r\n\r\n").await.starts_with("HTTP/1.1 400"));
+            assert!(send("nonsense\r\n\r\n").await.starts_with("HTTP/1.1 400"));
+            assert!(send("GET /favicon.ico HTTP/1.1\r\n\r\n").await.starts_with("HTTP/1.1 404"));
+            assert!(send("GET /?state=right&code=good HTTP/1.1\r\n\r\n").await.starts_with("HTTP/1.1 200"));
+        };
+        let (code, ()) = tokio::join!(wait_for_code(&listener, "right"), client);
+        assert_eq!(code.unwrap(), "good");
+    }
 }
