@@ -95,8 +95,8 @@ impl Client {
         })
     }
 
-    /// Sends one request, retrying transient failures that happen before
-    /// the stream opens.
+    /// Sends one request, retrying transient failures before or during the
+    /// stream (see [`after_failure`]).
     pub async fn stream(
         &self,
         system: &str,
@@ -106,19 +106,38 @@ impl Client {
     ) -> Result<Completed, ApiError> {
         let body = self.body(system, tools, messages);
         let mut attempt = 0u32;
-        let response = loop {
+        loop {
             attempt += 1;
-            match self.open(&body).await {
-                Ok(r) => break r,
-                Err(ApiError::Retryable(m)) if attempt < 4 => {
-                    let wait = Duration::from_millis(1000 * 2u64.pow(attempt - 1));
+            // What this attempt has put on screen.
+            let mut shown = false;
+            let mut text_shown = false;
+            let result = match self.open(&body).await {
+                Ok(response) => {
+                    let mut live = |l: Live<'_>| {
+                        shown = true;
+                        text_shown |= matches!(l, Live::Text(t) if !t.is_empty());
+                        on_live(l);
+                    };
+                    read_stream(response, &mut live).await
+                }
+                Err(e) => Err(e),
+            };
+            let error = match result {
+                Ok(done) => return Ok(done),
+                Err(e) => e,
+            };
+            match after_failure(error, attempt, text_shown) {
+                Next::Retry(wait, m) => {
                     eprintln!("agent-core: retrying in {wait:?} after: {m}");
+                    if shown {
+                        // Progress notes from this attempt will show again.
+                        on_live(Live::Note(format!("Retrying after an error: {m}")));
+                    }
                     tokio::time::sleep(wait).await;
                 }
-                Err(e) => return Err(e),
+                Next::GiveUp(e) => return Err(e),
             }
-        };
-        read_stream(response, &mut on_live).await
+        }
     }
 
     async fn open(&self, body: &Value) -> Result<reqwest::Response, ApiError> {
@@ -148,6 +167,36 @@ impl Client {
         } else {
             Err(ApiError::Fatal(msg))
         }
+    }
+}
+
+/// Tries per request, counting the first.
+const MAX_ATTEMPTS: u32 = 4;
+
+/// What to do after an attempt failed.
+#[derive(Debug)]
+enum Next {
+    /// Wait this long, then send the request again. Carries the error.
+    Retry(Duration, String),
+    GiveUp(ApiError),
+}
+
+/// Retries a transient error, whether the request failed to open or the
+/// stream broke afterwards, with exponential backoff. Not once reply text
+/// has reached the screen, though: a retry would show it twice. The final
+/// error says whether retries were made.
+fn after_failure(error: ApiError, attempt: u32, text_shown: bool) -> Next {
+    match error {
+        ApiError::Retryable(m) if text_shown => {
+            Next::GiveUp(ApiError::Retryable(format!("{m} (the reply broke off partway, so it wasn't retried)")))
+        }
+        ApiError::Retryable(m) if attempt < MAX_ATTEMPTS => {
+            Next::Retry(Duration::from_millis(1000 * 2u64.pow(attempt - 1)), m)
+        }
+        ApiError::Retryable(m) if attempt > 1 => {
+            Next::GiveUp(ApiError::Retryable(format!("{m} (gave up after {attempt} tries)")))
+        }
+        e => Next::GiveUp(e),
     }
 }
 
@@ -277,5 +326,49 @@ fn merge(into: &mut Value, from: &Value) {
                 a.insert(k.clone(), v.clone());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn overloaded() -> ApiError {
+        ApiError::Retryable("stream error (overloaded_error): Overloaded".into())
+    }
+
+    #[test]
+    fn retries_a_mid_stream_error_before_any_text() {
+        for attempt in 1..MAX_ATTEMPTS {
+            match after_failure(overloaded(), attempt, false) {
+                Next::Retry(wait, _) => assert_eq!(wait, Duration::from_millis(1000 << (attempt - 1))),
+                other => panic!("attempt {attempt}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn gives_up_after_the_last_try_and_says_so() {
+        let Next::GiveUp(ApiError::Retryable(m)) = after_failure(overloaded(), MAX_ATTEMPTS, false) else {
+            panic!("expected to give up");
+        };
+        assert!(m.ends_with(&format!("(gave up after {MAX_ATTEMPTS} tries)")), "{m}");
+    }
+
+    #[test]
+    fn no_retry_once_text_is_on_screen() {
+        let Next::GiveUp(ApiError::Retryable(m)) = after_failure(overloaded(), 1, true) else {
+            panic!("expected to give up");
+        };
+        assert!(m.contains("wasn't retried"), "{m}");
+        assert!(!m.contains("gave up after"), "{m}");
+    }
+
+    #[test]
+    fn fatal_errors_pass_through() {
+        let Next::GiveUp(ApiError::Fatal(m)) = after_failure(ApiError::Fatal("API 400: bad".into()), 1, false) else {
+            panic!("expected a fatal error");
+        };
+        assert_eq!(m, "API 400: bad");
     }
 }
