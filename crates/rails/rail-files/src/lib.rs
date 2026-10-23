@@ -124,12 +124,20 @@ fn needs_context(tool: &str) -> BoxFuture<'static, ToolResult> {
     Box::pin(async move { Err(msg) })
 }
 
+/// For a pipe, socket or device: reading one could wait forever.
+fn not_a_file(cfg: &Config, path: &Path) -> String {
+    format!("{} isn't a regular file (it's a pipe, socket or device), so it can't be read or changed here.", cfg.show(path))
+}
+
 /// Reads a text file whole for changing it, refusing what can't be
 /// changed safely as text.
 fn read_text_for_change(cfg: &Config, path: &Path) -> Result<String, String> {
     let meta = std::fs::metadata(path).map_err(|_| format!("There's no file at {}.", cfg.show(path)))?;
     if meta.is_dir() {
         return Err(format!("{} is a folder, not a file.", cfg.show(path)));
+    }
+    if !meta.is_file() {
+        return Err(not_a_file(cfg, path));
     }
     if meta.len() > MAX_TEXT {
         return Err(format!("{} is too big to change here ({}).", cfg.show(path), diff::size(meta.len())));
@@ -146,11 +154,8 @@ fn read_text_for_change(cfg: &Config, path: &Path) -> Result<String, String> {
 fn replace_contents(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
     let dir = path.parent().ok_or("no parent folder")?;
-    let name = path.file_name().ok_or("no file name")?.to_string_lossy();
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    let tmp = dir.join(format!(".{name}.unibrow-{}-{nanos}.tmp", std::process::id()));
+    let (tmp, mut f) = create_temp(dir).map_err(|e| format!("Couldn't write the file: {e}"))?;
     let result = (|| {
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
         if let Ok(meta) = std::fs::metadata(path) {
@@ -162,6 +167,74 @@ fn replace_contents(path: &Path, bytes: &[u8]) -> Result<(), String> {
         let _ = std::fs::remove_file(&tmp);
     }
     result.map_err(|e| format!("Couldn't write the file: {e}"))
+}
+
+/// A new, empty hidden file in `dir` to write before renaming it into
+/// place. The name is short and random, not built from the target's, so it
+/// fits wherever the target's name does.
+fn create_temp(dir: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    use std::hash::{BuildHasher, Hasher};
+    let mut tries = 0;
+    loop {
+        // A fresh RandomState is randomly keyed; the time and process mix
+        // in more.
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+        h.write_u32(std::process::id());
+        let tmp = dir.join(format!(".unibrow-{:016x}.tmp", h.finish()));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(f) => return Ok((tmp, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 8 => tries += 1,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Moves a file to another drive: copies it to a temporary name next to
+/// `to`, puts that in place only if nothing has appeared at `to`, then
+/// removes the original. A failed copy leaves nothing behind.
+fn move_across(from: &Path, to: &Path) -> Result<(), String> {
+    let dir = to.parent().ok_or("no parent folder")?;
+    let (tmp, mut dst) = create_temp(dir).map_err(|e| format!("Couldn't copy it there: {e}. Nothing was moved."))?;
+    let copied = (|| -> std::io::Result<()> {
+        let mut src = std::fs::File::open(from)?;
+        std::io::copy(&mut src, &mut dst)?;
+        let meta = src.metadata()?;
+        dst.set_permissions(meta.permissions())?;
+        if let Ok(t) = meta.modified() {
+            let _ = dst.set_modified(t);
+        }
+        dst.sync_all()
+    })();
+    drop(dst);
+    let placed = copied
+        .map_err(|e| format!("Couldn't copy it there: {e}. Nothing was moved."))
+        .and_then(|()| place_new(&tmp, to));
+    if let Err(e) = placed {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::remove_file(from).map_err(|e| format!("Copied, but couldn't remove the original: {e}"))
+}
+
+/// Renames `tmp` to `to`, refusing if something is at `to` already.
+fn place_new(tmp: &Path, to: &Path) -> Result<(), String> {
+    let appeared = || "Something appeared at the destination while copying; nothing was moved.".to_string();
+    // A hard link fails if `to` exists, with no gap between check and move.
+    match std::fs::hard_link(tmp, to) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(tmp);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(appeared()),
+        // Drives without hard links (FAT, exFAT): check, then rename.
+        Err(_) => {
+            if std::fs::symlink_metadata(to).is_ok() {
+                return Err(appeared());
+            }
+            std::fs::rename(tmp, to).map_err(|e| format!("Couldn't put it in place: {e}. Nothing was moved."))
+        }
+    }
 }
 
 /// Writes a file that mustn't exist yet.
@@ -292,6 +365,9 @@ fn read_text(cfg: &Config, path: &Path) -> Result<String, String> {
     if meta.is_dir() {
         return Err(format!("{} is a folder. Use file_list to see what's in it.", cfg.show(path)));
     }
+    if !meta.is_file() {
+        return Err(not_a_file(cfg, path));
+    }
     if meta.len() > MAX_READ {
         return Err(format!("{} is too big to read ({}).", cfg.show(path), diff::size(meta.len())));
     }
@@ -379,7 +455,23 @@ impl Tool for ReadFile {
             let mut last = offset - 1;
             for (i, line) in lines.iter().enumerate().skip(offset - 1).take(limit) {
                 let row = format!("{:>6}\t{line}\n", i + 1);
-                if out.len() + row.len() > max_chars && i + 1 > offset {
+                if out.len() + row.len() > max_chars {
+                    if i + 1 > offset {
+                        break;
+                    }
+                    // The first line alone is too long (minified code, a
+                    // PDF without line breaks): show the start of it.
+                    // Leaves space for the line number and the notes below.
+                    let room = max_chars.saturating_sub(out.len() + 200);
+                    let cut = line.floor_char_boundary(room);
+                    out.push_str(&format!("{:>6}\t{}…\n", i + 1, &line[..cut]));
+                    out.push_str(&format!(
+                        "(line {} was cut: only its first {} of {} are shown.)\n",
+                        i + 1,
+                        diff::size(cut as u64),
+                        diff::size(line.len() as u64)
+                    ));
+                    last = i + 1;
                     break;
                 }
                 out.push_str(&row);
@@ -601,29 +693,44 @@ impl WriteFile {
         let new_size = diff::size(content.len() as u64);
         match std::fs::metadata(&path) {
             Ok(m) if m.is_dir() => Err(format!("{show} is a folder.")),
+            Ok(m) if !m.is_file() => Err(not_a_file(&cfg, &path)),
             Ok(m) => {
+                let old_size = diff::size(m.len());
                 if !overwrite {
                     return Err(format!(
-                        "{show} already exists ({}). To replace all of it, call again with overwrite: true (the \
-                         user is asked first), or use file_edit to change part of it.",
-                        diff::size(m.len())
+                        "{show} already exists ({old_size}). To replace all of it, call again with overwrite: true \
+                         (the user is asked first), or use file_edit to change part of it."
                     ));
                 }
-                let old = std::fs::read(&path).map_err(|e| format!("Couldn't read {show}: {e}"))?;
-                let shown_diff = match std::str::from_utf8(&old) {
-                    Ok(text) if !looks_binary(&old) && old.len() as u64 <= MAX_TEXT => {
-                        diff::preview(text, &content, CARD_LINES)
-                    }
-                    _ => "(the current contents aren't text; not shown)".to_string(),
+                // A big file isn't read for the diff; a change to it while
+                // waiting shows in its size and time instead.
+                let (old, shown_diff) = if m.len() > MAX_TEXT {
+                    (None, format!("(this replaces a {old_size} file; its contents aren't shown)"))
+                } else {
+                    let old = std::fs::read(&path).map_err(|e| format!("Couldn't read {show}: {e}"))?;
+                    let shown_diff = match std::str::from_utf8(&old) {
+                        Ok(text) if !looks_binary(&old) => diff::preview(text, &content, CARD_LINES),
+                        _ => "(the current contents aren't text; not shown)".to_string(),
+                    };
+                    (Some(old), shown_diff)
                 };
-                let card = format!("Replace {show} ({} → {new_size})\n{shown_diff}", diff::size(old.len() as u64));
+                let stamp = (m.len(), m.modified().ok());
+                let card = format!("Replace {show} ({old_size} → {new_size})\n{shown_diff}");
                 let (p, c) = (path.clone(), content.clone());
                 Ok(Plan {
                     card,
                     reason: "file_write replaces a file on your computer".into(),
                     ask: true,
                     apply: Box::new(move || {
-                        if std::fs::read(&p).ok().as_deref() != Some(&old[..]) {
+                        let now = std::fs::metadata(&p).ok().filter(|n| n.is_file());
+                        let unchanged = match &old {
+                            Some(old) => {
+                                now.is_some_and(|n| n.len() == old.len() as u64)
+                                    && std::fs::read(&p).ok().as_deref() == Some(&old[..])
+                            }
+                            None => now.is_some_and(|n| (n.len(), n.modified().ok()) == stamp),
+                        };
+                        if !unchanged {
                             return Err("The file changed while waiting for approval; nothing was written. Read it again.".into());
                         }
                         replace_contents(&p, c.as_bytes())?;
@@ -859,10 +966,7 @@ impl MoveFile {
                 match std::fs::rename(&from, &to) {
                     Ok(()) => {}
                     // Another drive: copy, then remove the original.
-                    Err(e) if e.raw_os_error() == Some(18) && meta.is_file() => {
-                        std::fs::copy(&from, &to).map_err(|e| format!("Couldn't copy it there: {e}"))?;
-                        std::fs::remove_file(&from).map_err(|e| format!("Copied, but couldn't remove the original: {e}"))?;
-                    }
+                    Err(e) if e.raw_os_error() == Some(18) && meta.is_file() => move_across(&from, &to)?,
                     Err(e) if e.raw_os_error() == Some(18) => {
                         return Err("Folders can't be moved to another drive here; nothing was moved.".into());
                     }

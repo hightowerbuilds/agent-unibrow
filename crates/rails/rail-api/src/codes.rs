@@ -42,7 +42,6 @@ pub fn extract_code(subject: &str, body: &str) -> Option<String> {
 
 fn candidates(text: &str, in_subject: bool) -> Vec<Candidate> {
     let chars: Vec<char> = text.chars().collect();
-    let lower: Vec<char> = text.to_lowercase().chars().collect();
     let mut out = Vec::new();
     let mut i = 0;
     while i < chars.len() {
@@ -96,8 +95,10 @@ fn candidates(text: &str, in_subject: bool) -> Vec<Candidate> {
         if len == 4 && (digits.starts_with("19") || digits.starts_with("20")) {
             score -= 4; // a year
         }
-        let window: String = lower[start.saturating_sub(60)..start].iter().collect();
-        let ahead: String = lower[j.min(lower.len())..(j + 40).min(lower.len())].iter().collect();
+        // Lowercased after slicing: lowercasing can lengthen text ("İ" is
+        // two chars lowercased), so it wouldn't line up with `chars`.
+        let window = chars[start.saturating_sub(60)..start].iter().collect::<String>().to_lowercase();
+        let ahead = chars[j..(j + 40).min(chars.len())].iter().collect::<String>().to_lowercase();
         if KEYWORDS.iter().any(|k| window.contains(k)) {
             score += 3;
         } else if KEYWORDS.iter().any(|k| ahead.contains(k)) {
@@ -204,6 +205,16 @@ mod tests {
             extract_code("Confirm your email", "Order #A1234567 from 2026. Your confirmation code: 905521"),
             Some("905521".into())
         );
+    }
+
+    #[test]
+    fn text_that_lengthens_when_lowercased() {
+        // "İ" lowercases to two chars; the keyword window must still be
+        // the text just before the number.
+        let body = format!("{} Your code: 482913", "İ".repeat(50));
+        assert_eq!(extract_code("", &body), Some("482913".into()));
+        let body = format!("Use 7731 as your one-time PIN {}", "İ".repeat(50));
+        assert_eq!(extract_code("", &body), Some("7731".into()));
     }
 
     #[test]

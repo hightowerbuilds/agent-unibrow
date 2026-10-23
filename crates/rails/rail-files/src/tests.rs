@@ -171,3 +171,77 @@ async fn move_mkdir_read_list_and_search() {
     let found = tool(&cfg, "file_search").call(json!({"name": "*.txt"})).await.unwrap();
     assert!(found.content.contains("pancakes.txt"), "{}", found.content);
 }
+
+#[tokio::test]
+async fn replacing_a_big_file_doesnt_read_it() {
+    let (data, cfg) = sandbox("bigwrite");
+    let f = data.join("files/huge.log");
+    // Sparse: big by its size, nothing on disk.
+    std::fs::File::create(&f).unwrap().set_len(MAX_TEXT + 1024 * 1024).unwrap();
+    let (r, cards) = run(&cfg, "file_write", json!({"path": "huge.log", "content": "short now\n", "overwrite": true}), true).await;
+    r.unwrap();
+    assert!(cards[0].contains("replaces a 6.0 MB file") && !cards[0].contains("- "), "{}", cards[0]);
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "short now\n");
+}
+
+#[tokio::test]
+async fn a_long_first_line_is_cut() {
+    let (data, cfg) = sandbox("longline");
+    std::fs::write(data.join("files/min.js"), format!("{}\nsecond\n", "é".repeat(100_000))).unwrap();
+    let read = tool(&cfg, "file_read").call(json!({"path": "min.js", "max_chars": 2000})).await.unwrap();
+    assert!(read.content.len() <= 2000, "{} bytes", read.content.len());
+    assert!(read.content.contains("line 1 was cut"), "{}", read.content);
+    assert!(read.content.contains("Pass offset: 2"), "{}", read.content);
+    // Later lines are left for the next read.
+    let read = tool(&cfg, "file_read").call(json!({"path": "min.js", "offset": 2})).await.unwrap();
+    assert!(read.content.contains("     2\tsecond"), "{}", read.content);
+}
+
+#[tokio::test]
+async fn pipes_and_sockets_arent_read() {
+    let (data, cfg) = sandbox("special");
+    let _sock = std::os::unix::net::UnixListener::bind(data.join("files/app.sock")).unwrap();
+    let r = tool(&cfg, "file_read").call(json!({"path": "app.sock"})).await;
+    assert!(r.unwrap_err().contains("isn't a regular file"));
+    let (r, cards) = run(&cfg, "file_edit", json!({"path": "app.sock", "old_text": "a", "new_text": "b"}), true).await;
+    assert!(r.unwrap_err().contains("isn't a regular file") && cards.is_empty());
+    let (r, cards) = run(&cfg, "file_write", json!({"path": "app.sock", "content": "x", "overwrite": true}), true).await;
+    assert!(r.unwrap_err().contains("isn't a regular file") && cards.is_empty());
+}
+
+#[test]
+fn moving_across_drives_never_leaves_a_partial_file() {
+    let (data, _) = sandbox("across");
+    let dir = data.join("files");
+    let (from, to) = (dir.join("a.txt"), dir.join("b.txt"));
+    std::fs::write(&from, "hello").unwrap();
+    move_across(&from, &to).unwrap();
+    assert!(!from.exists());
+    assert_eq!(std::fs::read_to_string(&to).unwrap(), "hello");
+
+    // Something appeared at the destination: it stays, and so does the original.
+    std::fs::write(&from, "new").unwrap();
+    assert!(move_across(&from, &to).unwrap_err().contains("appeared"));
+    assert_eq!(std::fs::read_to_string(&to).unwrap(), "hello");
+    assert_eq!(std::fs::read_to_string(&from).unwrap(), "new");
+
+    // A failed copy leaves nothing behind.
+    assert!(move_across(&dir.join("missing.txt"), &dir.join("c.txt")).is_err());
+    let mut left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+    left.sort();
+    assert_eq!(left, ["a.txt", "b.txt"]);
+}
+
+#[tokio::test]
+async fn long_file_names_can_be_replaced() {
+    let (data, cfg) = sandbox("longname");
+    // 250 bytes: room for the name, but not for one built from it.
+    let name = format!("{}.txt", "n".repeat(246));
+    std::fs::write(data.join("files").join(&name), "old\n").unwrap();
+    let (r, _) = run(&cfg, "file_write", json!({"path": name.clone(), "content": "new\n", "overwrite": true}), true).await;
+    r.unwrap();
+    let (r, _) = run(&cfg, "file_edit", json!({"path": name.clone(), "old_text": "new", "new_text": "newer"}), true).await;
+    r.unwrap();
+    assert_eq!(std::fs::read_to_string(data.join("files").join(&name)).unwrap(), "newer\n");
+    assert_eq!(std::fs::read_dir(data.join("files")).unwrap().count(), 1, "a temporary file was left behind");
+}
