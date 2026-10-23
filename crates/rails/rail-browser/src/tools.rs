@@ -157,6 +157,14 @@ impl Probe {
         self.in_form && !self.is_search && (self.method == "post" || self.has_sensitive)
     }
 
+    /// The form button that Enter presses, for the approval card's label
+    /// (where the spending guard also looks for words like "Checkout").
+    fn pressing(&self) -> String {
+        // A focused button is the one pressed; in a field, the form's own.
+        let name = if self.pressable { &self.name } else { &self.submit_name };
+        if name.is_empty() { String::new() } else { format!(", which presses “{name}”") }
+    }
+
     /// Whether Enter in this field would press a form button worded like
     /// "Place order" or "Send", whatever the form's method.
     fn enter_presses_commit(&self) -> bool {
@@ -1317,7 +1325,13 @@ impl Tool for Type {
                     )
                     .await?;
                 } else if probe.submit_commits() {
-                    b.confirm(&ctx, format!("Submit the form from {}", el.label()), "Pressing Enter submits a form that sends information".into(), &probe).await?;
+                    b.confirm(
+                        &ctx,
+                        format!("Submit the form from {}{}", el.label(), probe.pressing()),
+                        "Pressing Enter submits a form that sends information".into(),
+                        &probe,
+                    )
+                    .await?;
                 }
                 b.key(&parse_keys("Enter")?.0, 0).await?;
             }
@@ -1405,7 +1419,7 @@ impl Tool for Press {
                         "Enter here presses the form's button, which looks like it could buy, send, post, delete or confirm something".to_string(),
                     ))
                 } else if (enter || probe.is_submit) && probe.submit_commits() {
-                    Some((format!("Submit the form ({combo})"), "This submits a form that sends information".to_string()))
+                    Some((format!("Submit the form ({combo}){}", probe.pressing()), "This submits a form that sends information".to_string()))
                 } else {
                     None
                 };

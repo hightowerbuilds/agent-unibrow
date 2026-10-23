@@ -1,0 +1,29 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Unibrow Test Shop – Payment</title>
+<style>
+  body { font-family: sans-serif; margin: 24px; }
+  iframe { display: block; width: 420px; height: 120px; border: 1px solid #d5dce2; border-radius: 8px; margin: 16px 0; }
+  input { font: 20px monospace; padding: 6px; width: 320px; }
+</style>
+</head>
+<body>
+  <h1>Payment</h1>
+  <p>Card details (secure partner frame):</p>
+  <iframe id="card" title="Card details (partner site)"></iframe>
+  <p>Backup card (in a widget):</p>
+  <div id="widget"></div>
+  <script>
+    // A different host on the same port: another site, so Chromium puts it
+    // in its own process (an out-of-process iframe).
+    const other = location.hostname === '127.0.0.1' ? 'localhost' : '127.0.0.1';
+    document.getElementById('card').src = `${location.protocol}//${other}:${location.port}/card-field.html`;
+    // A card field inside an open shadow root.
+    const root = document.getElementById('widget').attachShadow({ mode: 'open' });
+    root.innerHTML = '<style>input { font: 20px monospace; padding: 6px; width: 320px; }</style>' +
+      '<input aria-label="Backup card number" autocomplete="cc-number" value="5555 4444 3333 1111">';
+  </script>
+</body>
+</html>

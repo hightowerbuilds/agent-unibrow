@@ -91,6 +91,33 @@ fn marks_js() -> String {
     )
 }
 
+/// Most frames masked for a screenshot.
+const MASK_FRAMES: usize = 40;
+
+/// Adds (`true`) or removes the style that shows sensitive fields as dots,
+/// in a document and its open shadow roots.
+fn mask_fn() -> String {
+    let css = format!("{SENSITIVE_SELECTOR} {{ -webkit-text-security: disc !important; }}");
+    format!(
+        r#"(on) => {{
+  const id = '__unibrow_mask', css = {css};
+  const visit = (root) => {{
+    let s = root.getElementById(id);
+    if (on && !s) {{
+      s = document.createElement('style');
+      s.id = id;
+      (root === document ? (document.head || document.documentElement) : root).appendChild(s);
+    }}
+    if (s) {{ if (on) s.textContent = css; else s.remove(); }}
+    const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+    for (let n = w.currentNode; n; n = w.nextNode()) {{ if (n.shadowRoot) visit(n.shadowRoot); }}
+  }};
+  visit(document);
+}}"#,
+        css = serde_json::to_string(&css).unwrap_or_default()
+    )
+}
+
 /// One document to fetch: where its commands go and what it's called.
 struct Doc {
     /// Index in the `FrameInput` list being built.
@@ -183,6 +210,43 @@ impl Browser {
             let _ = self
                 .cdp_in(session.as_deref(), "DOM.scrollIntoViewIfNeeded", json!({"backendNodeId": backend}))
                 .await;
+        }
+    }
+
+    /// Shows sensitive fields as dots (or stops), in every frame the page
+    /// has, in or out of its process, and in their open shadow roots: for
+    /// screenshots, which see what the outline hides (6.4).
+    pub(super) async fn mask_sensitive(&self, on: bool) {
+        if on {
+            self.attach_frames().await;
+        }
+        let mut sessions: Vec<Option<String>> = vec![None];
+        if let Ok(reg) = self.frames.lock() {
+            sessions.extend(reg.sessions.values().map(|(s, _)| Some(s.clone())));
+        }
+        let expr = format!("({})({on})", mask_fn());
+        for session in sessions {
+            let Ok(tree) = self.cdp_in(session.as_deref(), "Page.getFrameTree", json!({})).await else { continue };
+            let mut ids = Vec::new();
+            let mut stack = vec![&tree["frameTree"]];
+            while let Some(node) = stack.pop() {
+                if let Some(id) = node["frame"]["id"].as_str() {
+                    ids.push(id.to_string());
+                }
+                stack.extend(node["childFrames"].as_array().into_iter().flatten());
+            }
+            for id in ids.into_iter().take(MASK_FRAMES) {
+                // A frame from another process fails here; its own session
+                // covers it.
+                let Ok(w) = self
+                    .cdp_in(session.as_deref(), "Page.createIsolatedWorld", json!({"frameId": id, "worldName": "unibrow"}))
+                    .await
+                else {
+                    continue;
+                };
+                let Some(ctx) = w["executionContextId"].as_i64() else { continue };
+                let _ = self.cdp_in(session.as_deref(), "Runtime.evaluate", json!({"expression": expr, "contextId": ctx})).await;
+            }
         }
     }
 

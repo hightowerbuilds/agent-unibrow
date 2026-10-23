@@ -9,7 +9,7 @@
 //! fields are masked as dots in every capture, as for the page screenshot
 //! (roadmap 6.4).
 
-use super::{Browser, SENSITIVE_SELECTOR, Screenshot, check_keys, site};
+use super::{Browser, Screenshot, check_keys, site};
 use crate::bridge::Rect;
 use futures::future::BoxFuture;
 use router::{Effect, Tool, ToolImage, ToolOutput, ToolResult};
@@ -77,18 +77,9 @@ impl Browser {
     /// `Page.captureScreenshot` with `params`, sensitive fields masked as
     /// dots while it's taken (6.4). Returns the base64 image data.
     pub(super) async fn capture_masked(&self, params: Value) -> Result<String, String> {
-        let css = format!("{SENSITIVE_SELECTOR} {{ -webkit-text-security: disc !important; }}");
-        let mask = format!(
-            "(() => {{ let s = document.getElementById('__unibrow_mask'); if (!s) {{ s = document.createElement('style'); \
-             s.id = '__unibrow_mask'; (document.head || document.documentElement).appendChild(s); }} s.textContent = {}; }})()",
-            serde_json::to_string(&css).unwrap_or_default()
-        );
-        let _ = self.bridge.cdp("Runtime.evaluate", json!({"expression": mask})).await;
+        self.mask_sensitive(true).await;
         let r = self.bridge.cdp("Page.captureScreenshot", params).await;
-        let _ = self
-            .bridge
-            .cdp("Runtime.evaluate", json!({"expression": "document.getElementById('__unibrow_mask')?.remove()"}))
-            .await;
+        self.mask_sensitive(false).await;
         Ok(r?["data"].as_str().ok_or("no screenshot data")?.to_string())
     }
 

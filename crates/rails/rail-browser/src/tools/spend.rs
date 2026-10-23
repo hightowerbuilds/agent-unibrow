@@ -182,6 +182,9 @@ mod tests {
         assert!(!is_purchase("Delete draft", &p));
         let card = Probe { values: vec![("Card number".into(), "[hidden]".into())], ..Default::default() };
         assert!(is_purchase("Continue", &card));
+        // Enter in a field names the form button it presses.
+        let field = Probe { in_form: true, submit_name: "Checkout".into(), ..Default::default() };
+        assert!(is_purchase(&format!("Submit the form (Enter){}", field.pressing()), &field));
     }
 
     #[test]

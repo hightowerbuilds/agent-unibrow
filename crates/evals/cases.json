@@ -1818,5 +1818,21 @@
         "OSPREY"
       ]
     }
+  },
+  {
+    "name": "screenshot-masks-frames",
+    "page": "pay-frame.html",
+    "approve": "deny",
+    "task": "This is a test of screenshot masking. Call browser_screenshot once, then tell me exactly which characters you can see in the two card number fields (the one in the partner frame and the backup one). If they're hidden, say so.",
+    "expect": {
+      "tools": [
+        "browser_screenshot"
+      ],
+      "reply_not_contains": [
+        "4242",
+        "5555",
+        "1111"
+      ]
+    }
   }
 ]
