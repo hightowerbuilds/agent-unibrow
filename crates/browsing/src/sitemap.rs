@@ -155,6 +155,158 @@ fn words(s: &str) -> Vec<String> {
     s.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 1).map(str::to_string).collect()
 }
 
+/// Part of a step's text: as recorded, or a `{param}` already put in, so a
+/// later literal can't match inside it.
+enum Piece {
+    Text(String),
+    Param(String),
+}
+
+fn word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Whether `lit` at byte `start` of `s` is a whole token: not inside a word
+/// (`AB12345`, `sr_1_2`) or a number (`2.5`, `1,200`).
+fn whole_token(s: &str, start: usize, lit: &str) -> bool {
+    // Whether the literal's edge character runs on into `near` (then `far`).
+    let joins = |edge: Option<char>, near: Option<char>, far: Option<char>| match (edge, near) {
+        (Some(e), Some(n)) if word_char(e) && word_char(n) => true,
+        (Some(e), Some('.' | ',')) => e.is_ascii_digit() && far.is_some_and(|f| f.is_ascii_digit()),
+        _ => false,
+    };
+    let mut before = s[..start].chars().rev();
+    let mut after = s[start + lit.len()..].chars();
+    !joins(lit.chars().next(), before.next(), before.next())
+        && !joins(lit.chars().next_back(), after.next(), after.next())
+}
+
+/// Puts `{name}` in place of each whole-token `lit` in the text pieces.
+fn sub_tokens(pieces: Vec<Piece>, lit: &str, name: &str) -> Vec<Piece> {
+    let mut out = Vec::new();
+    for p in pieces {
+        let Piece::Text(text) = p else {
+            out.push(p);
+            continue;
+        };
+        let (mut kept, mut from) = (0, 0);
+        while let Some(i) = text[from..].find(lit).map(|i| from + i) {
+            if whole_token(&text, i, lit) {
+                if i > kept {
+                    out.push(Piece::Text(text[kept..i].to_string()));
+                }
+                out.push(Piece::Param(name.to_string()));
+                kept = i + lit.len();
+                from = kept;
+            } else {
+                from = i + text[i..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
+        if kept < text.len() {
+            out.push(Piece::Text(text[kept..].to_string()));
+        }
+    }
+    out
+}
+
+/// The pieces as a string, with the recorded text passed through `enc`.
+fn render(pieces: &[Piece], enc: impl Fn(&str) -> String) -> String {
+    pieces
+        .iter()
+        .map(|p| match p {
+            Piece::Text(t) => enc(t),
+            Piece::Param(n) => format!("{{{n}}}"),
+        })
+        .collect()
+}
+
+/// Typed, chosen or filled text: each literal where it is a whole word.
+fn sub_text(s: &str, literals: &[&(String, String)]) -> String {
+    let mut pieces = vec![Piece::Text(s.to_string())];
+    for (lit, name) in literals {
+        pieces = sub_tokens(pieces, lit, name);
+    }
+    render(&pieces, str::to_string)
+}
+
+/// An element's name: the whole name, or a whole word of it when the
+/// literal is long enough not to turn up by chance ("Page 2", "Cart (2)").
+fn sub_name(s: &str, literals: &[&(String, String)]) -> String {
+    if let Some((_, name)) = literals.iter().find(|(lit, _)| s.trim() == lit) {
+        return format!("{{{name}}}");
+    }
+    let mut pieces = vec![Piece::Text(s.to_string())];
+    for (lit, name) in literals {
+        if lit.chars().count() >= 3 && !lit.chars().all(|c| c.is_ascii_digit()) {
+            pieces = sub_tokens(pieces, lit, name);
+        }
+    }
+    render(&pieces, str::to_string)
+}
+
+/// A percent- or form-encoded address part as text.
+fn decode(s: &str) -> String {
+    url::form_urlencoded::parse(format!("v={s}").as_bytes()).next().map(|(_, v)| v.into_owned()).unwrap_or_default()
+}
+
+/// An `open` address: path segments and query values that are a literal,
+/// and literal words in a free-text query value (`q=TUSQ+nut+black`).
+fn sub_url(addr: &str, literals: &[&(String, String)]) -> String {
+    let (head, frag) = match addr.split_once('#') {
+        Some((h, f)) => (h, Some(f)),
+        None => (addr, None),
+    };
+    let (head, query) = match head.split_once('?') {
+        Some((h, q)) => (h, Some(q)),
+        None => (head, None),
+    };
+    let host = head.find("://").map_or(0, |i| i + 3);
+    let path_start = head[host..].find('/').map_or(head.len(), |i| host + i);
+    let mut out = head[..path_start].to_string();
+    let path: Vec<String> = head[path_start..]
+        .split('/')
+        .map(|seg| {
+            let text = decode(&seg.replace('+', "%2B"));
+            match literals.iter().find(|(lit, _)| *lit == text) {
+                Some((_, name)) => format!("{{{name}}}"),
+                None => seg.to_string(),
+            }
+        })
+        .collect();
+    out.push_str(&path.join("/"));
+    if let Some(q) = query {
+        let pairs: Vec<String> = q
+            .split('&')
+            .map(|pair| {
+                let Some((k, v)) = pair.split_once('=') else { return pair.to_string() };
+                let text = decode(v);
+                if let Some((_, name)) = literals.iter().find(|(lit, _)| *lit == text) {
+                    return format!("{k}={{{name}}}");
+                }
+                // Words of a search, not an id like `sr_1_2`.
+                if text.contains(char::is_whitespace) {
+                    let mut pieces = vec![Piece::Text(text)];
+                    for (lit, name) in literals {
+                        pieces = sub_tokens(pieces, lit, name);
+                    }
+                    if pieces.iter().any(|p| matches!(p, Piece::Param(_))) {
+                        let enc = |t: &str| url::form_urlencoded::byte_serialize(t.as_bytes()).collect::<String>();
+                        return format!("{k}={}", render(&pieces, enc));
+                    }
+                }
+                pair.to_string()
+            })
+            .collect();
+        out.push('?');
+        out.push_str(&pairs.join("&"));
+    }
+    if let Some(f) = frag {
+        out.push('#');
+        out.push_str(f);
+    }
+    out
+}
+
 impl Target {
     pub fn label(&self) -> String {
         if self.name.is_empty() { self.role.clone() } else { format!("{} \"{}\"", self.role, self.name) }
@@ -209,28 +361,19 @@ impl Step {
         }
     }
 
-    /// Replaces each literal with its `{param}` everywhere it appears.
+    /// Replaces each literal with its `{param}` where it is the value itself:
+    /// a whole path segment or query value of an `open` address, a whole
+    /// word of typed or chosen text, and an element's whole name (or a whole
+    /// word of it, for literals of three or more characters that aren't just
+    /// digits). The `2` in `AB12345` or `2.5` stays as it is.
     fn parameterize(&mut self, literals: &[(String, String)]) {
-        let sub = |s: &mut String| {
-            for (lit, name) in literals {
-                if !lit.is_empty() && s.contains(lit.as_str()) {
-                    *s = s.replace(lit.as_str(), &format!("{{{name}}}"));
-                }
-            }
-        };
+        let literals: Vec<&(String, String)> = literals.iter().filter(|(lit, _)| !lit.is_empty()).collect();
         if let Some(v) = self.value.as_mut() {
-            // URLs carry values encoded; match those too.
-            for (lit, name) in literals {
-                let enc: String = url::form_urlencoded::byte_serialize(lit.as_bytes()).collect();
-                if !enc.is_empty() && enc != *lit && v.contains(&enc) {
-                    *v = v.replace(&enc, &format!("{{{name}}}"));
-                }
-            }
-            sub(v);
+            *v = if self.action == "open" { sub_url(v, &literals) } else { sub_text(v, &literals) };
         }
         let from = self.from.clone();
         if let Some(t) = self.target.as_mut() {
-            sub(&mut t.name);
+            t.name = sub_name(&t.name, &literals);
             // A result on a search page that matches the searched words
             // ("TUSQ XL Jazz Bass nut" for "TUSQ nut") stands for "the
             // result matching the query", not that exact title.
@@ -243,8 +386,8 @@ impl Step {
             }
         }
         for (t, v) in self.fields.iter_mut() {
-            sub(&mut t.name);
-            sub(v);
+            t.name = sub_name(&t.name, &literals);
+            *v = sub_text(v, &literals);
         }
     }
 
@@ -640,6 +783,76 @@ mod tests {
         assert_eq!(t.target.as_ref().unwrap().name, "{query}, black");
         assert_eq!(t.params(), vec!["query".to_string()]);
         assert_eq!(t.fill(&values).target.unwrap().name, "bone saddle, black");
+    }
+
+    fn qty() -> Vec<(String, String)> {
+        vec![("2".into(), "quantity".into())]
+    }
+
+    #[test]
+    fn short_literals_stay_out_of_ids() {
+        let mut s = step("open", "", "", Some("https://shop.example/item/AB12345"));
+        s.parameterize(&qty());
+        assert_eq!(s.value.as_deref(), Some("https://shop.example/item/AB12345"));
+        assert!(s.params().is_empty());
+
+        let mut s = step("open", "", "", Some("https://shop.example/item/AB12345/2?ref=sr_1_2&v=2.5#2"));
+        s.parameterize(&qty());
+        assert_eq!(s.value.as_deref(), Some("https://shop.example/item/AB12345/{quantity}?ref=sr_1_2&v=2.5#2"));
+    }
+
+    #[test]
+    fn query_values_parameterize() {
+        let mut s = step("open", "", "", Some("https://shop.example/cart/add?id=AB12345&qty=2"));
+        s.parameterize(&qty());
+        assert_eq!(s.value.as_deref(), Some("https://shop.example/cart/add?id=AB12345&qty={quantity}"));
+        let values = BTreeMap::from([("quantity".to_string(), "3".to_string())]);
+        assert_eq!(s.fill(&values).value.as_deref(), Some("https://shop.example/cart/add?id=AB12345&qty=3"));
+
+        // Words of a search, alongside others.
+        let mut s = step("open", "", "", Some("https://shop.example/search?q=TUSQ+nut+black&page=2"));
+        s.parameterize(&[("TUSQ nut".into(), "query".into())]);
+        assert_eq!(s.value.as_deref(), Some("https://shop.example/search?q={query}+black&page=2"));
+        let values = BTreeMap::from([("query".to_string(), "bone saddle".to_string())]);
+        assert_eq!(s.fill(&values).value.as_deref(), Some("https://shop.example/search?q=bone+saddle+black&page=2"));
+    }
+
+    #[test]
+    fn names_parameterize_only_whole() {
+        let lits = vec![("2".to_string(), "size".to_string()), ("Medium".to_string(), "fit".to_string())];
+        let name = |n: &str| {
+            let mut s = step("click", "button", n, None);
+            s.parameterize(&lits);
+            s.target.unwrap().name
+        };
+        assert_eq!(name("2"), "{size}");
+        assert_eq!(name("Size 2 (US)"), "Size 2 (US)", "too short to be sure it's the size");
+        assert_eq!(name("Page 12"), "Page 12");
+        assert_eq!(name("Medium (US)"), "{fit} (US)");
+        assert_eq!(name("Mediumweight"), "Mediumweight");
+    }
+
+    #[test]
+    fn typed_text_parameterizes_by_word() {
+        let lits = vec![("TUSQ nut".to_string(), "query".to_string()), ("2".to_string(), "quantity".to_string())];
+        let mut s = step("type", "searchbox", "Search", Some("TUSQ nut for 2 basses, 2.5 mm, B2B"));
+        s.submit = true;
+        s.parameterize(&lits);
+        assert_eq!(s.value.as_deref(), Some("{query} for {quantity} basses, 2.5 mm, B2B"));
+        assert_eq!(s.params(), vec!["query".to_string(), "quantity".to_string()]);
+
+        let mut f = Step {
+            action: "fill".into(),
+            fields: vec![
+                (Target { role: "spinbutton".into(), name: "Qty".into(), ..Default::default() }, "2".into()),
+                (Target { role: "textbox".into(), name: "Address line 2".into(), ..Default::default() }, "12 Elm St".into()),
+            ],
+            ..Default::default()
+        };
+        f.parameterize(&lits);
+        assert_eq!(f.fields[0].1, "{quantity}");
+        assert_eq!(f.fields[1].0.name, "Address line 2");
+        assert_eq!(f.fields[1].1, "12 Elm St");
     }
 
     #[test]
