@@ -87,6 +87,12 @@ impl Codex {
             let ev = match out.next().await {
                 Line::Json(v) => v,
                 Line::Eof => break,
+                Line::Failed(e) => {
+                    // It may still be running; kill it so the wait below returns.
+                    let _ = child.start_kill();
+                    self.emit(AgentEvent::Info(format!("Couldn't read Codex's output: {e}")));
+                    break;
+                }
             };
             match ev["type"].as_str().unwrap_or("") {
                 "thread.started" => {

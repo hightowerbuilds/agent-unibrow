@@ -7,7 +7,7 @@
 //! (`--strict-mcp-config`), only our tools allowed, and anything that would
 //! prompt is denied (`--permission-prompts none`) so a headless run can't hang.
 
-use super::proc::{JsonLines, Line, died};
+use super::proc::{JsonLines, Line, PrivateFile, died};
 use crate::mcp::{McpServer, SERVER_NAME};
 use crate::{AgentEvent, Settings, prompt, workspace_dir};
 use serde_json::{Value, json};
@@ -19,6 +19,8 @@ struct Running {
     child: Child,
     stdin: ChildStdin,
     out: JsonLines,
+    /// The MCP config with the token; deleted when the process goes.
+    _mcp_config: PrivateFile,
 }
 
 pub struct ClaudeCode {
@@ -54,7 +56,10 @@ impl ClaudeCode {
         let _ = self.events.try_send(ev);
     }
 
-    fn command(&self) -> Command {
+    /// The `claude` command, and the config file it reads the MCP server
+    /// from. The file holds the token, so it's passed by path: the command
+    /// line is visible to other local users.
+    fn command(&self) -> Result<(Command, PrivateFile), String> {
         let mcp_config = json!({
             "mcpServers": {
                 SERVER_NAME: {
@@ -64,13 +69,16 @@ impl ClaudeCode {
                 }
             }
         });
+        let config = PrivateFile::create("mcp.json", &mcp_config.to_string())
+            .map_err(|e| format!("Couldn't write Claude Code's MCP config: {e}"))?;
         let mut cmd = Command::new("claude");
         cmd.current_dir(workspace_dir())
             .args(["-p", "--input-format", "stream-json", "--output-format", "stream-json"])
             .args(["--verbose", "--include-partial-messages"])
             .args(["--tools", ""])
             .arg("--strict-mcp-config")
-            .args(["--mcp-config", &mcp_config.to_string()])
+            .arg("--mcp-config")
+            .arg(&config.path)
             .args(["--allowedTools", &format!("mcp__{SERVER_NAME}")])
             .args(["--permission-prompts", "none"])
             .args(["--setting-sources", "project"])
@@ -85,17 +93,17 @@ impl ClaudeCode {
         if let Some(id) = &self.session_id {
             cmd.args(["--resume", id]);
         }
-        cmd
+        Ok((cmd, config))
     }
 
     async fn ensure_running(&mut self) -> Result<(), String> {
         if self.running.is_some() {
             return Ok(());
         }
-        let mut cmd = self.command();
+        let (mut cmd, mcp_config) = self.command()?;
         let (mut child, out) = JsonLines::spawn(&mut cmd)?;
         let stdin = child.stdin.take().ok_or("claude stdin unavailable")?;
-        self.running = Some(Running { child, stdin, out });
+        self.running = Some(Running { child, stdin, out, _mcp_config: mcp_config });
         Ok(())
     }
 
@@ -127,6 +135,14 @@ impl ClaudeCode {
             let ev = match next {
                 Line::Json(v) => v,
                 Line::Eof => {
+                    self.crashed().await;
+                    return;
+                }
+                Line::Failed(e) => {
+                    // It may still be running, and waiting on it would hang the turn.
+                    let r = self.running.as_mut().expect("running");
+                    let _ = r.child.start_kill();
+                    self.emit(AgentEvent::Info(format!("Couldn't read Claude Code's output: {e}")));
                     self.crashed().await;
                     return;
                 }

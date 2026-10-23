@@ -98,6 +98,12 @@ impl OpenCode {
             let ev = match out.next().await {
                 Line::Json(v) => v,
                 Line::Eof => break,
+                Line::Failed(e) => {
+                    // It may still be running; kill it so the wait below returns.
+                    let _ = child.start_kill();
+                    self.emit(AgentEvent::Info(format!("Couldn't read OpenCode's output: {e}")));
+                    break;
+                }
             };
             if let Some(id) = ev["sessionID"].as_str() {
                 if self.session_id.is_none() {
