@@ -163,8 +163,8 @@ mod tests {
     #[test]
     fn clearing_history_keeps_bookmarked_icons() {
         let s = Browsing::in_memory();
-        s.record_visit("https://kept.com/", "Kept");
-        s.record_visit("https://gone.com/", "Gone");
+        s.record_visit(1, "https://kept.com/", "Kept", false);
+        s.record_visit(1, "https://gone.com/", "Gone", false);
         s.add_bookmark("https://kept.com/", "Kept");
         s.save_favicon("https://kept.com/", solid(16, 16, [1, 1, 1, 255]));
         s.save_favicon("https://gone.com/", solid(16, 16, [2, 2, 2, 255]));
