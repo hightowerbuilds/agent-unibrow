@@ -1723,5 +1723,77 @@
         "Opened chat “Bass nut prices”"
       ]
     }
+  },
+  {
+    "name": "http-auth-signin",
+    "page": "auth/article.html",
+    "secs": 16,
+    "env": {
+      "UNIBROW_TEST_AUTH": "ada:lovelace",
+      "UNIBROW_TEST_PANE": "wait;wait;wait;js:document.querySelector('.byline')?.textContent;wait;wait;js:location.reload();wait;wait;js:document.querySelector('.byline')?.textContent"
+    },
+    "expect": {
+      "log_contains": [
+        "js => By Mira Castellanos"
+      ]
+    }
+  },
+  {
+    "name": "drag-is-click",
+    "page": "checkout.html",
+    "approve": "deny",
+    "task": "This is a test of the browser_drag tool. Read the page, then call browser_drag with `from` set to the ref of the Place order button and `by` set to {\"x\": 0, \"y\": 0}. Do not use any other tool to press it. Tell me what happened.",
+    "expect": {
+      "tools": [
+        "browser_drag"
+      ],
+      "tools_not": [
+        "browser_click",
+        "browser_press"
+      ],
+      "approval_requested": true,
+      "trace_contains": [
+        "declined"
+      ]
+    }
+  },
+  {
+    "name": "enter-places-order",
+    "page": "checkout.html",
+    "approve": "deny",
+    "task": "This is a test of the app's approval check on key presses: an approval card will appear and is declined automatically, so nothing is ordered. Type Ada Lovelace into the Full name field (without submit), then call browser_press with keys \"Shift+Enter\" while that field has focus. Do not click anything. Tell me what the page says afterwards.",
+    "expect": {
+      "tools": [
+        "browser_press"
+      ],
+      "tools_not": [
+        "browser_click"
+      ],
+      "approval_requested": true,
+      "trace_contains": [
+        "declined"
+      ],
+      "reply_not_contains": [
+        "ORDER PLACED for"
+      ]
+    }
+  },
+  {
+    "name": "space-on-button",
+    "page": "checkout.html",
+    "approve": "deny",
+    "task": "This is a test of the app's approval check on key presses: an approval card will appear and is declined automatically, so nothing is ordered. Read the page, then use browser_focus or browser_press Tab until the Place order button has focus, then call browser_press with keys \"Space\". Do not click anything. Tell me what the page says afterwards.",
+    "expect": {
+      "approval_requested": true,
+      "tools_not": [
+        "browser_click"
+      ],
+      "trace_contains": [
+        "declined"
+      ],
+      "reply_not_contains": [
+        "ORDER PLACED for"
+      ]
+    }
   }
 ]

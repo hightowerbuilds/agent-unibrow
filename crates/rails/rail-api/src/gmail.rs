@@ -190,6 +190,7 @@ impl Gmail {
 
     async fn create_draft(&self, a: NewDraftArgs) -> Result<ToolOutput, String> {
         let cc = a.cc.unwrap_or_default();
+        check_recipients(&a.to, &cc)?;
         let raw = mime::build_raw(&Outgoing {
             to: &a.to,
             cc: &cc,
@@ -210,6 +211,7 @@ impl Gmail {
 
     async fn send(&self, a: SendArgs) -> Result<ToolOutput, String> {
         let cc = a.cc.unwrap_or_default();
+        check_recipients(&a.to, &cc)?;
         let (subject, in_reply_to, references) = match &a.thread_id {
             Some(tid) => {
                 let ctx = self.reply_context(tid).await?;
@@ -284,11 +286,51 @@ fn split_addresses(s: &str) -> Vec<String> {
     out
 }
 
-/// The bare `user@host` part of `Name <user@host>`.
-fn bare_address(s: &str) -> String {
-    match (s.rfind('<'), s.rfind('>')) {
-        (Some(a), Some(b)) if b > a => s[a + 1..b].trim().to_lowercase(),
-        _ => s.trim().to_lowercase(),
+/// The bare address of a `to`/`cc` entry that is exactly one address,
+/// `user@host` or `Name <user@host>` (the name may be quoted). Anything
+/// else (lists, groups, comments, empty `<>`) is `None`, so what the
+/// approval check sees is always what goes in the header.
+fn single_address(entry: &str) -> Option<String> {
+    let s = entry.trim();
+    let (name, addr) = match s.strip_suffix('>') {
+        Some(rest) => {
+            let a = rest.rfind('<')?;
+            (rest[..a].trim(), &rest[a + 1..])
+        }
+        None => ("", s),
+    };
+    let name_ok = match name.strip_prefix('"').and_then(|n| n.strip_suffix('"')) {
+        Some(inner) => !inner.contains(['"', '\\']),
+        None => !name.contains([',', ';', '<', '>', '@', '"', ':', '(', ')', '\\']),
+    };
+    let (local, domain) = addr.split_once('@')?;
+    let addr_ok = !local.is_empty()
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !domain.contains('@')
+        && !addr.chars().any(|c| c.is_whitespace() || c.is_control() || ",;<>\"()[]\\:".contains(c));
+    (name_ok && addr_ok).then(|| addr.to_lowercase())
+}
+
+/// The approval check's view of a send's `to` and `cc`. An entry that isn't
+/// one address is kept whole, so it can never match an always-allowed one.
+fn recipients(input: &Value) -> Vec<String> {
+    ["to", "cc"]
+        .iter()
+        .flat_map(|k| input[*k].as_array().cloned().unwrap_or_default())
+        .filter_map(|v| v.as_str().map(|e| single_address(e).unwrap_or_else(|| format!("(not one address) {e}"))))
+        .collect()
+}
+
+/// Refuses `to`/`cc` entries that aren't one address each.
+fn check_recipients(to: &[String], cc: &[String]) -> Result<(), String> {
+    match to.iter().chain(cc).find(|e| single_address(e).is_none()) {
+        Some(bad) => Err(format!(
+            "Each to/cc entry must be a single address, like \"user@host\" or \"Name <user@host>\"; \
+             put each person in their own entry. Not valid: {bad:?}"
+        )),
+        None => Ok(()),
     }
 }
 
@@ -524,11 +566,7 @@ impl Tool for SendEmail {
         Effect::Commit
     }
     fn counterparties(&self, input: &Value) -> Vec<String> {
-        ["to", "cc"]
-            .iter()
-            .flat_map(|k| input[*k].as_array().cloned().unwrap_or_default())
-            .filter_map(|v| v.as_str().map(bare_address))
-            .collect()
+        recipients(input)
     }
     fn describe_call(&self, input: &Value) -> String {
         let body = input["body"].as_str().unwrap_or("");
@@ -591,7 +629,33 @@ mod tests {
     fn splits_quoted_names() {
         let v = split_addresses("\"Hightower, Luke\" <luke@x.com>, zack@y.com");
         assert_eq!(v, vec!["\"Hightower, Luke\" <luke@x.com>", "zack@y.com"]);
-        assert_eq!(bare_address(&v[0]), "luke@x.com");
+        assert_eq!(single_address(&v[0]).as_deref(), Some("luke@x.com"));
+    }
+
+    #[test]
+    fn one_address_per_entry() {
+        assert_eq!(single_address("Bob <Bob@Y.com>").as_deref(), Some("bob@y.com"));
+        assert_eq!(single_address("\"Hightower, Luke\" <luke@x.com>").as_deref(), Some("luke@x.com"));
+        assert_eq!(single_address(" zack@y.co.uk ").as_deref(), Some("zack@y.co.uk"));
+        for bad in [
+            "evil@x.com, Bob <bob@y.com>",
+            "<>, evil@x.com",
+            "Bob <bob@y.com>, evil@x.com",
+            "a@b.com b@c.com",
+            "undisclosed:;",
+            "evil@x.com <bob@y.com>",
+            "Bob <bob@y.com> (evil@x.com)",
+            "Bob <bob@y.com,evil@x.com>",
+            "\"a\"b\" <bob@y.com>",
+            "",
+            "bob",
+        ] {
+            assert!(single_address(bad).is_none(), "{bad:?} should be refused");
+        }
+        // An entry that hides a second address is never just the allowed one.
+        let parties = recipients(&json!({"to": ["evil@x.com, Bob <bob@y.com>"]}));
+        assert_eq!(parties.len(), 1);
+        assert_ne!(parties[0], "bob@y.com");
     }
 
     #[test]

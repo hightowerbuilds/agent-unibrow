@@ -36,6 +36,9 @@ impl ApiBackend {
             "Anthropic API: {} at {} effort (API key billing)",
             config.model, config.effort
         )));
+        // Chats saved before empty replies were skipped can hold one; the API
+        // refuses any later request with it.
+        let messages: Vec<Value> = messages.into_iter().filter(|m| !is_empty_assistant(m)).collect();
         Self {
             client: Client::new(api_key, config),
             tools: host.registry().definitions(true),
@@ -121,7 +124,13 @@ impl ApiBackend {
             // the cleaned copy.
             let kept = after_fallback(&done.content);
             let tool_uses: Vec<Value> = kept.iter().filter(|b| b["type"] == "tool_use").cloned().collect();
-            self.messages.push(json!({"role": "assistant", "content": strip_bookkeeping(&kept)}));
+            // An empty reply (end_turn with no content, which can follow
+            // tool results) isn't kept: the API refuses an empty assistant
+            // message anywhere but last, so it would break every later turn.
+            let reply = json!({"role": "assistant", "content": strip_bookkeeping(&kept)});
+            if !is_empty_assistant(&reply) {
+                self.messages.push(reply);
+            }
 
             if stop == "max_tokens" && !tool_uses.is_empty() {
                 // Inputs may be cut off; never run them. Answer each call with
@@ -194,6 +203,10 @@ impl ApiBackend {
     }
 }
 
+fn is_empty_assistant(m: &Value) -> bool {
+    m["role"] == "assistant" && m["content"].as_array().is_some_and(|c| c.is_empty())
+}
+
 /// After a mid-output fallback, drops the blocks before the last `fallback`
 /// marker that the fallback model can't accept (thinking, tool calls), per
 /// the fallback echo rules. Without a fallback, keeps everything.
@@ -254,6 +267,13 @@ fn tool_result(id: &Value, content: &str, is_error: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_assistant_replies_are_spotted() {
+        assert!(is_empty_assistant(&json!({"role": "assistant", "content": []})));
+        assert!(!is_empty_assistant(&json!({"role": "assistant", "content": [{"type": "text", "text": "hi"}]})));
+        assert!(!is_empty_assistant(&json!({"role": "user", "content": []})));
+    }
 
     #[test]
     fn fallback_echo_drops_pre_boundary_thinking_and_tools() {

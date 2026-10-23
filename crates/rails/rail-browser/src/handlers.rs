@@ -1363,6 +1363,12 @@ wrap_dev_tools_message_observer! {
                 return 1;
             }
             if let Some(method) = msg["method"].as_str() {
+                // The sign-in interception's events go on to
+                // `on_dev_tools_event`, which CEF only calls for messages
+                // this method leaves unhandled.
+                if method.starts_with("Fetch.") {
+                    return 0;
+                }
                 if KEPT_EVENTS.contains(&method) {
                     let mut ev = self.handler.events.borrow_mut();
                     if ev.len() >= MAX_EVENTS {

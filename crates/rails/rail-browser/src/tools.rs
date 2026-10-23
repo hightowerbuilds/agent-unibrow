@@ -78,10 +78,33 @@ const PROBE_FN: &str = r#"function(sel){
       if (isSensitive(x)) v = v ? '[hidden]' : '';
       return [label.slice(0, 50), String(v).slice(0, 100)];
     });
-  return { tag, type, sensitive: isSensitive(el), isSubmit, inForm: !!form,
+  // Enter or Space on these presses them, like a click.
+  const pressable = !!(el.matches && el.matches('button, a[href], [role=button], [role=link], [role=menuitem], input[type=submit], input[type=button], input[type=image], summary'));
+  const name = pressable ? String((el.getAttribute('aria-label') || el.value || el.innerText || el.textContent || '')).trim().replace(/\s+/g, ' ').slice(0, 200) : '';
+  const link = pressable && el.matches('a[href], [role=link]');
+  // Enter in a field submits through the form's default button.
+  const dflt = form ? form.querySelector('button:not([type]), button[type=submit], input[type=submit], input[type=image]') : null;
+  const submitName = dflt ? String(dflt.getAttribute('aria-label') || dflt.value || dflt.innerText || dflt.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 200) : '';
+  return { tag, type, sensitive: isSensitive(el), isSubmit, inForm: !!form, pressable, name, link, submitName,
            method: form ? String(form.method || 'get').toLowerCase() : '',
            isSearch, hasSensitive: fields.some(isSensitive), values };
 }"#;
+
+/// The focused element, looking into shadow roots and same-origin frames.
+/// A frame from another site can't be looked into, so it stays the frame.
+const FOCUSED_JS: &str = r#"(() => {
+  let e = document.activeElement;
+  for (let i = 0; i < 10 && e; i++) {
+    if (e.shadowRoot && e.shadowRoot.activeElement) { e = e.shadowRoot.activeElement; continue; }
+    if (e.tagName === 'IFRAME' || e.tagName === 'FRAME') {
+      let d = null;
+      try { d = e.contentDocument; } catch (_) {}
+      if (d && d.activeElement) { e = d.activeElement; continue; }
+    }
+    break;
+  }
+  return e;
+})()"#;
 
 /// What the probe found out about an element and its form.
 #[derive(Default)]
@@ -94,6 +117,13 @@ struct Probe {
     is_search: bool,
     has_sensitive: bool,
     values: Vec<(String, String)>,
+    /// A button or link, which Enter or Space presses.
+    pressable: bool,
+    /// Its text or label, when pressable.
+    name: String,
+    link: bool,
+    /// The text of the form's default button, which Enter in a field presses.
+    submit_name: String,
 }
 
 impl Probe {
@@ -106,6 +136,10 @@ impl Probe {
             method: v["method"].as_str().unwrap_or("").to_string(),
             is_search: v["isSearch"].as_bool().unwrap_or(false),
             has_sensitive: v["hasSensitive"].as_bool().unwrap_or(false),
+            pressable: v["pressable"].as_bool().unwrap_or(false),
+            name: v["name"].as_str().unwrap_or("").to_string(),
+            link: v["link"].as_bool().unwrap_or(false),
+            submit_name: v["submitName"].as_str().unwrap_or("").to_string(),
             values: v["values"]
                 .as_array()
                 .map(|a| {
@@ -121,6 +155,12 @@ impl Probe {
     /// carries passwords/payment details, and it isn't a search. (6.1)
     fn submit_commits(&self) -> bool {
         self.in_form && !self.is_search && (self.method == "post" || self.has_sensitive)
+    }
+
+    /// Whether Enter in this field would press a form button worded like
+    /// "Place order" or "Send", whatever the form's method.
+    fn enter_presses_commit(&self) -> bool {
+        self.in_form && self.tag != "textarea" && !self.pressable && has_word(&self.submit_name, COMMIT_WORDS)
     }
 
     /// The form's current values, one per line, sensitive ones hidden.
@@ -795,7 +835,7 @@ impl Browser {
 
     /// The element that has keyboard focus.
     async fn probe_focused(&self) -> Probe {
-        match self.bridge.cdp("Runtime.evaluate", json!({"expression": "document.activeElement"})).await {
+        match self.bridge.cdp("Runtime.evaluate", json!({"expression": FOCUSED_JS})).await {
             Ok(r) => match r["result"]["objectId"].as_str() {
                 Some(id) => self.probe_object(id).await,
                 None => Probe::default(),
@@ -1089,7 +1129,7 @@ impl Tool for Click {
 
             let worded = match el.role.as_str() {
                 "link" => has_word(&el.name, LINK_COMMIT_WORDS),
-                "button" | "menuitem" | "" => has_word(&el.name, COMMIT_WORDS),
+                "button" | "menuitem" | "img" | "image" | "generic" | "" => has_word(&el.name, COMMIT_WORDS),
                 _ => false,
             };
             let probe = b.probe(&el).await;
@@ -1111,6 +1151,12 @@ impl Tool for Click {
                 } else {
                     "This submits a form that sends information".to_string()
                 };
+                if clicks > 1 {
+                    return Err(format!(
+                        "Not clicked: {} needs the user's approval, and a double click would press it twice. Click it once.",
+                        el.label()
+                    ));
+                }
                 b.confirm(&ctx, format!("Click {}", el.label()), why, &probe).await?;
             }
             if let Some(cover) = info.covered.as_ref() {
@@ -1262,7 +1308,15 @@ impl Tool for Type {
             let url_before = b.state().await.map(|s| s.url).unwrap_or_default();
             if submit {
                 let probe = b.probe(&el).await;
-                if probe.submit_commits() {
+                if probe.enter_presses_commit() {
+                    b.confirm(
+                        &ctx,
+                        format!("Press Enter in {}, which presses “{}”", el.label(), probe.submit_name),
+                        "Enter here presses the form's button, which looks like it could buy, send, post, delete or confirm something".into(),
+                        &probe,
+                    )
+                    .await?;
+                } else if probe.submit_commits() {
                     b.confirm(&ctx, format!("Submit the form from {}", el.label()), "Pressing Enter submits a form that sends information".into(), &probe).await?;
                 }
                 b.key(&parse_keys("Enter")?.0, 0).await?;
@@ -1330,13 +1384,39 @@ impl Tool for Press {
                 ));
             }
             let mut in_form = false;
-            if key.key == "Enter" && mods == 0 {
+            // Enter (with or without modifiers) and Space press buttons and
+            // links, and Enter submits forms: the same check as a click.
+            let enter = key.key == "Enter";
+            if enter || key.key == " " {
                 let probe = b.probe_focused().await;
-                if probe.submit_commits() {
-                    b.confirm(&ctx, "Submit the form (Enter)".into(), "Pressing Enter submits a form that sends information".into(), &probe).await?;
+                let ask = if probe.tag == "iframe" || probe.tag == "frame" {
+                    Some((
+                        format!("Press {combo} in a frame"),
+                        "The focus is in a frame from another site, where this could press a button or submit a form".to_string(),
+                    ))
+                } else if probe.pressable && has_word(&probe.name, if probe.link { LINK_COMMIT_WORDS } else { COMMIT_WORDS }) {
+                    Some((
+                        format!("Press {combo} on “{}”", probe.name),
+                        "This presses a button that looks like it could buy, send, post, delete or confirm something".to_string(),
+                    ))
+                } else if enter && probe.enter_presses_commit() {
+                    Some((
+                        format!("Press {combo}, which presses “{}”", probe.submit_name),
+                        "Enter here presses the form's button, which looks like it could buy, send, post, delete or confirm something".to_string(),
+                    ))
+                } else if (enter || probe.is_submit) && probe.submit_commits() {
+                    Some((format!("Submit the form ({combo})"), "This submits a form that sends information".to_string()))
+                } else {
+                    None
+                };
+                if let Some((action, why)) = ask {
+                    if times > 1 {
+                        return Err(format!("{action} needs the user's approval; press it once, not {times} times."));
+                    }
+                    b.confirm(&ctx, action, why, &probe).await?;
                 }
                 // Enter in a text area is a new line, not a submit.
-                in_form = probe.in_form && probe.tag != "textarea";
+                in_form = enter && mods == 0 && probe.in_form && probe.tag != "textarea";
             }
             let url_before = b.state().await.map(|s| s.url).unwrap_or_default();
             for _ in 0..times {

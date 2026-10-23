@@ -10,7 +10,7 @@
 //! drive Chrome. If the page started no drag at all from a draggable
 //! element, the drag events are sent from script as a last resort.
 
-use super::{Browser, Element, LINK_COMMIT_WORDS, check_keys, has_word};
+use super::{Browser, COMMIT_WORDS, Element, LINK_COMMIT_WORDS, check_keys, has_word};
 use crate::bridge::Rect;
 use futures::future::BoxFuture;
 use router::{Effect, Tool, ToolContext, ToolResult};
@@ -57,6 +57,27 @@ const BY_TEXT_JS: &str = r#"(t) => {
     hit = inc[0];
   }
   return hit || null;
+}"#;
+
+/// What a press at one point and a release at another would click: the
+/// page fires `click` when both land on the same element, however far
+/// apart, so a "drag" within one button is a click on it. Returns
+/// `{frame: true}` when either point is in a frame (its inside can't be
+/// seen from here), else `{same, name, link}` for the clickable element
+/// under both points.
+const CLICK_BETWEEN_JS: &str = r#"(x1, y1, x2, y2) => {
+  const at = (x, y) => {
+    let e = document.elementFromPoint(x, y);
+    while (e && e.shadowRoot) { const inner = e.shadowRoot.elementFromPoint(x, y); if (!inner || inner === e) break; e = inner; }
+    if (!e) return null;
+    if (e.tagName === 'IFRAME' || e.tagName === 'FRAME') return 'frame';
+    return e.closest('button, a[href], [role=button], [role=link], [role=menuitem], input[type=submit], input[type=button], input[type=image], summary, label') || e;
+  };
+  const a = at(x1, y1), b = at(x2, y2);
+  if (a === 'frame' || b === 'frame') return { frame: true };
+  if (!a || a !== b) return { same: false };
+  const name = (a.getAttribute('aria-label') || a.value || a.innerText || a.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 200);
+  return { same: true, name, link: a.matches('a[href], [role=link]') };
 }"#;
 
 fn point_arg(v: &Value) -> Option<(f64, f64)> {
@@ -232,6 +253,29 @@ impl Tool for Drag {
                     )
                     .await?;
                 }
+            }
+            // A press and release on one element is a click on it: ask
+            // first just as browser_click would.
+            let expr = format!("({CLICK_BETWEEN_JS})({}, {}, {}, {})", from.0, from.1, to.0, to.1);
+            let between = b
+                .bridge
+                .cdp("Runtime.evaluate", json!({"expression": expr, "returnByValue": true}))
+                .await
+                .map(|r| r["result"]["value"].clone())
+                .unwrap_or(Value::Null);
+            let clicks = if between["frame"].as_bool().unwrap_or(false) {
+                Some(("something inside a frame".to_string(), "This drag is inside a frame, where it could click a button".to_string()))
+            } else if between["same"].as_bool().unwrap_or(false) {
+                let name = between["name"].as_str().unwrap_or_default().to_string();
+                let words = if between["link"].as_bool().unwrap_or(false) { LINK_COMMIT_WORDS } else { COMMIT_WORDS };
+                has_word(&name, words).then(|| {
+                    (format!("“{name}”"), "This drag starts and ends on the same button, which clicks it; it looks like it could buy, send, post, delete or confirm something".to_string())
+                })
+            } else {
+                None
+            };
+            if let Some((what, why)) = clicks {
+                b.confirm(&ctx, format!("Drag on {what}"), why, &Default::default()).await?;
             }
             let how = b.drag_path(from, to, steps).await?;
             let mut what = format!(
