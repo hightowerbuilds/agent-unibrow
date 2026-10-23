@@ -213,6 +213,11 @@ struct Shell {
     last_sent: Option<String>,
     /// Interrupt was pressed: send the queued steering once stopped.
     interrupt_pending: bool,
+    /// How many of the newest queued messages came from Interrupt (or were
+    /// typed while stopping) and so were never handed to the agent.
+    interrupt_unsent: usize,
+    /// Stop was pressed and the agent hasn't finished stopping yet.
+    stopping: bool,
     trace: Trace,
     expanded: HashSet<usize>,
     approvals: Vec<PendingApproval>,
@@ -333,6 +338,8 @@ impl Shell {
             pending_recap: None,
             last_sent: None,
             interrupt_pending: false,
+            interrupt_unsent: 0,
+            stopping: false,
             trace: Trace::open_session(),
             expanded: HashSet::new(),
             approvals: Vec::new(),
@@ -619,7 +626,7 @@ impl Shell {
                 self.notice(line);
             }
             Event::Answer { id, text, calls, subq_calls, secs } => {
-                let Some((_, asked, site)) = self.jev_pending.take().filter(|p| p.0 == id) else { return };
+                let Some((_, asked, site)) = self.jev_pending.take_if(|p| p.0 == id) else { return };
                 self.push(ItemKind::Assistant, text.clone());
                 let (by, decisions, model) = match (calls - subq_calls, subq_calls) {
                     (_, 0) => ("Jev", format!("{calls} decisions"), "jev"),
@@ -637,7 +644,7 @@ impl Shell {
                 self.scroll_to_bottom();
             }
             Event::Fallback { id, reason } => {
-                let Some((_, asked, _)) = self.jev_pending.take().filter(|p| p.0 == id) else { return };
+                let Some((_, asked, _)) = self.jev_pending.take_if(|p| p.0 == id) else { return };
                 self.set_busy(false, "", cx);
                 self.push(ItemKind::Note, format!("Jev: {reason}. Passing this to Claude."));
                 self.trace.push(Kind::Info, format!("Jev passed to Claude: {reason}"), None);
@@ -657,6 +664,7 @@ impl Shell {
     fn end_agent(&mut self, cx: &mut Context<Self>) {
         // Dropping the handle ends the old agent; dropping pending approval
         // senders answers them with Deny.
+        self.drop_queued_steering();
         self.agent = None;
         self._events = None;
         self.approvals.clear();
@@ -781,7 +789,12 @@ impl Shell {
             // Steering (C3.1): goes to the agent mid-task.
             self.push(ItemKind::Steer(SteerState::Queued), text.clone());
             self.trace.push(Kind::User, format!("Steer: {}", first_line(&text)), Some(text.clone()));
-            if let Some(agent) = &self.agent {
+            if self.stopping {
+                // The agent drops steering when it stops: send this as the
+                // next message once it has.
+                self.interrupt_pending = true;
+                self.interrupt_unsent += 1;
+            } else if let Some(agent) = &self.agent {
                 agent.steer(text);
             }
             self.scroll_to_bottom();
@@ -867,6 +880,31 @@ impl Shell {
         }
     }
 
+    /// After a turn ends without the Stop that Interrupt sent: the messages
+    /// Interrupt queued never reached the agent, so hand them over now. An
+    /// idle agent runs them at once (and drops the stale Stop first); one
+    /// with steering of its own sends them along with it.
+    fn hand_over_interrupt(&mut self, queued: &[String]) {
+        let unsent = std::mem::take(&mut self.interrupt_unsent).min(queued.len());
+        if !std::mem::take(&mut self.interrupt_pending) {
+            return;
+        }
+        if let Some(agent) = &self.agent {
+            for text in &queued[queued.len() - unsent..] {
+                agent.steer(text.clone());
+            }
+        }
+    }
+
+    /// The agent is going away: nothing queued for it will be sent.
+    fn drop_queued_steering(&mut self) {
+        let queued = self.queued_steering().len();
+        self.mark_steered(queued, SteerState::NotSent);
+        self.interrupt_pending = false;
+        self.interrupt_unsent = 0;
+        self.stopping = false;
+    }
+
     fn queued_steering(&self) -> Vec<String> {
         self.items.iter().filter(|i| i.kind == ItemKind::Steer(SteerState::Queued)).map(|i| i.text.clone()).collect()
     }
@@ -882,6 +920,23 @@ impl Shell {
             self.input.update(cx, |i, cx| i.set_text("", cx));
             self.push(ItemKind::Steer(SteerState::Queued), text.clone());
             self.trace.push(Kind::User, format!("Interrupt: {}", first_line(&text)), Some(text));
+            self.interrupt_unsent += 1;
+        }
+        // Jev can't be interrupted mid-request: stop it and send what's
+        // queued to the agent straight away.
+        if self.jev_pending.is_some() {
+            self.stop_agent("Stopped.", cx);
+            let queued = self.queued_steering();
+            self.interrupt_unsent = 0;
+            if !queued.is_empty() {
+                if self.agent.is_some() {
+                    self.mark_steered(queued.len(), SteerState::Delivered);
+                    self.send_to_agent(queued.join("\n\n"), cx);
+                } else {
+                    self.mark_steered(queued.len(), SteerState::NotSent);
+                }
+            }
+            return;
         }
         if self.queued_steering().is_empty() {
             self.stop_agent("Stopped.", cx);
@@ -1047,8 +1102,12 @@ impl Shell {
             }
             Cmd::LearnJev { site } if self.store.is_focused(&site) || self.store.is_focused(&format!("www.{site}")) => {
                 let key = site.trim_start_matches("www.").to_string();
-                self.learn_with_jev(key.clone(), cx);
-                Ok(format!("learn_jev {key}"))
+                if self.jev_progress.contains_key(&key) {
+                    Err(format!("Jev is already learning {key}"))
+                } else {
+                    self.learn_with_jev(key.clone(), cx);
+                    Ok(format!("learn_jev {key}"))
+                }
             }
             Cmd::ToggleJev { site } => {
                 let key = site.trim_start_matches("www.").to_string();
@@ -1133,6 +1192,7 @@ impl Shell {
         if let Some(agent) = &self.agent {
             agent.cancel();
         }
+        self.stopping = true;
         // Dropping the senders answers pending approvals with Deny.
         self.approvals.clear();
         self.end_stream();
@@ -1265,7 +1325,9 @@ impl Shell {
                     Some(format!("{}\n\nmodel: {}\n{tokens}", reply.join("\n\n"), model.unwrap_or_default())),
                 );
                 let queued = self.queued_steering();
+                self.stopping = false;
                 if stop_reason == "cancelled" {
+                    self.interrupt_unsent = 0;
                     if std::mem::take(&mut self.interrupt_pending) && !queued.is_empty() {
                         // Interrupt: what was queued goes as the next message.
                         self.mark_steered(queued.len(), SteerState::Delivered);
@@ -1275,8 +1337,12 @@ impl Shell {
                         self.mark_steered(queued.len(), SteerState::NotSent);
                         self.set_busy(false, "", cx);
                     }
-                } else if queued.is_empty() {
-                    self.set_busy(false, "", cx);
+                } else {
+                    // The turn finished before a Stop reached it.
+                    self.hand_over_interrupt(&queued);
+                    if queued.is_empty() {
+                        self.set_busy(false, "", cx);
+                    }
                 }
                 // Otherwise the agent sends the queued messages as its next
                 // turn and stays busy.
@@ -1286,9 +1352,14 @@ impl Shell {
                 self.push(ItemKind::Error, e.clone());
                 self.trace.push(Kind::Error, first_line(&e), Some(e.clone()));
                 self.set_busy(false, "", cx);
+                self.stopping = false;
+                // The agent carries on with queued steering after an error.
+                let queued = self.queued_steering();
+                self.hand_over_interrupt(&queued);
                 if e.contains("API 401") && self.settings.backend.needs_api_key() {
                     let _ = delete_api_key();
                     self.check_home_keys(cx);
+                    self.drop_queued_steering();
                     self.agent = None;
                     self._events = None;
                     self.ask_for_key("That API key was rejected. Paste a valid key and press Enter.", cx);
@@ -1749,7 +1820,6 @@ impl Shell {
                             .child(div().text_sm().text_color(rgb(theme::FG)).truncate().child(label))
                             .child(div().text_xs().text_color(rgb(theme::MUTED)).truncate().child(v.site.clone())),
                     )
-                    .child(self.site_icons.view(&self.store, &v.site))
                     .child(
                         Self::small_button(
                             SharedString::from(format!("visit-focus-{}", v.id)),

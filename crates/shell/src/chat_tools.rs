@@ -12,7 +12,9 @@
 //! Test hook (isolated instances only): `UNIBROW_TEST_SHELL` is a list of
 //! `;`-separated steps run once the first turn is over, each logged to the
 //! trace as "Shell test: …": `rename:<title>`, `export`, `search:<text>`,
-//! and `icons` (which visited sites have an icon for the History list).
+//! `icons` (which visited sites have an icon for the History list),
+//! `interrupt_race:<text>` (Interrupt & send pressed just as a turn ends on
+//! its own) and `idle` (waits up to a minute for the agent to finish).
 
 use crate::text_input::{Changed, Submit, TextInput};
 use crate::{Shell, StopAgent, theme};
@@ -260,6 +262,14 @@ impl Shell {
                 }
             }
             for step in steps {
+                if step == "idle" {
+                    for _ in 0..120 {
+                        if !this.update(cx, |s, _| s.busy).unwrap_or(false) {
+                            break;
+                        }
+                        cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                    }
+                }
                 // `icons` waits (up to 15 s) for the page to be in history with its icon.
                 for _ in 0..30 {
                     let waiting = step == "icons"
@@ -315,6 +325,17 @@ impl Shell {
                     .collect();
                 format!("search {arg:?}: {} hit(s) {shown:?}", hits.len())
             }
+            "interrupt_race" => {
+                // The turn's end arrives before the Stop that Interrupt sends
+                // reaches the agent.
+                self.set_busy(true, "Thinking…", cx);
+                self.input.update(cx, |i, cx| i.set_text(arg, cx));
+                self.interrupt(cx);
+                let done = agent_core::AgentEvent::Done { stop_reason: "end_turn".into(), model: None, usage: serde_json::Value::Null };
+                self.on_event(done, cx);
+                format!("interrupt race: busy={} queued={}", self.busy, self.queued_steering().len())
+            }
+            "idle" => format!("idle: busy={} queued={}", self.busy, self.queued_steering().len()),
             "icons" => {
                 let mut sites: Vec<String> = Vec::new();
                 for v in self.store.history(&browsing::HistoryQuery { limit: 50, ..Default::default() }) {

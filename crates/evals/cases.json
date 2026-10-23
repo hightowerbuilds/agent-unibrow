@@ -1795,5 +1795,28 @@
         "ORDER PLACED for"
       ]
     }
+  },
+  {
+    "name": "interrupt-race",
+    "page": "polish.html",
+    "approve": "deny",
+    "task": "Reply with just the word ready, nothing else.",
+    "env": {
+      "UNIBROW_TEST_SHELL": "interrupt_race:Reply with just the word OSPREY, nothing else.;idle"
+    },
+    "after_turn": {
+      "wait_trace": "Shell test: done",
+      "timeout": 90
+    },
+    "expect": {
+      "trace_contains": [
+        "interrupt race: busy=true queued=1",
+        "Steering delivered (1 message)",
+        "idle: busy=false queued=0"
+      ],
+      "reply_contains": [
+        "OSPREY"
+      ]
+    }
   }
 ]

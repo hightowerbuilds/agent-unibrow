@@ -510,8 +510,21 @@ impl Tool for PlaybookRun {
                 let step = recorded.fill(&values);
                 let n = i + 1;
                 let here = b.state().await?.url;
+                // A playbook only ever acts on its own site: never on the
+                // app's pages or another site that happens to share a path,
+                // since each step runs without the per-tool checks for those.
+                if step.action == "open" {
+                    let to = crate::normalize_address(step.value.as_deref().unwrap_or_default());
+                    if browsing::site_of(&to).as_deref() != Some(pb.site.as_str()) {
+                        let why = format!("step {n} ({}) would leave {} for {to}", step.describe(), pb.site);
+                        return Self::fell_off(&b, &store, &pb, &log, why).await;
+                    }
+                } else if browsing::site_of(&here).as_deref() != Some(pb.site.as_str()) {
+                    let why = format!("step {n} ({}) is for {}, but the browser is on {}", step.describe(), pb.site, site(&here));
+                    return Self::fell_off(&b, &store, &pb, &log, why).await;
+                }
                 // 8.5: is this the page the recording was on? (Opening an
-                // address works from anywhere.)
+                // address works from anywhere on the site.)
                 if step.action != "open" && !step.from.is_empty() && url_pattern(&here) != step.from {
                     let why = format!(
                         "step {n} ({}) expects a {} page ({}), but the browser is on {}",
