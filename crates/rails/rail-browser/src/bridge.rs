@@ -71,6 +71,8 @@ pub struct TabInfo {
     /// A popup window (`window.open`) and the tab that opened it, which it
     /// can talk back to (3.2).
     pub opener: Option<u32>,
+    /// On screen in split view, next to the active tab.
+    pub split: bool,
 }
 
 pub enum TabOp {
@@ -84,6 +86,11 @@ pub enum TabOp {
     /// Work in this tab without showing it to the user.
     Use { id: u32 },
     Close { id: u32 },
+    /// Show these tabs side by side (2 to 4, the first is focused). The
+    /// agent then works in the focused one, as after a switch.
+    Split { ids: Vec<u32> },
+    /// Back to one tab on screen (the focused one).
+    Unsplit,
 }
 
 
@@ -100,11 +107,12 @@ pub struct CodeCard {
 pub enum Request {
     /// List, open, switch or close tabs; replies with the tabs afterwards.
     Tabs { op: TabOp, reply: Reply<Vec<TabInfo>> },
-    /// A raw DevTools Protocol command.
-    Cdp { method: String, params: Value, reply: Reply<Value> },
+    /// A raw DevTools Protocol command, to the agent's tab or to `tab`.
+    Cdp { tab: Option<u32>, method: String, params: Value, reply: Reply<Value> },
     Navigate { url: String, reply: Reply<()> },
     Nav { action: NavAction, reply: Reply<()> },
-    State { reply: Reply<PageState> },
+    /// The agent's tab's state, or `tab`'s.
+    State { tab: Option<u32>, reply: Reply<PageState> },
     /// Outline an element the agent is about to act on.
     Highlight { rect: Rect, label: String },
     /// Downloads from every tab.
@@ -129,27 +137,45 @@ pub enum Request {
 }
 
 impl Request {
-    /// Requests about background pages, which don't touch the user's page.
+    /// Requests that don't act on the agent's tab: background pages, and
+    /// looking at a tab by id (`browser_view_tabs`).
     pub fn is_background(&self) -> bool {
-        matches!(self, Request::BgOpen { .. } | Request::BgCdp { .. } | Request::BgState { .. } | Request::BgClose { .. })
+        matches!(
+            self,
+            Request::BgOpen { .. }
+                | Request::BgCdp { .. }
+                | Request::BgState { .. }
+                | Request::BgClose { .. }
+                | Request::Cdp { tab: Some(_), .. }
+                | Request::State { tab: Some(_), .. }
+        )
     }
 }
 
 #[derive(Clone)]
 pub struct BrowserBridge {
     tx: async_channel::Sender<Request>,
+    /// DevTools commands and state go to this tab instead of the agent's
+    /// ([`BrowserBridge::for_tab`]).
+    tab: Option<u32>,
 }
 
 /// Creates the bridge: tools get the [`BrowserBridge`], the UI drains the receiver.
 pub fn channel() -> (BrowserBridge, async_channel::Receiver<Request>) {
     let (tx, rx) = async_channel::unbounded();
-    (BrowserBridge { tx }, rx)
+    (BrowserBridge { tx, tab: None }, rx)
 }
 
 /// How long to wait for the UI to answer before giving up.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl BrowserBridge {
+    /// The same bridge, with DevTools commands and state going to tab `id`
+    /// (to look at it without making it the agent's tab).
+    pub fn for_tab(&self, id: u32) -> Self {
+        BrowserBridge { tx: self.tx.clone(), tab: Some(id) }
+    }
+
     async fn ask<T>(&self, make: impl FnOnce(Reply<T>) -> Request) -> Result<T, String> {
         let (tx, rx) = oneshot::channel();
         self.tx.send(make(tx)).await.map_err(|_| "The browser isn't running.".to_string())?;
@@ -163,7 +189,8 @@ impl BrowserBridge {
     /// Sends a DevTools command and returns its `result` object.
     pub async fn cdp(&self, method: &str, params: Value) -> Result<Value, String> {
         let method_owned = method.to_string();
-        self.ask(|reply| Request::Cdp { method: method_owned, params, reply })
+        let tab = self.tab;
+        self.ask(|reply| Request::Cdp { tab, method: method_owned, params, reply })
             .await
             .map_err(|e| format!("{method}: {e}"))
     }
@@ -178,7 +205,8 @@ impl BrowserBridge {
     }
 
     pub async fn state(&self) -> Result<PageState, String> {
-        self.ask(|reply| Request::State { reply }).await
+        let tab = self.tab;
+        self.ask(|reply| Request::State { tab, reply }).await
     }
 
     pub async fn downloads(&self) -> Result<Vec<crate::DownloadInfo>, String> {

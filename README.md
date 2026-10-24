@@ -51,6 +51,14 @@ thumbnails, open, rename, delete (to the Trash) and show in the file manager. Th
 can save screenshots there too ("save a screenshot of this page"), with passwords and
 card numbers masked.
 
+**Pop out** (⤢ at the top of the sidebar, or Ctrl+Shift+B) turns the sidebar into a tab in
+the tab strip, next to your web tabs, with chat, history and the rest at full size; the
+Sidebar tab's × puts it back beside the page.
+
+**Split view** shows 2 to 4 tabs at once: Ctrl+click a tab, or use the toolbar's split
+button. The agent can set one up and look at several open tabs at once
+(`browser_view_tabs`) without switching away from the one it's working in.
+
 ## Run
 
 ```

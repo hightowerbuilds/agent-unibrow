@@ -193,6 +193,10 @@ const CHAT: &[Section] = &[
             "+ New starts a fresh chat; × takes one out of the strip (it stays in All chats). All chats lists every chat; \
              Delete there removes one for good (click twice to confirm).",
             "The agent works in one chat at a time. Let it finish or press Stop before switching.",
+            "⤢ Pop out (top right of the sidebar, or Ctrl+Shift+B) turns the sidebar into a tab, first in the tab \
+             strip: click it for chat, history, focus and the rest at full size, click a web tab for pages. The × on \
+             the Sidebar tab puts it back beside the page. Pages keep running meanwhile, and come forward on their own \
+             when one needs you or you open a link from the sidebar.",
         ])],
     },
     Section {
@@ -297,6 +301,25 @@ const RESEARCH: &[Section] = &[
              Watches are listed in Focus, where you can remove them.",
         ])],
     },
+    Section {
+        title: "Split view: tabs side by side",
+        blocks: &[
+            Block::Bullets(&[
+                "Show 2 to 4 tabs at once: Ctrl+click a tab to add it next to the one you're on (Ctrl+click again \
+                 takes it out), or press the split button in the toolbar. Two sit side by side, three in columns, \
+                 four in a grid.",
+                "The pane you click in has the focus: the keyboard and the toolbar act on it. ✕ on a pane's header \
+                 takes it out of the split. Clicking a tab outside the split shows it alone; clicking back on a split \
+                 tab brings the grid back.",
+                "The agent can set up a split too, and look at several open tabs at once (a screenshot and the text \
+                 of each) without switching away from the one it's working in.",
+            ]),
+            Block::Examples(&[
+                "Open the top three results in tabs and show them side by side",
+                "Look at my open tabs and tell me which of these laptops is cheapest",
+            ]),
+        ],
+    },
 ];
 
 const KEYS: &[Section] = &[
@@ -304,6 +327,7 @@ const KEYS: &[Section] = &[
         title: "Shortcuts",
         blocks: &[Block::Keys(&[
             ("Ctrl+B", "Show or hide the sidebar"),
+            ("Ctrl+Shift+B", "Pop the sidebar out into a tab, or back"),
             ("Alt+1 … Alt+3", "Chat, History, Focus"),
             ("Alt+4", "History → Trace"),
             ("Alt+5", "Explained"),
@@ -311,6 +335,7 @@ const KEYS: &[Section] = &[
             ("Esc", "Stop the agent"),
             ("Ctrl+T / Ctrl+W", "New tab / close tab"),
             ("Ctrl+Tab", "Next tab (Shift for previous)"),
+            ("Ctrl+click a tab", "Show it side by side with this one (split view)"),
             ("Ctrl+L", "Jump to the address bar"),
             ("Ctrl+F", "Find in page"),
         ])],

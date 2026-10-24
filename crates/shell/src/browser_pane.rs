@@ -4,6 +4,9 @@
 //! in the page area. Mouse, wheel and keyboard input on the page are
 //! forwarded to Chromium. One pump loop drives CEF from the main thread.
 
+mod sidebar_tab;
+mod split;
+
 use crate::text_input::{Changed, Submit, TextInput};
 use crate::theme;
 use gpui::{
@@ -133,6 +136,10 @@ pub enum AgentControl {
     TookOver,
 }
 
+/// The sidebar tab's × was clicked: the shell puts the sidebar back
+/// beside the page.
+pub struct DockSidebar;
+
 /// The agent asked the user to do something on the page (browser_handoff).
 struct Handoff {
     message: String,
@@ -152,6 +159,8 @@ const MAX_BG_PAGES: usize = 8;
 const BG_PAGE_MAX_AGE: Duration = Duration::from_secs(300);
 /// Background pages lay out like a desktop window, whatever the pane size.
 const BG_PAGE_SIZE: (i32, i32) = (1280, 900);
+/// How long a tab the agent looked at by id stays live off screen.
+const PEEK_FOR: Duration = Duration::from_secs(20);
 
 /// A verification code on screen, and what happened to it.
 struct CodeShown {
@@ -213,6 +222,15 @@ struct Tab {
     /// The page at the current address has finished loading. Leaving one
     /// that hasn't is a redirect, which history folds into the visit.
     loaded: bool,
+    /// The tab's last frame, while it's on screen.
+    image: Option<Arc<RenderImage>>,
+    last_seq: u64,
+    /// It has painted since it last finished loading. Until it has, the
+    /// app's own pages show the app's background instead of the frame:
+    /// Chromium paints a white page first (H1.1).
+    painted: bool,
+    /// The size it's laid out at (w, h, scale %).
+    applied: (i32, i32, u32),
 }
 
 /// A tab's sound indicator.
@@ -417,18 +435,23 @@ pub struct BrowserPane {
     size: Option<(i32, i32, f32)>,
     /// Why Chromium couldn't start, if it couldn't.
     unavailable: Option<String>,
-    image: Option<Arc<RenderImage>>,
-    /// The active tab has painted since it last finished loading. Until it
-    /// has, the app's own pages show the app's background instead of the
-    /// frame: Chromium paints a white page first (H1.1).
-    painted_since_load: bool,
     /// An open dropdown list: where it goes (CSS px) and its pixels.
     popup: Option<(f32, f32, Arc<RenderImage>)>,
     /// Old frames waiting to be released from the GPU atlas.
     retired: Vec<Arc<RenderImage>>,
-    last_seq: u64,
-    applied: (i32, i32, u32),
     geometry: Rc<Cell<Geometry>>,
+    /// Tabs shown side by side (split.rs), when the active tab is one.
+    split: Vec<u32>,
+    /// Tabs the agent looked at by id lately (`browser_view_tabs`), kept
+    /// live off screen meanwhile.
+    peeked: HashMap<u32, Instant>,
+    /// The tab a mouse button went down in, which gets the drag and the
+    /// release.
+    pressed: Option<u32>,
+    /// Pop out: the shell's sidebar as a tab (sidebar_tab.rs), and whether
+    /// it's the tab on screen.
+    sidebar_tab: Option<gpui::AnyView>,
+    sidebar_shown: bool,
     chrome: Chrome,
     address: Entity<TextInput>,
     editing_address: bool,
@@ -474,6 +497,7 @@ pub struct BrowserPane {
 impl EventEmitter<BrowsingChanged> for BrowserPane {}
 impl EventEmitter<FullscreenChanged> for BrowserPane {}
 impl EventEmitter<AgentControl> for BrowserPane {}
+impl EventEmitter<DockSidebar> for BrowserPane {}
 
 impl BrowserPane {
     pub fn new(
@@ -551,13 +575,14 @@ impl BrowserPane {
             next_tab_id: 1,
             size: None,
             unavailable: cef.err(),
-            image: None,
-            painted_since_load: false,
             popup: None,
             retired: Vec::new(),
-            last_seq: 0,
-            applied: (0, 0, 0),
             geometry: Rc::new(Cell::new(Geometry::default())),
+            split: Vec::new(),
+            peeked: HashMap::new(),
+            pressed: None,
+            sidebar_tab: None,
+            sidebar_shown: false,
             chrome: Chrome::default(),
             address,
             editing_address: false,
@@ -598,7 +623,6 @@ impl BrowserPane {
             return;
         }
         let scale = if g.scale > 0.0 { g.scale } else { 1.0 };
-        let wanted = (w, h, (scale * 100.0) as u32);
 
         self.size = Some((w, h, scale));
         if self.tabs.is_empty() {
@@ -608,12 +632,12 @@ impl BrowserPane {
                 cx.notify();
                 return;
             }
-            self.applied = wanted;
-        } else if self.applied != wanted {
-            for t in &self.tabs {
-                t.view.resize(w, h, scale);
-            }
-            self.applied = wanted;
+        }
+        self.resize_tabs(w, h, scale);
+        let before = self.peeked.len();
+        self.peeked.retain(|_, at| at.elapsed() < PEEK_FOR);
+        if before != self.peeked.len() {
+            self.sync_visibility();
         }
 
         // Links that asked for new tabs, popup windows pages opened, and
@@ -660,6 +684,15 @@ impl BrowserPane {
                     }
                 }
             }
+            // Looking at a tab by id: keep it live (and awake) meanwhile.
+            if let Request::Cdp { tab: Some(id), .. } | Request::State { tab: Some(id), .. } = &req {
+                if let Some(t) = self.tabs.iter().find(|t| t.id == *id) {
+                    if t.view.visibility() == Visibility::Hidden {
+                        t.view.set_visibility(Visibility::Working);
+                    }
+                    self.peeked.insert(*id, Instant::now());
+                }
+            }
             // The tab the agent's page requests go to.
             let target = if self.agent_tab_gone { None } else { self.agent_index() };
             let gone = || {
@@ -671,7 +704,13 @@ impl BrowserPane {
             };
             let view = target.map(|i| &self.tabs[i].view);
             match req {
-                Request::Cdp { method, params, reply } => match view {
+                Request::Cdp { tab: Some(id), method, params, reply } => match self.tabs.iter().find(|t| t.id == id) {
+                    Some(t) => t.view.cdp(&method, params, reply),
+                    None => {
+                        let _ = reply.send(Err(format!("No tab {id}.")));
+                    }
+                },
+                Request::Cdp { tab: None, method, params, reply } => match view {
                     Some(view) => view.cdp(&method, params, reply),
                     None => {
                         let _ = reply.send(Err(gone()));
@@ -691,7 +730,15 @@ impl BrowserPane {
                         .ok_or_else(gone);
                     let _ = reply.send(r);
                 }
-                Request::State { reply } => {
+                Request::State { tab: Some(id), reply } => {
+                    let r = self.index_of(id).map(|i| {
+                        let mut st = self.tabs[i].view.page_state();
+                        st.tab_note = self.tab_note(i);
+                        st
+                    });
+                    let _ = reply.send(r.ok_or_else(|| format!("No tab {id}.")));
+                }
+                Request::State { tab: None, reply } => {
                     let r = match (view, target) {
                         (Some(view), Some(i)) => {
                             let mut st = view.page_state();
@@ -795,6 +842,7 @@ impl BrowserPane {
         }
         // The user is needed on the page the agent works in: show it.
         if bring_forward {
+            self.show_page(cx);
             if let Some(i) = self.agent_index().filter(|i| *i != self.active) {
                 debug(|| format!("handoff: showing the agent's tab {}", self.tabs[i].id));
                 self.activate(i, cx);
@@ -875,38 +923,19 @@ impl BrowserPane {
                 self.test_agent_shot = None;
             }
         }
-        let Some(view) = self.tabs.get(self.active).map(|t| &t.view) else { return };
-        let (seq, loading) = {
-            let st = view.state();
-            (st.frame_seq, st.loading)
-        };
-        if loading && self.painted_since_load {
-            self.painted_since_load = false;
-            changed = true;
+        if self.tabs.get(self.active).is_none() {
+            return;
         }
-        if seq != self.last_seq {
-            self.last_seq = seq;
-            if !loading && !self.painted_since_load {
-                self.painted_since_load = true;
-                changed = true;
-            }
-            if let Some(frame) = view.take_frame() {
-                if let Some(name) = self.test_shot.take() {
-                    save_ppm(&rail_browser::data_dir().join(format!("{name}.ppm")), &frame);
-                }
-                if let Some(path) = self.save_shot.take() {
-                    Self::save_screenshot(path, &frame, cx);
-                }
-                if let Some(buf) = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra) {
-                    // GPUI images are BGRA, which is what Chromium paints.
-                    let img = Arc::new(RenderImage::new(vec![image::Frame::new(buf)]));
-                    if let Some(old) = self.image.replace(img) {
-                        self.retired.push(old);
-                    }
-                    changed = true;
-                }
+        let mut shown = vec![self.active];
+        shown.extend(self.split_cells().into_iter().map(|(i, _)| i).filter(|i| *i != self.active));
+        // Behind the sidebar tab nothing is drawn, so frames wait (and old
+        // ones aren't released until the page is drawn again).
+        if !self.sidebar_tab_shown() {
+            for i in shown {
+                changed |= self.take_tab_frame(i, cx);
             }
         }
+        let view = &self.tabs[self.active].view;
 
         // Open dropdown list (painted separately by Chromium).
         if let Some((x, y, _w, _h, frame)) = view.take_popup_frame() {
@@ -1002,6 +1031,47 @@ impl BrowserPane {
         if changed {
             cx.notify();
         }
+    }
+
+    /// Picks up tab `i`'s new frame, if it painted one. The focused tab's
+    /// also goes to a pending screenshot. Returns whether anything changed.
+    fn take_tab_frame(&mut self, i: usize, cx: &mut Context<Self>) -> bool {
+        let mut changed = false;
+        let (seq, loading) = {
+            let st = self.tabs[i].view.state();
+            (st.frame_seq, st.loading)
+        };
+        let t = &mut self.tabs[i];
+        if loading && t.painted {
+            t.painted = false;
+            changed = true;
+        }
+        if seq == t.last_seq {
+            return changed;
+        }
+        t.last_seq = seq;
+        if !loading && !t.painted {
+            t.painted = true;
+            changed = true;
+        }
+        let Some(frame) = t.view.take_frame() else { return changed };
+        if i == self.active {
+            if let Some(name) = self.test_shot.take() {
+                save_ppm(&rail_browser::data_dir().join(format!("{name}.ppm")), &frame);
+            }
+            if let Some(path) = self.save_shot.take() {
+                Self::save_screenshot(path, &frame, cx);
+            }
+        }
+        if let Some(buf) = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra) {
+            // GPUI images are BGRA, which is what Chromium paints.
+            let img = Arc::new(RenderImage::new(vec![image::Frame::new(buf)]));
+            if let Some(old) = self.tabs[i].image.replace(img) {
+                self.retired.push(old);
+            }
+            changed = true;
+        }
+        changed
     }
 
     /// Per-tab upkeep: zoom, favicons, the sound indicator and context
@@ -1155,7 +1225,7 @@ impl BrowserPane {
 
     /// The agent is working in a tab the user isn't looking at.
     fn agent_in_background(&self) -> bool {
-        self.agent_tab.and_then(|a| self.index_of(a.id)).is_some_and(|i| i != self.active)
+        self.agent_tab.is_some_and(|a| self.index_of(a.id).is_some_and(|i| i != self.active) && !self.on_screen(a.id))
     }
 
     /// The tab to mark in the tab strip as the agent's, if any.
@@ -1170,11 +1240,17 @@ impl BrowserPane {
     fn tab_note(&self, i: usize) -> Option<String> {
         let t = self.tabs.get(i)?;
         let mut notes = Vec::new();
-        if i != self.active {
-            let user = self.tabs.get(self.active).map(|u| {
-                let name = if u.chrome.title.is_empty() { u.chrome.url.clone() } else { u.chrome.title.clone() };
-                format!("tab {} (“{name}”)", u.id)
-            });
+        let user = self.tabs.get(self.active).map(|u| {
+            let name = if u.chrome.title.is_empty() { u.chrome.url.clone() } else { u.chrome.title.clone() };
+            format!("tab {} (“{name}”)", u.id)
+        });
+        if i != self.active && self.on_screen(t.id) {
+            notes.push(format!(
+                "Tab {}: the user sees this tab in split view, next to {}, which has the focus.",
+                t.id,
+                user.unwrap_or_else(|| "another tab".into())
+            ));
+        } else if i != self.active {
             notes.push(format!(
                 "Tab {}: you're working in this tab in the background; the user is looking at {}.",
                 t.id,
@@ -1190,14 +1266,16 @@ impl BrowserPane {
         (!notes.is_empty()).then(|| notes.join(" "))
     }
 
-    /// The active tab is shown; the agent's tab, while it works there,
-    /// stays live off screen; every other tab is hidden.
+    /// The tabs on screen (the active one, and the split) are shown; the
+    /// agent's tab, while it works there, and tabs it's looking at stay live
+    /// off screen; every other tab is hidden.
     fn sync_visibility(&self) {
         let working = if self.agent_busy { self.agent_index() } else { None };
         for (i, t) in self.tabs.iter().enumerate() {
-            let v = if i == self.active {
-                Visibility::Shown
-            } else if Some(i) == working {
+            let v = if self.on_screen(t.id) {
+                // Behind the sidebar tab: live, but not on screen.
+                if self.sidebar_shown && self.sidebar_tab.is_some() { Visibility::Working } else { Visibility::Shown }
+            } else if Some(i) == working || self.peeked.contains_key(&t.id) {
                 Visibility::Working
             } else {
                 Visibility::Hidden
@@ -1238,6 +1316,10 @@ impl BrowserPane {
             reader: None,
             recorded: false,
             loaded: false,
+            image: None,
+            last_seq: u64::MAX,
+            painted: false,
+            applied: self.size.map(|(w, h, s)| (w, h, (s * 100.0) as u32)).unwrap_or_default(),
         });
         if activate {
             self.activate(self.tabs.len() - 1, cx);
@@ -1323,17 +1405,14 @@ impl BrowserPane {
         self.close_menu(cx);
         self.nav_menu = None;
         self.active = index;
-        self.sync_visibility();
+        // Tabs that left the screen drop their frames; the new tab shows
+        // its next one.
+        self.screen_changed(cx);
         let tab = &self.tabs[index];
         debug(|| format!("activate tab {}", tab.id));
-        // Show the new tab's next frame, not the old tab's last one.
-        if let Some(old) = self.image.take() {
-            self.retired.push(old);
-        }
         if let Some((_, _, old)) = self.popup.take() {
             self.retired.push(old);
         }
-        self.last_seq = u64::MAX;
         self.chrome = tab.chrome.clone();
         self.follow_fullscreen(cx);
         if !self.editing_address {
@@ -1356,6 +1435,8 @@ impl BrowserPane {
             self.nav_menu = None;
         }
         self.tabs.remove(index); // dropping the WebView closes its page
+        self.split_forget(id);
+        self.peeked.remove(&id);
         // A popup that closes hands the agent back to the page that opened
         // it. Any other tab the agent was working in is gone for this turn.
         if self.agent_tab.is_some_and(|a| a.id == id) {
@@ -1375,12 +1456,13 @@ impl BrowserPane {
             self.active = self.active.saturating_sub(1);
         }
         if closing_active {
-            // Closing a popup returns to the page that opened it.
-            let next = opener.and_then(|o| self.index_of(o)).unwrap_or(self.active);
+            // Closing a popup returns to the page that opened it; closing a
+            // pane of a split, to another pane.
+            let pane = self.split.first().and_then(|s| self.index_of(*s));
+            let next = opener.and_then(|o| self.index_of(o)).or(pane).unwrap_or(self.active);
             self.activate(next, cx);
         }
-        self.sync_visibility();
-        cx.notify();
+        self.screen_changed(cx);
     }
 
     fn index_of(&self, id: u32) -> Option<usize> {
@@ -1416,6 +1498,16 @@ impl BrowserPane {
                 self.agent_tab = Some(AgentTab { id, chosen: i != self.active });
                 Ok(())
             }
+            TabOp::Split { ids } => {
+                self.set_split(ids, cx)?;
+                // Like a switch: the agent works in the focused pane.
+                self.agent_tab = None;
+                Ok(())
+            }
+            TabOp::Unsplit => {
+                self.unsplit(cx);
+                Ok(())
+            }
             TabOp::Close { id } => {
                 let i = self.index_of(id).ok_or_else(|| format!("No tab {id}."))?;
                 let own = self.agent_tab.is_some_and(|a| a.id == id);
@@ -1446,6 +1538,7 @@ impl BrowserPane {
                 active: i == self.active,
                 agent: Some(i) == agent,
                 opener: t.opener,
+                split: self.split_shown().contains(&t.id),
             })
             .collect()
     }
@@ -1453,6 +1546,7 @@ impl BrowserPane {
     // ---------------------------------------------------- tab actions
 
     pub fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_page(cx);
         if self.open_tab(HOME, true, cx).is_ok() {
             window.focus(&self.address.focus_handle(cx));
             self.address.update(cx, |a, cx| a.set_text("", cx));
@@ -1462,6 +1556,7 @@ impl BrowserPane {
     /// Opens `url` in a new tab and shows it (the home page's links that
     /// open in a new tab).
     pub fn open_in_new_tab(&mut self, url: &str, cx: &mut Context<Self>) {
+        self.show_page(cx);
         let _ = self.open_tab(url, true, cx);
     }
 
@@ -1478,6 +1573,7 @@ impl BrowserPane {
     }
 
     pub fn cycle_tab(&mut self, forward: bool, cx: &mut Context<Self>) {
+        self.show_page(cx);
         let n = self.tabs.len();
         if n > 1 {
             let next = if forward { (self.active + 1) % n } else { (self.active + n - 1) % n };
@@ -1765,6 +1861,7 @@ impl BrowserPane {
 
     fn tab_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let agent_tab = self.agent_marked();
+        let split = self.split_shown().to_vec();
         div()
             .flex()
             .items_end()
@@ -1772,8 +1869,9 @@ impl BrowserPane {
             .px_2()
             .pt_1()
             .bg(rgb(theme::BG))
+            .children(self.sidebar_tab_view(cx))
             .children(self.tabs.iter().enumerate().map(|(i, t)| {
-                let active = i == self.active;
+                let active = i == self.active && !self.sidebar_shown;
                 let title = if t.chrome.title.is_empty() {
                     if t.chrome.loading { "Loading…".to_string() } else { t.chrome.url.clone() }
                 } else {
@@ -1781,6 +1879,8 @@ impl BrowserPane {
                 };
                 let id = t.id;
                 let agents = agent_tab == Some(t.id);
+                // On screen in split view: looks open like the active tab.
+                let paned = split.contains(&t.id) && !self.sidebar_shown;
                 // A popup window shows which tab opened it.
                 let title = match t.opener {
                     Some(_) => format!("⧉ {title}"),
@@ -1830,13 +1930,17 @@ impl BrowserPane {
                     .py_1()
                     .rounded_t_md()
                     .text_xs()
-                    .bg(rgb(if active { theme::PANE } else { theme::BG }))
+                    .bg(rgb(if active || paned { theme::PANE } else { theme::BG }))
                     .text_color(rgb(if active { theme::FG } else { theme::MUTED }))
                     .border_t_2()
-                    .border_color(rgb(if agents { theme::ACCENT } else if active { theme::PANE } else { theme::BG }))
+                    .border_color(rgb(if agents { theme::ACCENT } else if active || paned { theme::PANE } else { theme::BG }))
                     .when(!active, |d| d.cursor_pointer().hover(|s| s.bg(rgb(theme::RAISED))))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(i) = this.index_of(id) {
+                    // Ctrl+click adds the tab to split view, or takes it out.
+                    .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, _, cx| {
+                        this.show_page(cx);
+                        if ev.modifiers().control {
+                            this.toggle_split_member(id, cx);
+                        } else if let Some(i) = this.index_of(id) {
                             this.activate(i, cx);
                         }
                     }))
@@ -1848,6 +1952,7 @@ impl BrowserPane {
                     }))
                     .child(icon)
                     .child(div().flex_1().min_w(px(0.)).overflow_hidden().truncate().child(SharedString::from(title)))
+                    .when(paned, |d| d.child(div().flex_none().text_color(rgb(theme::ACCENT)).child("◫")))
                     // The tab the agent is working in.
                     .when(agents, |d| {
                         d.child(
@@ -1893,6 +1998,7 @@ impl BrowserPane {
     }
 
     pub fn navigate(&mut self, input: &str, cx: &mut Context<Self>) {
+        self.show_page(cx);
         if let Some(v) = self.view() {
             v.navigate(&normalize_address(input));
         }
@@ -1920,9 +2026,13 @@ impl BrowserPane {
 
     /// The user is acting on the page while the agent drives it. (Not
     /// during a handoff: then the agent is waiting for exactly that.)
-    fn user_took_over(&mut self, cx: &mut Context<Self>) {
-        // Browsing another tab while the agent works in its own is fine.
-        if self.agent_busy && self.agent_driving && self.handoff.is_none() && !self.agent_in_background() {
+    /// The user's input went to tab `i` (the focused one by default): if
+    /// that's where the agent is working, the user has taken over.
+    /// Browsing another tab while the agent works in its own is fine,
+    /// including another pane of a split.
+    fn user_took_over(&mut self, i: Option<usize>, cx: &mut Context<Self>) {
+        let i = i.unwrap_or(self.active);
+        if self.agent_busy && self.agent_driving && self.handoff.is_none() && self.agent_index() == Some(i) {
             cx.emit(AgentControl::TookOver);
         }
     }
@@ -1955,18 +2065,19 @@ impl BrowserPane {
 
     // ---------------------------------------------------------- input
 
-    fn local(&self, p: gpui::Point<Pixels>) -> (f32, f32) {
-        let origin = self.geometry.get().bounds.map(|b| b.origin).unwrap_or_default();
-        (f32::from(p.x - origin.x), f32::from(p.y - origin.y))
-    }
-
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.user_took_over(cx);
         window.focus(&self.page_focus);
+        // In split view, a click in another pane focuses it first.
+        let Some((i, x, y)) = self.hit(ev.position) else { return };
+        self.user_took_over(Some(i), cx);
+        if i != self.active {
+            self.activate(i, cx);
+        }
         let Some(v) = self.view() else { return };
         v.set_focus(true);
         let Some(button) = map_button(ev.button) else { return };
-        let (x, y) = self.local(ev.position);
+        self.pressed = self.tabs.get(self.active).map(|t| t.id);
+        let v = &self.tabs[self.active].view;
         v.mouse_button(x, y, button, false, ev.click_count, mods(&ev.modifiers));
         if button == rail_browser::MouseButton::Right {
             self.user_right_click = Some((Instant::now(), x, y));
@@ -1974,15 +2085,33 @@ impl BrowserPane {
     }
 
     fn on_mouse_up(&mut self, ev: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
-        let (Some(v), Some(button)) = (self.view(), map_button(ev.button)) else { return };
-        let (x, y) = self.local(ev.position);
-        v.mouse_button(x, y, button, true, ev.click_count, mods(&ev.modifiers));
+        // The release goes to the tab the button went down in.
+        let i = match self.pressed.take().and_then(|id| self.index_of(id)) {
+            Some(i) => i,
+            None => match self.hit(ev.position) {
+                Some((i, ..)) => i,
+                None => return,
+            },
+        };
+        let Some(button) = map_button(ev.button) else { return };
+        let (x, y) = self.local_in(i, ev.position);
+        self.tabs[i].view.mouse_button(x, y, button, true, ev.click_count, mods(&ev.modifiers));
     }
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, _: &mut Context<Self>) {
-        let Some(v) = self.view() else { return };
-        let (x, y) = self.local(ev.position);
-        v.mouse_move(x, y, mods(&ev.modifiers));
+        // A drag stays with its tab; otherwise the tab under the pointer.
+        let dragging = self.pressed.filter(|_| ev.pressed_button.is_some()).and_then(|id| self.index_of(id));
+        let (i, x, y) = match dragging {
+            Some(i) => {
+                let (x, y) = self.local_in(i, ev.position);
+                (i, x, y)
+            }
+            None => match self.hit(ev.position) {
+                Some(hit) => hit,
+                None => return,
+            },
+        };
+        self.tabs[i].view.mouse_move(x, y, mods(&ev.modifiers));
     }
 
     fn on_scroll(&mut self, ev: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -2002,13 +2131,12 @@ impl BrowserPane {
             }
             return;
         }
-        let Some(v) = self.view() else { return };
-        let (x, y) = self.local(ev.position);
-        v.wheel(x, y, dx, dy, mods(&ev.modifiers));
+        let Some((i, x, y)) = self.hit(ev.position) else { return };
+        self.tabs[i].view.wheel(x, y, dx, dy, mods(&ev.modifiers));
     }
 
     fn on_key_down(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.user_took_over(cx);
+        self.user_took_over(None, cx);
         if self.menu.is_some() {
             self.close_menu(cx);
             if ev.keystroke.key == "escape" {
@@ -2087,6 +2215,7 @@ impl BrowserPane {
             .children(self.zoom_badge(cx))
             .child(self.reader_button(cx))
             .child(self.screenshot_button(cx))
+            .child(self.split_button(cx))
             // Nothing to bookmark or focus on the app's own pages.
             .when(!rail_browser::app_pages::is_app_page(&self.chrome.url), |d| {
                 d.child(self.bookmark_button(cx)).child(self.focus_button(cx))
@@ -2470,11 +2599,14 @@ impl BrowserPane {
             let _ = window.drop_image(old);
         }
         let geometry = self.geometry.clone();
+        let split = !self.split_shown().is_empty();
         // The app's own pages: the app's background until a real frame of
         // the loaded page arrives, never Chromium's first white one.
-        let cover = rail_browser::app_pages::is_app_page(&self.chrome.url) && !self.painted_since_load;
-        let image = if cover { None } else { self.image.clone() };
-        let popup = self.popup.clone();
+        let painted = self.tabs.get(self.active).is_some_and(|t| t.painted);
+        let cover = !split && rail_browser::app_pages::is_app_page(&self.chrome.url) && !painted;
+        // In split view each pane paints its own tab (split.rs).
+        let image = if cover || split { None } else { self.tabs.get(self.active).and_then(|t| t.image.clone()) };
+        let popup = if split { None } else { self.popup.clone() };
         let cursor = match self.chrome.cursor {
             Cursor::Arrow => CursorStyle::Arrow,
             Cursor::Pointer => CursorStyle::PointingHand,
@@ -2486,11 +2618,13 @@ impl BrowserPane {
             Cursor::ResizeColumn => CursorStyle::ResizeLeftRight,
             Cursor::ResizeRow => CursorStyle::ResizeUpDown,
         };
-        // The agent's rect is in CSS pixels; at page zoom Z each is Z of ours.
-        let z = self.tabs.get(self.active).map(|t| zoom_factor(t.zoom) as f32).unwrap_or(1.0);
-        let active_id = self.tabs.get(self.active).map(|t| t.id);
-        let highlight = self.highlight.as_ref().filter(|(tab, ..)| Some(*tab) == active_id).map(|(_, r, label, _)| {
-            let (x, y) = (r.x as f32 * z, r.y as f32 * z);
+        // The agent's rect is in CSS pixels; at page zoom Z each is Z of
+        // ours. It's drawn over its tab wherever that is on screen.
+        let lit = self.highlight.as_ref().and_then(|(tab, ..)| self.index_of(*tab)).filter(|i| self.on_screen(self.tabs[*i].id));
+        let z = lit.map(|i| zoom_factor(self.tabs[i].zoom) as f32).unwrap_or(1.0);
+        let (ox, oy) = lit.and_then(|i| self.page_origin(i)).unwrap_or((0.0, 0.0));
+        let highlight = self.highlight.as_ref().filter(|_| lit.is_some()).map(|(_, r, label, _)| {
+            let (x, y) = (ox + r.x as f32 * z, oy + r.y as f32 * z);
             let (w, h) = ((r.width as f32 * z).max(4.), (r.height as f32 * z).max(4.));
             vec![
                 div()
@@ -2618,7 +2752,7 @@ impl BrowserPane {
             .flex_1()
             .min_h(px(0.))
             .w_full()
-            .bg(rgb(if cover { theme::BG } else { 0xffffff }))
+            .bg(rgb(if cover || split { theme::BG } else { 0xffffff }))
             .track_focus(&self.page_focus)
             .key_context("WebPage")
             .cursor(cursor)
@@ -2638,33 +2772,25 @@ impl BrowserPane {
                     move |bounds, window, _| {
                         geometry.set(Geometry { bounds: Some(bounds), scale: window.scale_factor() });
                     },
-                    move |bounds, _, window, _| {
-                        let Some(img) = image else { return };
-                        // Frames are device pixels; draw them at logical size.
-                        let s = window.scale_factor().max(0.01);
-                        let fs = img.size(0);
-                        let logical =
-                            size(px(fs.width.0 as f32 / s), px(fs.height.0 as f32 / s));
-                        let target = Bounds::new(point(bounds.origin.x, bounds.origin.y), logical);
-                        let _ = window.paint_image(target, Corners::default(), img, 0, false);
-                        if let Some((px_, py_, pimg)) = popup {
-                            let ps = pimg.size(0);
-                            let psize = size(px(ps.width.0 as f32 / s), px(ps.height.0 as f32 / s));
-                            let at = point(bounds.origin.x + px(px_), bounds.origin.y + px(py_));
-                            let _ = window.paint_image(Bounds::new(at, psize), Corners::default(), pimg, 0, false);
-                        }
-                    },
+                    // Frames are device pixels, drawn at logical size.
+                    move |bounds, _, window, _| split::paint_frame(bounds, image, popup, window),
                 )
                 .size_full(),
             )
+            .children(self.split_panes(cx))
             .children(highlight.into_iter().flatten())
             .children(agent_bar)
-            .children(self.dialog_card(cx))
-            .children(self.permission_card(cx))
-            .children(self.crash_overlay(cx))
+            .child({
+                // The focused tab's own overlays sit over its pane.
+                let mut own: Vec<gpui::AnyElement> = Vec::new();
+                own.extend(self.dialog_card(cx).map(|e| e.into_any_element()));
+                own.extend(self.permission_card(cx).map(|e| e.into_any_element()));
+                own.extend(self.crash_overlay(cx).map(|e| e.into_any_element()));
+                self.over_focused(own)
+            })
             .children(self.handoff_banner(cx))
             .children(self.code_card_view(cx))
-            .children(self.context_menu_view(cx))
+            .child(self.over_focused(self.context_menu_view(cx).map(|e| e.into_any_element()).into_iter().collect()))
             .children(self.nav_menu_view(cx))
             .children(self.notice.as_ref().map(|(text, _)| {
                 div()
@@ -3028,7 +3154,8 @@ impl BrowserPane {
     /// (typed in the address bar), `visits` (the history's URLs), `histmenu:back|forward` (the
     /// Back/Forward history list), `histpick:<n>` (its nth entry, nearest
     /// first), `shot:<name>`, `agentshot:<name>` (a frame of the agent's tab
-    /// while it's in the background).
+    /// while it's in the background), and split view's `ctrltab:<n>`,
+    /// `splitbutton` and `areaclick:X:Y`.
     fn run_test_step(&mut self, step: &str, cx: &mut Context<Self>) {
         let (name, arg) = step.split_once(':').unwrap_or((step, ""));
         let xy = || {
@@ -3052,7 +3179,7 @@ impl BrowserPane {
                 // userclick: the user clicking their page while the agent
                 // works, which stops the agent if it's working in that tab.
                 if name == "userclick" {
-                    self.user_took_over(cx);
+                    self.user_took_over(None, cx);
                 }
                 if let (Some(v), Some((x, y))) = (self.view(), xy()) {
                     let b = if name == "rclick" { rail_browser::MouseButton::Right } else { rail_browser::MouseButton::Left };
@@ -3218,6 +3345,35 @@ impl BrowserPane {
                     self.activate(i, cx);
                 }
             }
+            // Split view (split.rs): ctrltab:<n> is a Ctrl+click on the nth
+            // tab, splitbutton the toolbar button, areaclick:X:Y a click at
+            // that point of the page area (whichever pane it's in).
+            "ctrltab" => {
+                if let Some(id) = arg.parse::<usize>().ok().and_then(|i| self.tabs.get(i)).map(|t| t.id) {
+                    self.toggle_split_member(id, cx);
+                }
+            }
+            "splitbutton" => self.toggle_split(cx),
+            "areaclick" => {
+                let origin = self.geometry.get().bounds.map(|b| b.origin).unwrap_or_default();
+                let Some((x, y)) = xy() else { return };
+                match self.hit(point(origin.x + px(x), origin.y + px(y))) {
+                    Some((i, lx, ly)) => {
+                        self.user_took_over(Some(i), cx);
+                        if i != self.active {
+                            self.activate(i, cx);
+                        }
+                        let v = &self.tabs[self.active].view;
+                        let b = rail_browser::MouseButton::Left;
+                        v.set_focus(true);
+                        v.mouse_move(lx, ly, Modifiers::default());
+                        v.mouse_button(lx, ly, b, false, 1, Modifiers::default());
+                        v.mouse_button(lx, ly, b, true, 1, Modifiers::default());
+                        eprintln!("pane test: areaclick went to tab {} at {lx:.0},{ly:.0}", self.tabs[self.active].id);
+                    }
+                    None => eprintln!("pane test: areaclick hit no page"),
+                }
+            }
             "log" => {
                 for (i, t) in self.tabs.iter().enumerate() {
                     let st = t.view.page_state();
@@ -3239,7 +3395,8 @@ impl BrowserPane {
                         t.chrome.reader_of,
                     );
                 }
-                eprintln!("pane test: painted_since_load={}", self.painted_since_load);
+                let painted = self.tabs.get(self.active).is_some_and(|t| t.painted);
+                eprintln!("pane test: painted_since_load={painted} split={:?}", self.split_shown());
                 let menu = self.menu.as_ref().map(|m| (m.x, m.y, m.info.clone()));
                 eprintln!("pane test: menu={menu:?} notice={:?}", self.notice.as_ref().map(|n| &n.0));
             }
@@ -3299,7 +3456,12 @@ impl Render for BrowserPane {
         if self.fullscreen {
             return root.child(self.page(window, cx));
         }
-        root = root.child(self.tab_strip(cx)).child(self.toolbar(cx)).child(self.panels(cx));
+        root = root.child(self.tab_strip(cx));
+        // Popped out and selected: the sidebar in place of the page.
+        if let Some(body) = self.sidebar_tab_body() {
+            return root.child(body);
+        }
+        root = root.child(self.toolbar(cx)).child(self.panels(cx));
         if let Some(err) = &self.chrome.load_error {
             root = root.child(
                 div()
@@ -3333,7 +3495,7 @@ impl BrowserPane {
         let Some(after) = rail_browser::discard_after() else { return false };
         let mut any = false;
         for (i, t) in self.tabs.iter().enumerate() {
-            if i != self.active && t.view.discard_if_idle(after) {
+            if i != self.active && !self.on_screen(t.id) && t.view.discard_if_idle(after) {
                 eprintln!("discarded idle tab {} ({})", t.id, t.chrome.url);
                 any = true;
             }

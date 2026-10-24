@@ -164,6 +164,7 @@ The minimum for the agent to work in the browser at all.
 ## Phase 3: Tabs, windows and navigation
 
 ### 3.1 Multiple tabs — ✅ **COMPLETED** (tab strip, shortcuts, `browser_tabs`; the agent works in its own background tab (`new` with `background`, or `use`) while the user browses theirs; marked "agent" in the strip; the agent bar offers Show)
+- Split view — ✅ **COMPLETED**: 2–4 tabs on screen in a grid (side by side, columns, 2×2), each laid out at its pane's size; Ctrl+click a tab or the toolbar split button; the clicked pane has the focus; the split stays a group when another tab is shown. The agent splits with `browser_tabs` (`split`/`unsplit`) and looks at up to 4 tabs at once with `browser_view_tabs` (screenshot, text and injection check per tab, without switching). Evals `split-view-user`, `agent-split-view`, `agent-views-background-tab`.
 - Real tabs in the UI (a tab strip), each its own `WebView`.
 - Agent tools: `browser_tabs`, `browser_new_tab`, `browser_switch_tab`,
   `browser_close_tab`.
@@ -422,6 +423,7 @@ set path instead of starting from scratch each time.
 - Screenshot button (toolbar camera: saves the visible page as a PNG in ~/Desktop/unibrow-workspace/Screenshots and copies it with wl-copy/xclip; eval `screenshot-button`) — ✅ **COMPLETED**
 - Workspace folder and sidebar tab (`~/Desktop/unibrow-workspace` with Screenshots, Downloads, Pages, Chats and Files; the Workspace tab lists it with thumbnails, open, rename, delete to the Trash, show in folder; Alt+6; eval `workspace-tab`) — ✅ **COMPLETED**
 - Agent saves screenshots to the workspace (`browser_save_screenshot`: the visible page, one element or a region, as PNG in Screenshots; sensitive fields masked; evals `agent-saves-screenshot`, `agent-saves-element-shot`, `agent-saved-shot-masked`) — ✅ **COMPLETED**
+- Sidebar pop out (⤢ / Ctrl+Shift+B: the sidebar becomes a "Sidebar" tab, first in the tab strip, shown full size in a centered column; web tabs keep running live off screen; the tab's × docks it again; pages come forward when one needs the user or a sidebar link opens a page; eval `sidebar-pop-out`) — ✅ **COMPLETED**
 - Translate page — skipped: Chromium's translate sends page text to Google. Option: the agent translates the extracted article into chat or reader view — todo
 - Spellcheck in fields — blocked: CEF 154 off-screen browsers never report misspellings (dictionary downloads, prefs set); menu wiring ready if it ever does
 - Right-click context menus rendered in-app (links, images, editing, navigation, save as PDF, view source) — ✅ **COMPLETED**

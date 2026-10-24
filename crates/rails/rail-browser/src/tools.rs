@@ -257,6 +257,7 @@ pub fn tools(
         Arc::new(clipboard::Clipboard(b.clone())),
         Arc::new(Dialog(b.clone())),
         Arc::new(tabs::Tabs(b.clone())),
+        Arc::new(tabs::ViewTabs(b.clone())),
         Arc::new(history::HistoryList(b.clone())),
         Arc::new(Find(b.clone())),
         Arc::new(Downloads(b.clone())),
@@ -298,7 +299,8 @@ impl NotOnAppPages {
 fn acts_on_open_page(tool: &str, input: &Value) -> bool {
     match tool {
         "browser_open" | "browser_tabs" | "browser_back" | "browser_forward" | "browser_reload" | "browser_wait"
-        | "browser_history_list" | "browser_downloads" | "browser_read_download" | "browser_compare" | "playbook_run"
+        | "browser_history_list" | "browser_downloads" | "browser_read_download" | "browser_compare" | "browser_view_tabs"
+        | "playbook_run"
         | "playbook_save" => false,
         "browser_extract" | "browser_gather" => input["url"].as_str().is_none_or(|u| u.trim().is_empty()),
         _ => true,

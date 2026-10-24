@@ -1944,6 +1944,88 @@
     }
   },
   {
+    "name": "split-view-user",
+    "page": "polish.html",
+    "secs": 30,
+    "env": {
+      "UNIBROW_TEST_PANE": "wait;newtab;open:{base}/article.html;wait;splitbutton;wait;log;areaclick:700:200;wait;log;newtab;open:{base}/find.html;wait;log;tab:0;ctrltab:2;wait;log;splitbutton;wait;log"
+    },
+    "expect": {
+      "log_contains": [
+        "split=[2, 1]",
+        "areaclick went to tab 1",
+        "split=[2, 1, 3]",
+        "split=[]"
+      ],
+      "log_not_contains": [
+        "areaclick hit no page"
+      ]
+    }
+  },
+  {
+    "name": "agent-split-view",
+    "page": "polish.html",
+    "approve": "deny",
+    "task": "Open {base}/shop.html in a new tab and show it side by side with tab 1 using split view. Then, without switching tabs, use browser_view_tabs to look at both tabs at once and tell me each one's main heading.",
+    "expect": {
+      "tools": [
+        "browser_tabs",
+        "browser_view_tabs"
+      ],
+      "trace_contains": [
+        "on screen in split view",
+        "Screenshots, in order: tab"
+      ],
+      "reply_contains": [
+        "Choosing strings for an old bass",
+        "Unibrow Parts"
+      ]
+    }
+  },
+  {
+    "name": "agent-views-background-tab",
+    "page": "polish.html",
+    "approve": "deny",
+    "task": "Open {base}/find.html in a background tab (don't show it to me), then use browser_view_tabs to look at it and this tab together, and tell me the main heading of each.",
+    "expect": {
+      "tools": [
+        "browser_tabs",
+        "browser_view_tabs"
+      ],
+      "tools_not": [
+        "browser_read"
+      ],
+      "trace_contains": [
+        "in the background)",
+        "Screenshots, in order: tab"
+      ],
+      "reply_contains": [
+        "Choosing strings for an old bass",
+        "Results for"
+      ]
+    }
+  },
+  {
+    "name": "sidebar-pop-out",
+    "page": "polish.html",
+    "approve": "deny",
+    "task": "Reply with just the word ready, nothing else.",
+    "env": {
+      "UNIBROW_TEST_SHELL": "popout;popin;popout;openurl:{base}/article.html"
+    },
+    "after_turn": {
+      "wait_trace": "Shell test: done",
+      "timeout": 60
+    },
+    "expect": {
+      "trace_contains": [
+        "Shell test: popped out: true, sidebar tab shown: true",
+        "Shell test: popped out: false, sidebar tab shown: false",
+        "article.html; popped out: true, sidebar tab shown: false"
+      ]
+    }
+  },
+  {
     "name": "home-redirect-refused",
     "page": "redirect-home",
     "secs": 10,

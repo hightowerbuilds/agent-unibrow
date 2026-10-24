@@ -14,8 +14,10 @@
 //! trace as "Shell test: …": `rename:<title>`, `export`, `search:<text>`,
 //! `icons` (which visited sites have an icon for the History list),
 //! `interrupt_race:<text>` (Interrupt & send pressed just as a turn ends on
-//! its own), `idle` (waits up to a minute for the agent to finish) and the
-//! Workspace tab's steps (workspace_tab.rs).
+//! its own), `idle` (waits up to a minute for the agent to finish),
+//! `popout`, `popin` and `openurl:<address>` (Pop out to a tab, back, and
+//! a sidebar link, which shows the page), and the Workspace tab's steps
+//! (workspace_tab.rs).
 
 use crate::text_input::{Changed, Submit, TextInput};
 use crate::{Shell, StopAgent, theme};
@@ -341,6 +343,18 @@ impl Shell {
                 format!("interrupt race: busy={} queued={}", self.busy, self.queued_steering().len())
             }
             "idle" => format!("idle: busy={} queued={}", self.busy, self.queued_steering().len()),
+            // Pop out: the button (popout/popin), and a link in the sidebar
+            // (openurl:<address>), which shows the page again.
+            "popout" | "popin" => {
+                self.set_popped_out(name == "popout", cx);
+                let shown = self.browser.read(cx).sidebar_tab_shown();
+                format!("popped out: {}, sidebar tab shown: {shown}", self.popped_out)
+            }
+            "openurl" => {
+                self.open_url(arg.to_string(), cx);
+                let shown = self.browser.read(cx).sidebar_tab_shown();
+                format!("opened {arg}; popped out: {}, sidebar tab shown: {shown}", self.popped_out)
+            }
             "icons" => {
                 let mut sites: Vec<String> = Vec::new();
                 for v in self.store.history(&browsing::HistoryQuery { limit: 50, ..Default::default() }) {

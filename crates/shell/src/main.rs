@@ -39,7 +39,7 @@ use trace::{Kind, Trace};
 
 gpui::actions!(
     shell,
-    [ToggleSidebar, ShowChat, ShowHistory, ShowFocus, ShowTrace, ShowExplained, ShowWorkspace, StopAgent, NewTab, CloseTab, NextTab, PrevTab, FocusAddress, FindInPage, ZoomIn, ZoomOut, ZoomReset]
+    [ToggleSidebar, ShowChat, ShowHistory, ShowFocus, ShowTrace, ShowExplained, ShowWorkspace, TogglePopOut, StopAgent, NewTab, CloseTab, NextTab, PrevTab, FocusAddress, FindInPage, ZoomIn, ZoomOut, ZoomReset]
 );
 
 const KEYRING_SERVICE: &str = "agent-unibrow";
@@ -144,6 +144,8 @@ enum HistorySub {
 
 /// Width of the open sidebar and of the bumper strip that toggles it.
 const SIDEBAR_WIDTH: f32 = 420.;
+/// Widest the sidebar's column gets when popped out to fill the window.
+const POPPED_WIDTH: f32 = 960.;
 const BUMPER_WIDTH: f32 = 14.;
 
 struct PendingApproval {
@@ -236,6 +238,9 @@ struct Shell {
     focus_chat_pending: bool,
     status: SharedString,
     sidebar_open: bool,
+    /// Pop out: the sidebar is a tab in the browser's tab strip instead of
+    /// a column beside the page.
+    popped_out: bool,
     /// The sidebar, as its own cached view (see [`SidebarView`]).
     sidebar_view: Option<Entity<SidebarView>>,
     tab: SidebarTab,
@@ -283,6 +288,8 @@ impl Shell {
                 this.can_continue = true;
             }
         });
+        // The sidebar tab's ×: back beside the page.
+        let dock_sub = cx.subscribe(&browser, |this: &mut Self, _, _: &browser_pane::DockSidebar, cx| this.set_popped_out(false, cx));
         let history_filter = cx.new(|cx| TextInput::new("Search history", cx));
         let login_site = cx.new(|cx| TextInput::new("Site, e.g. sweetwater.com", cx));
         let login_user = cx.new(|cx| TextInput::new("Username or email", cx));
@@ -359,6 +366,7 @@ impl Shell {
             status: "".into(),
             sidebar_open: true,
             sidebar_view: None,
+            popped_out: false,
             tab: SidebarTab::Chat,
             history_sub: HistorySub::Visits,
             explained_page: 0,
@@ -368,7 +376,7 @@ impl Shell {
             chat_select: Default::default(),
             chat_focus: cx.focus_handle(),
             trace_scroll: ScrollHandle::new(),
-            _subscriptions: vec![subscription, browsing_sub, filter_sub, fullscreen_sub, control_sub],
+            _subscriptions: vec![subscription, browsing_sub, filter_sub, fullscreen_sub, control_sub, dock_sub],
             _events: None,
         };
         shell._subscriptions.extend(chat_tools_subs);
@@ -1399,7 +1407,37 @@ impl Shell {
 
     // ------------------------------------------------------------- views
 
+    /// Pops the sidebar out into a tab of its own in the tab strip (shown
+    /// at once), or back in beside the page.
+    fn set_popped_out(&mut self, popped: bool, cx: &mut Context<Self>) {
+        if self.popped_out == popped {
+            return;
+        }
+        let view = self.sidebar_view(cx);
+        self.popped_out = popped;
+        self.sidebar_open = true;
+        let tab = popped.then(|| AnyView::from(view));
+        self.browser.update(cx, |b, cx| b.set_sidebar_tab(tab, cx));
+        cx.notify();
+    }
+
+    /// The sidebar's cached view, made the first time it's needed.
+    fn sidebar_view(&mut self, cx: &mut Context<Self>) -> Entity<SidebarView> {
+        if let Some(v) = &self.sidebar_view {
+            return v.clone();
+        }
+        let shell = cx.entity();
+        let v = cx.new(|cx| SidebarView { _observe: cx.observe(&shell, |_, _, cx| cx.notify()), shell: shell.downgrade() });
+        self.sidebar_view = Some(v.clone());
+        v
+    }
+
     fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Out of the popped-out view, back to the sidebar beside the page.
+        if self.popped_out {
+            self.set_popped_out(false, cx);
+            return;
+        }
         self.sidebar_open = !self.sidebar_open;
         if self.sidebar_open && self.tab == SidebarTab::Chat {
             window.focus(&self.input.focus_handle(cx));
@@ -1500,6 +1538,24 @@ impl Shell {
                         cx.listener(|this, _, window, cx| this.select_tab(SidebarTab::Explained, window, cx)),
                     )),
             )
+            .when(!self.popped_out, |d| d.child(self.pop_out_button(cx)))
+    }
+
+    /// Pop out: the sidebar becomes a tab in the tab strip (whose × puts
+    /// it back).
+    fn pop_out_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("pop-out")
+            .mb_1()
+            .px_2()
+            .py(px(2.))
+            .rounded_md()
+            .text_xs()
+            .text_color(rgb(theme::MUTED))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(theme::RAISED)).text_color(rgb(theme::FG)))
+            .on_click(cx.listener(|this, _, _, cx| this.set_popped_out(true, cx)))
+            .child("⤢ Pop out")
     }
 
     /// The strip on the sidebar's edge that opens and closes it.
@@ -1637,6 +1693,7 @@ impl Shell {
     }
 
     fn open_url(&mut self, url: String, cx: &mut Context<Self>) {
+        // Shows the page, also when the sidebar is a tab.
         self.browser.update(cx, |b, cx| b.navigate(&url, cx));
     }
 
@@ -2427,14 +2484,15 @@ impl Shell {
                 .into_any_element()
             }
         };
-        div()
+        let column = div()
             .flex()
             .flex_col()
-            .w(px(SIDEBAR_WIDTH))
             .h_full()
-            .flex_none()
             .bg(rgb(theme::PANE))
             .relative()
+            // Popped out: a centered column of readable width.
+            .when(self.popped_out, |d| d.w_full().max_w(px(POPPED_WIDTH)).border_x_1().border_color(rgb(theme::RULE)))
+            .when(!self.popped_out, |d| d.w(px(SIDEBAR_WIDTH)).flex_none())
             .child(self.render_tabs(cx))
             .child(div().flex().flex_col().flex_1().min_h(px(0.)).child(body))
             .child(self.render_model_bar(cx))
@@ -2456,7 +2514,11 @@ impl Shell {
                         })),
                 )
                 .child(self.render_model_menu(cx))
-            })
+            });
+        if !self.popped_out {
+            return column.into_any_element();
+        }
+        div().size_full().flex().justify_center().bg(rgb(theme::BG)).child(column).into_any_element()
     }
 
     fn render_trace(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3014,20 +3076,15 @@ impl Render for Shell {
         if std::mem::take(&mut self.focus_chat_pending) {
             window.focus(&self.input.focus_handle(cx));
         }
-        if self.sidebar_view.is_none() {
-            let shell = cx.entity();
-            self.sidebar_view = Some(cx.new(|cx| SidebarView {
-                _observe: cx.observe(&shell, |_, _, cx| cx.notify()),
-                shell: shell.downgrade(),
-            }));
-        }
+        let view = self.sidebar_view(cx);
         // Cached: page frames redraw the browser pane (and so this view),
         // but the sidebar only re-renders when the shell itself changes.
         // A fullscreen video gets the whole window.
         let fullscreen = self.browser.read(cx).is_fullscreen();
-        let sidebar = (self.sidebar_open && !fullscreen).then(|| {
-            AnyView::from(self.sidebar_view.clone().expect("created above"))
-                .cached(StyleRefinement::default().w(px(SIDEBAR_WIDTH)).h_full().flex_none())
+        // Popped out, the sidebar is a tab in the browser pane instead.
+        let beside = !fullscreen && !self.popped_out;
+        let sidebar = (self.sidebar_open && beside).then(|| {
+            AnyView::from(view).cached(StyleRefinement::default().w(px(SIDEBAR_WIDTH)).h_full().flex_none())
         });
 
         div()
@@ -3061,13 +3118,14 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|this, _: &ShowExplained, window, cx| this.show_tab(SidebarTab::Explained, window, cx)))
             .on_action(cx.listener(|this, _: &ShowWorkspace, window, cx| this.show_tab(SidebarTab::Workspace, window, cx)))
+            .on_action(cx.listener(|this, _: &TogglePopOut, _, cx| this.set_popped_out(!this.popped_out, cx)))
             .flex()
             .flex_row()
             .size_full()
             .bg(rgb(theme::BG))
             .text_color(rgb(theme::FG))
             .children(sidebar)
-            .when(!fullscreen, |d| d.child(self.render_bumper(cx)))
+            .when(beside, |d| d.child(self.render_bumper(cx)))
             .child(self.browser.clone())
     }
 }
@@ -3237,6 +3295,7 @@ fn main() -> std::process::ExitCode {
             gpui::KeyBinding::new("alt-4", ShowTrace, None),
             gpui::KeyBinding::new("alt-5", ShowExplained, None),
             gpui::KeyBinding::new("alt-6", ShowWorkspace, None),
+            gpui::KeyBinding::new("ctrl-shift-b", TogglePopOut, None),
         ]);
         let bounds = Bounds::centered(None, size(px(1400.), px(860.)), cx);
         cx.open_window(
