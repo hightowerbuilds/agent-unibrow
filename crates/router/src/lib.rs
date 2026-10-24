@@ -32,6 +32,52 @@ pub struct ToolImage {
     pub base64: String,
 }
 
+/// A change a tool made to the user's files, for the change log: which
+/// message caused it (blame) and how to take it back (undo). Hashes are the
+/// SHA-256 of the contents, in hex.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FileChange {
+    /// A new file.
+    Created { path: std::path::PathBuf, hash: String },
+    /// A file's contents replaced. `before` is the old contents (`None` if
+    /// it was too big to keep, which can't be undone).
+    Replaced { path: std::path::PathBuf, before: Option<Vec<u8>>, hash: String },
+    /// A new folder; `top` is the highest one of the folders it made.
+    MadeDir { path: std::path::PathBuf, top: std::path::PathBuf },
+    Moved { from: std::path::PathBuf, to: std::path::PathBuf },
+    /// Moved to the Trash, to `trashed_as` (`None`: another drive's Trash,
+    /// through `gio`).
+    Trashed { path: std::path::PathBuf, trashed_as: Option<std::path::PathBuf> },
+    /// An empty folder removed (undoing a new folder).
+    RemovedDir { path: std::path::PathBuf },
+}
+
+impl FileChange {
+    /// The path it leaves changed (a move's destination).
+    pub fn path(&self) -> &std::path::Path {
+        match self {
+            FileChange::Created { path, .. }
+            | FileChange::Replaced { path, .. }
+            | FileChange::MadeDir { path, .. }
+            | FileChange::Trashed { path, .. }
+            | FileChange::RemovedDir { path } => path,
+            FileChange::Moved { to, .. } => to,
+        }
+    }
+
+    /// A short name for the kind of change ("created", "moved"...).
+    pub fn op(&self) -> &'static str {
+        match self {
+            FileChange::Created { .. } => "created",
+            FileChange::Replaced { .. } => "replaced",
+            FileChange::MadeDir { .. } => "made_dir",
+            FileChange::Moved { .. } => "moved",
+            FileChange::Trashed { .. } => "trashed",
+            FileChange::RemovedDir { .. } => "removed_dir",
+        }
+    }
+}
+
 /// What a tool hands back to the model.
 #[derive(Clone, Debug, Default)]
 pub struct ToolOutput {
@@ -43,6 +89,8 @@ pub struct ToolOutput {
     pub images: Vec<ToolImage>,
     /// Images kept for the trace only (before/after screenshots).
     pub evidence: Vec<ToolImage>,
+    /// Changes made to the user's files, for the change log.
+    pub changes: Vec<FileChange>,
 }
 
 impl ToolOutput {

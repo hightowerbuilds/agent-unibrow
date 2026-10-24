@@ -6,6 +6,7 @@
 
 mod browser_pane;
 mod chat_text;
+mod change_log;
 mod chat_tools;
 mod workspace_tab;
 mod sidebar_width;
@@ -141,6 +142,8 @@ enum HistorySub {
     Visits,
     Bookmarks,
     Trace,
+    /// The agent's changes to files (change_log.rs).
+    Changes,
 }
 
 /// Width of the bumper strip that toggles the sidebar (and, dragged,
@@ -205,6 +208,10 @@ struct Shell {
     confirm_delete: Option<chats::ChatId>,
     /// Rename, search and export (chat_tools.rs).
     chat_tools: chat_tools::ChatTools,
+    /// The agent's file changes, with undo and blame (change_log.rs).
+    change_log: change_log::ChangeLog,
+    /// Where the file tools may work: for the files rail and for undo.
+    files_cfg: Arc<rail_files::paths::Config>,
     /// The Workspace tab (workspace_tab.rs).
     workspace: workspace_tab::WorkspaceTab,
     /// The active chat's messages.
@@ -349,6 +356,11 @@ impl Shell {
             jev_context: Vec::new(),
             confirm_delete: None,
             chat_tools,
+            change_log: change_log::ChangeLog::new(cx),
+            files_cfg: Arc::new(rail_files::paths::Config::from_env(
+                rail_browser::workspace::ensure(),
+                rail_browser::workspace::Folder::Files.dir(),
+            )),
             workspace,
             items,
             task_plan,
@@ -387,6 +399,9 @@ impl Shell {
             _events: None,
         };
         shell._subscriptions.extend(chat_tools_subs);
+        shell.reload_changes();
+        let filter = shell.change_log.filter.clone();
+        shell._subscriptions.push(cx.subscribe(&filter, |_: &mut Self, _, _: &Changed, cx| cx.notify()));
         shell._subscriptions.extend(workspace_subs);
         shell.spawn_chat_test(cx);
         if let Some(p) = shell.trace.path().cloned() {
@@ -728,10 +743,7 @@ impl Shell {
             registry.add_tool(tool);
         }
         // Files on the user's computer (a sandbox folder in test instances).
-        registry.add_rail(&rail_files::FilesRail::new(rail_files::paths::Config::from_env(
-            rail_browser::workspace::ensure(),
-            rail_browser::workspace::Folder::Files.dir(),
-        )));
+        registry.add_rail(&rail_files::FilesRail::new((*self.files_cfg).clone()));
         registry.add_tool(chats::TaskProgress::new(self.chats.clone(), self.chat_id));
         registry.add_tool(Arc::new(home::Customize));
         for n in &notes {
@@ -848,6 +860,15 @@ impl Shell {
         // An unfinished task plan: say where it stands (7.4).
         if let Some(line) = self.chats.plan_reminder(self.chat_id) {
             message = format!("{line}\n{message}");
+        }
+        // File changes the user undid since the last reply (change_log.rs).
+        let undone = std::mem::take(&mut self.change_log.told_agent);
+        if !undone.is_empty() {
+            let lines: Vec<String> = undone.iter().map(|l| format!("- {l}")).collect();
+            message = format!(
+                "[Since your last reply, the user undid some of your file changes:]\n{}\n[End.]\n\n{message}",
+                lines.join("\n")
+            );
         }
         if !self.jev_context.is_empty() {
             message = format!(
@@ -1287,7 +1308,8 @@ impl Shell {
                 let pretty = serde_json::to_string_pretty(&input).unwrap_or_default();
                 self.trace.push(Kind::ToolCall, format!("{name} {}", compact(&input)), Some(pretty));
             }
-            AgentEvent::ToolResult { name, ok, summary, content, evidence, .. } => {
+            AgentEvent::ToolResult { id, name, ok, summary, content, evidence, changes } => {
+                self.log_changes(&id, &changes);
                 if name == "task_progress" {
                     self.task_plan = self.chats.plan(self.chat_id);
                 }
@@ -1601,8 +1623,12 @@ impl Shell {
         // Refilled as this frame's message texts prepaint.
         self.chat_select.registry.clear();
         let approvals: Vec<_> = self.approvals.iter().map(|a| self.render_approval(a, cx).into_any_element()).collect();
-        let items: Vec<_> =
-            self.items.iter().enumerate().map(|(i, item)| self.render_item(i, item, cx).into_any_element()).collect();
+        let mut items = Vec::new();
+        for (i, item) in self.items.iter().enumerate() {
+            items.push(self.render_item(i, item, cx).into_any_element());
+            // A turn that changed files ends with what it changed.
+            items.extend(self.changes_after(i, cx));
+        }
         div()
             .flex()
             .flex_col()
@@ -1827,11 +1853,13 @@ impl Shell {
             .border_color(rgb(theme::RULE))
             .child(pill(HistorySub::Visits, "history-sub-visits", "History".into()))
             .child(pill(HistorySub::Bookmarks, "history-sub-bookmarks", count(marks, "Bookmarks")))
-            .child(pill(HistorySub::Trace, "history-sub-trace", count(self.trace.entries().len(), "Trace")));
+            .child(pill(HistorySub::Trace, "history-sub-trace", count(self.trace.entries().len(), "Trace")))
+            .child(pill(HistorySub::Changes, "history-sub-changes", "Changes".into()));
         let body = match sub {
             HistorySub::Visits => self.render_history(cx).into_any_element(),
             HistorySub::Bookmarks => self.render_bookmarks(cx).into_any_element(),
             HistorySub::Trace => self.render_trace(cx).into_any_element(),
+            HistorySub::Changes => self.render_changes(cx).into_any_element(),
         };
         div().flex().flex_col().flex_1().min_h(px(0.)).child(bar).child(body).into_any_element()
     }
@@ -2803,6 +2831,7 @@ impl Shell {
         self.chat_id = id;
         self.chats.mark_active(id);
         self.items = load_items(&self.chats, id);
+        self.reload_changes();
         self.chat_select.clear();
         self.task_plan = self.chats.plan(id);
         self.chat_list_open = false;

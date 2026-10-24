@@ -96,3 +96,17 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial · todo.
 - Agents in background chats (needs per-chat browser tabs).
 - ✅ **COMPLETED**: rename chats (double-click the title), search across chats (All chats), export a chat to Markdown.
 - Per-chat trace files.
+- ✅ **COMPLETED**: the change log (DeltaDB-style, step 1). Every change the
+  file tools make (create, replace, edit, new folder, move, delete to the
+  Trash) is kept in `chats.sqlite3` (`file_changes`) with the chat and the
+  user's message it answered, the old contents of replaced files (up to
+  5 MB), and an operation id: this install's replica id and a Lamport
+  clock value, which chat items get too. A strip after each turn lists its
+  changes with Undo; History → Changes lists all of them with their chat
+  (blame) and Undo for one. Undo (`rail_files::undo`) only takes a change
+  back if the file is still as the agent left it, never erases, and is
+  logged itself; the agent hears about undone changes with the next
+  message. Eval `change-log-undo`.
+- Change log, step 2: playbook versioning (each saved playbook kept as a
+  version with its op id, so a replay can say which version ran and an
+  edit can be taken back).

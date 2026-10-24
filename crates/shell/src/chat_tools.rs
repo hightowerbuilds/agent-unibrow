@@ -17,7 +17,8 @@
 //! its own), `idle` (waits up to a minute for the agent to finish),
 //! `popout`, `popin` and `openurl:<address>` (Pop out to a tab, back, and
 //! a sidebar link, which shows the page), `sidebarwidth:<px>` (the end of
-//! a drag of the sidebar's edge), and the Workspace tab's steps
+//! a drag of the sidebar's edge), the change log's `changes` and
+//! `undo_turn` (change_log.rs), and the Workspace tab's steps
 //! (workspace_tab.rs).
 
 use crate::text_input::{Changed, Submit, TextInput};
@@ -376,7 +377,10 @@ impl Shell {
             }
             _ => match self.workspace_test_step(name, arg, cx) {
                 Some(line) => line,
-                None => format!("unknown step {step:?}"),
+                None => match self.change_log_test_step(name, cx) {
+                    Some(line) => line,
+                    None => format!("unknown step {step:?}"),
+                },
             },
         };
         eprintln!("shell test: {line}");

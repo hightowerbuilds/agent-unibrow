@@ -183,6 +183,7 @@ impl ApiBackend {
                         summary: "invalid tool input JSON".into(),
                         content: content.clone(),
                         evidence: Vec::new(),
+                        changes: Vec::new(),
                     });
                     self.finished.push(tool_result(&block["id"], &content, true));
                     continue;

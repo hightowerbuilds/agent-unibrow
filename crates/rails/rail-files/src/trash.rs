@@ -104,6 +104,27 @@ pub fn trash(path: &Path, trash_dir: &Path, allow_gio: bool) -> Result<Trashed, 
     Err("The Trash has too many items with that name.".into())
 }
 
+/// Puts an item [`trash`] moved to `<trash>/files/<name>` back at `to`,
+/// and removes its `.trashinfo`. Refuses if something is at `to` now, or
+/// if `trashed_as` isn't an item in a Trash folder.
+pub fn restore(trashed_as: &Path, to: &Path) -> Result<(), String> {
+    let name = trashed_as.file_name().ok_or("That isn't an item in the Trash.")?;
+    let files = trashed_as.parent().filter(|d| d.file_name().is_some_and(|n| n == "files")).ok_or("That isn't an item in the Trash.")?;
+    let info = files.parent().ok_or("That isn't an item in the Trash.")?.join("info").join(format!("{}.trashinfo", name.to_string_lossy()));
+    if std::fs::symlink_metadata(trashed_as).is_err() {
+        return Err("It's no longer in the Trash.".into());
+    }
+    if std::fs::symlink_metadata(to).is_ok() {
+        return Err("Something is at its old place now; it stays in the Trash.".into());
+    }
+    if let Some(dir) = to.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("Couldn't recreate its folder: {e}"))?;
+    }
+    std::fs::rename(trashed_as, to).map_err(|e| format!("Couldn't take it out of the Trash: {e}"))?;
+    let _ = std::fs::remove_file(info);
+    Ok(())
+}
+
 fn gio_trash(path: &Path) -> Result<(), String> {
     let out = std::process::Command::new("gio")
         .args(["trash", "--"])

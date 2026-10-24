@@ -251,3 +251,75 @@ async fn long_file_names_can_be_replaced() {
     assert_eq!(std::fs::read_to_string(data.join("files").join(&name)).unwrap(), "newer\n");
     assert_eq!(std::fs::read_dir(data.join("files")).unwrap().count(), 1, "a temporary file was left behind");
 }
+
+/// Runs a tool that must succeed and returns the one change it logged.
+async fn change_of(cfg: &Config, name: &str, input: Value) -> FileChange {
+    let (r, _) = run(cfg, name, input, true).await;
+    let mut changes = r.unwrap().changes;
+    assert_eq!(changes.len(), 1, "{name} should log one change");
+    changes.remove(0)
+}
+
+#[tokio::test]
+async fn every_change_is_logged_and_undone() {
+    let (data, cfg) = sandbox("undo");
+    let home = data.join("files");
+    // A new file: undo sends it to the Trash.
+    let c = change_of(&cfg, "file_write", json!({"path": "~/new.txt", "content": "hello"})).await;
+    assert_eq!(c, FileChange::Created { path: home.join("new.txt"), hash: undo::hash(b"hello") });
+    let (back, line) = undo::undo(&cfg, &c).unwrap();
+    assert!(line.contains("to the Trash"), "{line}");
+    assert!(!home.join("new.txt").exists());
+    // ...and undoing the undo brings it back.
+    undo::undo(&cfg, &back).unwrap();
+    assert_eq!(std::fs::read_to_string(home.join("new.txt")).unwrap(), "hello");
+
+    // An edit: the old text comes back, unless the file changed since.
+    std::fs::write(home.join("todo.txt"), "milk\n").unwrap();
+    let c = change_of(&cfg, "file_edit", json!({"path": "~/todo.txt", "old_text": "milk", "new_text": "oat milk"})).await;
+    std::fs::write(home.join("todo.txt"), "oat milk\nbread\n").unwrap();
+    assert!(undo::undo(&cfg, &c).unwrap_err().contains("changed since"));
+    std::fs::write(home.join("todo.txt"), "oat milk\n").unwrap();
+    undo::undo(&cfg, &c).unwrap();
+    assert_eq!(std::fs::read_to_string(home.join("todo.txt")).unwrap(), "milk\n");
+
+    // A replace.
+    let c = change_of(&cfg, "file_write", json!({"path": "~/todo.txt", "content": "eggs\n", "overwrite": true})).await;
+    undo::undo(&cfg, &c).unwrap();
+    assert_eq!(std::fs::read_to_string(home.join("todo.txt")).unwrap(), "milk\n");
+
+    // A move goes back; not if something took the old place.
+    let c = change_of(&cfg, "file_move", json!({"from": "~/todo.txt", "to": "~/list.txt"})).await;
+    undo::undo(&cfg, &c).unwrap();
+    assert!(home.join("todo.txt").exists() && !home.join("list.txt").exists());
+
+    // A delete comes back out of the Trash, info file and all.
+    let c = change_of(&cfg, "file_delete", json!({"path": "~/todo.txt"})).await;
+    assert!(!home.join("todo.txt").exists());
+    let FileChange::Trashed { trashed_as: Some(item), .. } = &c else { panic!("{c:?}") };
+    undo::undo(&cfg, &c).unwrap();
+    assert_eq!(std::fs::read_to_string(home.join("todo.txt")).unwrap(), "milk\n");
+    assert!(!item.exists());
+    let info = data.join("Trash/info").join(format!("{}.trashinfo", item.file_name().unwrap().to_string_lossy()));
+    assert!(!info.exists());
+
+    // New folders: removed while empty, up to the highest one made.
+    let c = change_of(&cfg, "file_mkdir", json!({"path": "~/a/b/c"})).await;
+    assert_eq!(c, FileChange::MadeDir { path: home.join("a/b/c"), top: home.join("a") });
+    std::fs::write(home.join("a/b/c/keep.txt"), "x").unwrap();
+    assert!(undo::undo(&cfg, &c).unwrap_err().contains("isn't empty"));
+    std::fs::remove_file(home.join("a/b/c/keep.txt")).unwrap();
+    let (back, _) = undo::undo(&cfg, &c).unwrap();
+    assert!(!home.join("a").exists());
+    assert_eq!(back, FileChange::RemovedDir { path: home.join("a") });
+}
+
+#[tokio::test]
+async fn undo_keeps_to_the_allowed_folders() {
+    let (_, cfg) = sandbox("undo-paths");
+    // A change naming a path outside the sandbox (say, a tampered log).
+    let outside = FileChange::Created { path: "/etc/hosts".into(), hash: String::new() };
+    assert!(undo::undo(&cfg, &outside).is_err());
+    let trashed = FileChange::Trashed { path: "/etc/x".into(), trashed_as: Some("/tmp/files/x".into()) };
+    assert!(undo::undo(&cfg, &trashed).is_err());
+}

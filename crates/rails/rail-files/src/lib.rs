@@ -15,10 +15,11 @@
 pub mod diff;
 pub mod paths;
 pub mod trash;
+pub mod undo;
 
 use futures::future::BoxFuture;
 use paths::{Config, Last, Use};
-use router::{Effect, Rail, Tool, ToolContext, ToolOutput, ToolResult};
+use router::{Effect, FileChange, Rail, Tool, ToolContext, ToolOutput, ToolResult};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -119,6 +120,12 @@ fn run_plan(
     })
 }
 
+/// `out`, with the change it made for the change log.
+fn changed(mut out: ToolOutput, change: FileChange) -> ToolOutput {
+    out.changes.push(change);
+    out
+}
+
 fn needs_context(tool: &str) -> BoxFuture<'static, ToolResult> {
     let msg = format!("{tool} needs the tool context");
     Box::pin(async move { Err(msg) })
@@ -151,7 +158,7 @@ fn read_text_for_change(cfg: &Config, path: &Path) -> Result<String, String> {
 
 /// Replaces `path`'s contents in one step (a temporary file in the same
 /// folder, renamed over it), keeping its permissions.
-fn replace_contents(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn replace_contents(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
     let dir = path.parent().ok_or("no parent folder")?;
     let (tmp, mut f) = create_temp(dir).map_err(|e| format!("Couldn't write the file: {e}"))?;
@@ -251,7 +258,7 @@ fn create_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 /// The nearest missing folder on the way to `path`, if any must be created.
-fn first_missing_parent(path: &Path) -> Option<PathBuf> {
+pub(crate) fn first_missing_parent(path: &Path) -> Option<PathBuf> {
     let mut missing = None;
     let mut p = path.parent();
     while let Some(dir) = p {
@@ -735,10 +742,11 @@ impl WriteFile {
                         }
                         replace_contents(&p, c.as_bytes())?;
                         let show = cfg.show(&p);
-                        Ok(ToolOutput::text(
+                        let out = ToolOutput::text(
                             format!("Replaced {show} ({new_size}, {} lines).", line_count(&c)),
                             format!("replaced {show} ({new_size})"),
-                        ))
+                        );
+                        Ok(changed(out, FileChange::Replaced { path: p, before: old, hash: undo::hash(c.as_bytes()) }))
                     }),
                 })
             }
@@ -758,10 +766,11 @@ impl WriteFile {
                     apply: Box::new(move || {
                         create_new(&p, content.as_bytes())?;
                         let show = cfg.show(&p);
-                        Ok(ToolOutput::text(
+                        let out = ToolOutput::text(
                             format!("Created {show} ({new_size}, {} lines).", line_count(&content)),
                             format!("created {show} ({new_size})"),
-                        ))
+                        );
+                        Ok(changed(out, FileChange::Created { path: p, hash: undo::hash(content.as_bytes()) }))
                     }),
                 })
             }
@@ -836,7 +845,9 @@ impl EditFile {
                 replace_contents(&path, after.as_bytes())?;
                 let show = cfg.show(&path);
                 let made = if n == 1 { "1 change".to_string() } else { format!("{n} changes") };
-                Ok(ToolOutput::text(format!("Edited {show}: {made}."), format!("edited {show} ({made})")))
+                let out = ToolOutput::text(format!("Edited {show}: {made}."), format!("edited {show} ({made})"));
+                let hash = undo::hash(after.as_bytes());
+                Ok(changed(out, FileChange::Replaced { path, before: Some(before.into_bytes()), hash }))
             }),
         })
     }
@@ -894,9 +905,11 @@ impl MakeDir {
             reason: "file_mkdir creates a folder on your computer".into(),
             ask,
             apply: Box::new(move || {
+                let top = first_missing_parent(&path).unwrap_or_else(|| path.clone());
                 std::fs::create_dir_all(&path).map_err(|e| format!("Couldn't create {}: {e}", cfg.show(&path)))?;
                 let show = cfg.show(&path);
-                Ok(ToolOutput::text(format!("Created the folder {show}."), format!("created folder {show}")))
+                let out = ToolOutput::text(format!("Created the folder {show}."), format!("created folder {show}"));
+                Ok(changed(out, FileChange::MadeDir { path, top }))
             }),
         })
     }
@@ -973,7 +986,8 @@ impl MoveFile {
                     Err(e) => return Err(format!("Couldn't move it: {e}")),
                 }
                 let (sf, st) = (cfg.show(&from), cfg.show(&to));
-                Ok(ToolOutput::text(format!("Moved {sf} to {st}."), format!("moved {sf} → {st}")))
+                let out = ToolOutput::text(format!("Moved {sf} to {st}."), format!("moved {sf} → {st}"));
+                Ok(changed(out, FileChange::Moved { from, to }))
             }),
         })
     }
@@ -1035,14 +1049,16 @@ impl DeleteFile {
             ask: true,
             apply: Box::new(move || {
                 let show = cfg.show(&path);
-                let r#where = match trash::trash(&path, &cfg.trash_dir, !cfg.sandboxed)? {
-                    trash::Trashed::At(p) => cfg.show(&p),
-                    trash::Trashed::Gio => "that drive's Trash".into(),
+                let trashed_as = match trash::trash(&path, &cfg.trash_dir, !cfg.sandboxed)? {
+                    trash::Trashed::At(p) => Some(p),
+                    trash::Trashed::Gio => None,
                 };
-                Ok(ToolOutput::text(
+                let r#where = trashed_as.as_ref().map(|p| cfg.show(p)).unwrap_or_else(|| "that drive's Trash".into());
+                let out = ToolOutput::text(
                     format!("Moved {show} to the Trash ({where}). The user can restore it from there."),
                     format!("trashed {show}"),
-                ))
+                );
+                Ok(changed(out, FileChange::Trashed { path, trashed_as }))
             }),
         })
     }

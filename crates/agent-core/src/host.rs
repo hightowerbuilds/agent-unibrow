@@ -112,6 +112,7 @@ impl ToolHost {
                 summary: crate::first_line(&content),
                 content: content.clone(),
                 evidence: Vec::new(),
+                changes: Vec::new(),
             });
             Outcome { content, is_error: true, images: Vec::new() }
         };
@@ -197,6 +198,7 @@ impl ToolHost {
                     summary: out.summary,
                     content: out.content.clone(),
                     evidence,
+                    changes: out.changes,
                 });
                 Outcome { content: out.content, is_error: false, images: out.images }
             }

@@ -276,6 +276,10 @@ const FILES: &[Section] = &[
                  change (or the new file's text), and waits for your OK. Only new files in the workspace's Files \
                  folder skip the card.",
                 "Deleting moves things to the Trash, so you can restore them from your file manager.",
+                "Every change is kept with the message that asked for it. After a reply that changed files, a strip \
+                 lists them with Undo (click twice); History → Changes lists every change and which chat made it, \
+                 with Undo for one. Undo only touches a file that's still as the agent left it, and never erases: \
+                 a file it made goes to the Trash.",
                 "Off limits: hidden folders (~/.ssh, ~/.config and the like), the app's own data and settings, keys \
                  and password files, and system folders outside your home.",
                 "Use ~/ or a full path. Every file action shows in History → Trace.",

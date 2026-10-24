@@ -11,6 +11,8 @@
 //!
 //! - A **task plan** (7.4, [`progress`]) is the agent's checklist for a long
 //!   task in the chat, so it can pick up where it left off.
+//! - The **change log** ([`changes`]): the agent's changes to the user's
+//!   files, each with the message that caused it, for blame and undo.
 //!
 //! Stored in SQLite (WAL) at `~/.local/share/agent-unibrow/chats.sqlite3`.
 
@@ -20,7 +22,9 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+pub mod changes;
 pub mod progress;
+pub use changes::{ChangeRecord, OpId};
 pub use progress::{TaskPlan, TaskProgress, TaskStep};
 
 pub type ChatId = i64;
@@ -205,6 +209,12 @@ impl Chats {
              );",
         )
         .map_err(|e| format!("can't set up the chat database: {e}"))?;
+        conn.execute_batch(changes::SCHEMA).map_err(|e| format!("can't set up the change log: {e}"))?;
+        // Operation ids on items (the change log's clock); older databases
+        // gain the columns, which then fail as duplicates.
+        for col in ["replica TEXT", "lamport INTEGER"] {
+            let _ = conn.execute(&format!("ALTER TABLE items ADD COLUMN {col}"), []);
+        }
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -378,7 +388,11 @@ impl Chats {
     pub fn append(&self, chat: ChatId, kind: &str, text: &str) -> ItemId {
         let c = self.conn();
         let t = now();
-        let _ = c.execute("INSERT INTO items (chat_id, kind, text, at) VALUES (?1, ?2, ?3, ?4)", params![chat, kind, text, t]);
+        let op = Self::next_op_in(&c);
+        let _ = c.execute(
+            "INSERT INTO items (chat_id, kind, text, at, replica, lamport) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![chat, kind, text, t, op.replica, op.lamport],
+        );
         let id = c.last_insert_rowid();
         let _ = c.execute("UPDATE chats SET updated = ?2 WHERE id = ?1", params![chat, t]);
         if kind == "user" {

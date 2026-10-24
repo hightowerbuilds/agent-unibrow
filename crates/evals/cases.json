@@ -2029,6 +2029,44 @@
     }
   },
   {
+    "name": "change-log-undo",
+    "page": "home",
+    "approve": "approve",
+    "sandbox_files": {
+      "notes.txt": "alpha\n"
+    },
+    "task": "In ~/notes.txt replace the word alpha with beta, then create a new file ~/new.txt containing exactly: gamma",
+    "env": {
+      "UNIBROW_TEST_SHELL": "changes;undo_turn;changes"
+    },
+    "after_turn": {
+      "wait_trace": "Shell test: done",
+      "timeout": 60
+    },
+    "expect": {
+      "tools": [
+        "file_edit",
+        "file_write"
+      ],
+      "trace_contains": [
+        "Shell test: changes: 2 [Changed ",
+        "/files/notes.txt [op ",
+        "Undid 2 changes",
+        "Moved ",
+        "(which it created) to the Trash",
+        "Put back ",
+        "undone Changed "
+      ],
+      "files": {
+        "files/notes.txt": "alpha",
+        "Trash/files/new.txt": "gamma"
+      },
+      "files_absent": [
+        "files/new.txt"
+      ]
+    }
+  },
+  {
     "name": "home-redirect-refused",
     "page": "redirect-home",
     "secs": 10,

@@ -169,6 +169,8 @@ pub enum AgentEvent {
         content: String,
         /// Screenshots and other images for the trace.
         evidence: Vec<router::ToolImage>,
+        /// Changes made to the user's files (the change log).
+        changes: Vec<router::FileChange>,
     },
     ApprovalNeeded {
         id: String,
