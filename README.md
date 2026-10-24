@@ -58,6 +58,8 @@ Sidebar tab's × puts it back beside the page.
 **Change log**: every file the agent changes is kept with the message that asked for it.
 A strip after each reply lists the changes with Undo, and History → Changes shows all of
 them and which chat made each (undo only touches files still as the agent left them).
+Playbooks keep their earlier versions too: saving one again, or removing it, keeps the old
+steps, and the site's view in Focus can restore any version.
 
 **Split view** shows 2 to 4 tabs at once: Ctrl+click a tab, or use the toolbar's split
 button. The agent can set one up and look at several open tabs at once

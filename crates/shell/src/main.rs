@@ -204,6 +204,8 @@ struct Shell {
     jev_next_id: u64,
     /// Requests Jev answered, for Claude's context with the next message.
     jev_context: Vec<String>,
+    /// The playbook (id) whose versions are listed in the site view.
+    playbook_versions_open: Option<i64>,
     /// A chat whose Delete was clicked once and awaits the confirm click.
     confirm_delete: Option<chats::ChatId>,
     /// Rename, search and export (chat_tools.rs).
@@ -355,6 +357,7 @@ impl Shell {
             jev_next_id: 1,
             jev_context: Vec::new(),
             confirm_delete: None,
+            playbook_versions_open: None,
             chat_tools,
             change_log: change_log::ChangeLog::new(cx),
             files_cfg: Arc::new(rail_files::paths::Config::from_env(
@@ -1587,6 +1590,39 @@ impl Shell {
             .child("⤢ Pop out")
     }
 
+    /// One earlier (or removed) version of a playbook, with Restore.
+    fn playbook_version_row(&self, v: browsing::playbook_versions::PlaybookVersion, cx: &mut Context<Self>) -> impl IntoElement {
+        use browsing::playbook_versions::VersionKind;
+        let how = match v.kind {
+            VersionKind::Saved => "saved".to_string(),
+            VersionKind::Restored => format!("restored from v{}", v.from_version.unwrap_or(0)),
+            VersionKind::Removed => format!("“{}”, removed", v.name),
+        };
+        let label = format!("v{} · {how} · {} · {} steps", v.version, v.at.format("%b %-d, %-I:%M %p"), v.steps.len());
+        let (site, name, version) = (v.site.clone(), v.name.clone(), v.version);
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .pl_2()
+            .text_xs()
+            .text_color(rgb(theme::MUTED))
+            .child(div().flex_1().min_w(px(0.)).truncate().child(label))
+            .child(
+                Self::small_button(SharedString::from(format!("playbook-restore-{site}-{name}-{version}")), "Restore", false).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        let line = match this.store.restore_playbook(&site, &name, version) {
+                            Ok(pb) => format!("Restored playbook “{}” on {site} from v{version} (now v{})", pb.name, pb.version),
+                            Err(e) => format!("Couldn't restore “{name}”: {e}"),
+                        };
+                        this.trace.push(Kind::Info, line.clone(), None);
+                        this.notice(line);
+                        cx.notify();
+                    }),
+                ),
+            )
+    }
+
     /// The strip on the sidebar's edge that opens and closes it.
     fn render_bumper(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let open = self.sidebar_open;
@@ -2239,6 +2275,17 @@ impl Shell {
         }
         for p in &map.playbooks {
             let id = p.id;
+            let versions_open = self.playbook_versions_open == Some(id);
+            let versions: Vec<gpui::AnyElement> = if versions_open {
+                self.store
+                    .playbook_versions(&p.site, &p.name)
+                    .into_iter()
+                    .filter(|v| v.version != p.version)
+                    .map(|v| self.playbook_version_row(v, cx).into_any_element())
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let record = if p.runs == 0 { "never run".to_string() } else { format!("ran {}×, {} finished", p.runs, p.successes) };
             let params = if p.params.is_empty() { String::new() } else { format!(" · needs {}", p.params.join(", ")) };
             let steps: Vec<String> = p.steps.iter().enumerate().map(|(i, s)| format!("{}. {}", i + 1, s.describe())).collect();
@@ -2257,6 +2304,16 @@ impl Shell {
                             .items_center()
                             .gap_2()
                             .child(div().flex_1().text_sm().text_color(rgb(theme::FG)).child(format!("“{}”", p.name)))
+                            .child(div().text_xs().text_color(rgb(theme::MUTED)).child(format!("v{}", p.version)))
+                            .when(p.version > 1, |d| {
+                                d.child(
+                                    Self::small_button(SharedString::from(format!("playbook-versions-{id}")), "Versions", versions_open)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.playbook_versions_open = if this.playbook_versions_open == Some(id) { None } else { Some(id) };
+                                            cx.notify();
+                                        })),
+                                )
+                            })
                             .child(Self::small_button(SharedString::from(format!("playbook-remove-{id}")), "Remove", false).on_click(
                                 cx.listener(move |this, _, _, cx| {
                                     this.store.remove_playbook(id);
@@ -2269,8 +2326,16 @@ impl Shell {
                     .children(p.last_error.clone().map(|e| {
                         div().text_xs().text_color(rgb(theme::WARN)).child(format!("Last run stopped: {e}"))
                     }))
-                    .children(steps.into_iter().map(|t| div().text_xs().text_color(rgb(theme::FG)).child(t))),
+                    .children(steps.into_iter().map(|t| div().text_xs().text_color(rgb(theme::FG)).child(t)))
+                    .children(versions),
             );
+        }
+        let removed = self.store.removed_playbooks(&map.site);
+        if !removed.is_empty() {
+            col = col.child(muted("Removed (they can come back):".into()));
+            for v in removed {
+                col = col.child(self.playbook_version_row(v, cx));
+            }
         }
 
         col = col.child(heading("PAGES"));

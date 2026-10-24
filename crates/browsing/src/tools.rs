@@ -34,7 +34,13 @@ pub fn describe_site_map(map: &crate::sitemap::SiteMap) -> String {
         for p in &map.playbooks {
             let params = if p.params.is_empty() { "no parameters".to_string() } else { format!("parameters: {}", p.params.join(", ")) };
             let record = if p.runs == 0 { "never run".to_string() } else { format!("ran {} times, {} finished", p.runs, p.successes) };
-            out.push_str(&format!("- \"{}\" ({params}; {} steps; {record}): {}\n", p.name, p.steps.len(), p.description));
+            out.push_str(&format!(
+                "- \"{}\" (version {}; {params}; {} steps; {record}): {}\n",
+                p.name,
+                p.version,
+                p.steps.len(),
+                p.description
+            ));
             if let Some(e) = &p.last_error {
                 out.push_str(&format!("  Last run stopped: {e}\n"));
             }

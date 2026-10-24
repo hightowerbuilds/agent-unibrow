@@ -339,6 +339,12 @@ set path instead of starting from scratch each time.
 - `playbook_run`: replays without the model through the same tools, so
   purchases and other commits still ask; site scope applies; at most 40
   steps. Run stats and the last failure are kept per playbook.
+- Versions (the change log's step 2): saving under a name in use keeps the
+  old steps as an earlier version, removing keeps the last version, and
+  each replay records which version ran (`playbook_runs`); the tools say
+  "version N". The site view lists versions and removed playbooks with
+  Restore, which saves the old version as the newest. Eval
+  `playbook-versions`.
 - Evals: `playbook-replay` (recorded searching "TUSQ nut", replayed for
   "bone nut" after a crash and restart, picks the bone result).
 

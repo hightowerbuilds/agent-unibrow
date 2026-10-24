@@ -107,6 +107,10 @@ Status: ✅ **COMPLETED** (built and tested) · ◐ partial · todo.
   back if the file is still as the agent left it, never erases, and is
   logged itself; the agent hears about undone changes with the next
   message. Eval `change-log-undo`.
-- Change log, step 2: playbook versioning (each saved playbook kept as a
-  version with its op id, so a replay can say which version ran and an
-  edit can be taken back).
+- ✅ **COMPLETED**: change log, step 2: playbook versions. Each save keeps
+  the old steps as a numbered version, a removed playbook keeps its last
+  version, every replay records the version that ran, and any version can
+  be restored from the site view (browsing's `playbook_versions`; eval
+  `playbook-versions`). Left: operation ids on trace entries, and on
+  playbook versions (they live in the browsing database, which has no
+  clock of its own yet).

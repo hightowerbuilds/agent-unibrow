@@ -11,7 +11,10 @@
 //!   user's next message.
 //!
 //! Test steps (`UNIBROW_TEST_SHELL`, see chat_tools.rs): `changes` logs the
-//! chat's changes, `undo_turn` undoes the last turn that changed files.
+//! chat's changes, `undo_turn` undoes the last turn that changed files;
+//! for playbook versions, `pbversions:<site>|<name>` logs a playbook's
+//! versions and `pbrestore:<site>|<name>|<version>` restores one, as the
+//! site view's Restore does.
 
 use crate::text_input::TextInput;
 use crate::{ItemKind, Shell, theme};
@@ -297,8 +300,28 @@ impl Shell {
     }
 
     /// A `changes` or `undo_turn` test step; `None` if it isn't one.
-    pub(crate) fn change_log_test_step(&mut self, name: &str, cx: &mut Context<Self>) -> Option<String> {
+    pub(crate) fn change_log_test_step(&mut self, name: &str, arg: &str, cx: &mut Context<Self>) -> Option<String> {
+        let parts: Vec<&str> = arg.split('|').collect();
         Some(match name {
+            "pbversions" => {
+                let (site, pb) = (parts.first().copied().unwrap_or(""), parts.get(1).copied().unwrap_or(""));
+                let current = self.store.playbook(site, pb).map(|p| p.version);
+                let versions: Vec<String> = self
+                    .store
+                    .playbook_versions(site, pb)
+                    .iter()
+                    .map(|v| format!("v{} {:?} {} steps", v.version, v.kind, v.steps.len()))
+                    .collect();
+                format!("pbversions {pb}: current {current:?} [{}]", versions.join("; "))
+            }
+            "pbrestore" => {
+                let (site, pb) = (parts.first().copied().unwrap_or(""), parts.get(1).copied().unwrap_or(""));
+                let v = parts.get(2).and_then(|v| v.parse().ok()).unwrap_or(0);
+                match self.store.restore_playbook(site, pb, v) {
+                    Ok(p) => format!("pbrestore {pb}: v{v} is now v{} with {} steps", p.version, p.steps.len()),
+                    Err(e) => format!("pbrestore {pb}: {e}"),
+                }
+            }
             "changes" => {
                 self.reload_changes();
                 let lines: Vec<String> = self

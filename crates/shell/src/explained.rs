@@ -180,6 +180,8 @@ const FOCUS: &[Section] = &[
             "Next time it replays the playbook step by step, checking each page. If the site has changed or something \
              unexpected appears, it stops and works it out itself. Purchases still ask you first.",
             "Focus → View shows one site's playbooks, pages, the agent's recent actions there, and your history.",
+            "Saving a playbook again under the same name keeps the old one as an earlier version, and a removed \
+             playbook is kept too. In the site's view, Versions lists them; Restore puts one back.",
         ])],
     },
 ];

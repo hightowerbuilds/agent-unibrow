@@ -13,6 +13,7 @@
 //!   literal values turned into parameters (`{query}`). The browser rail
 //!   replays them step by step and checks each page against the recording.
 
+use crate::playbook_versions::{self, VersionKind};
 use crate::{Browsing, site_of};
 use chrono::{DateTime, Local};
 use rusqlite::{Connection, params};
@@ -461,6 +462,9 @@ pub struct Playbook {
     pub successes: i64,
     pub last_run: Option<DateTime<Local>>,
     pub last_error: Option<String>,
+    /// Its current version (playbook_versions.rs): 1 when first saved, one
+    /// more each time it's saved again or an old version is restored.
+    pub version: i64,
 }
 
 /// A page pattern on a site and what's known about it.
@@ -654,20 +658,26 @@ impl Browsing {
         let steps_json = serde_json::to_string(&steps).map_err(|e| e.to_string())?;
         let params_json = serde_json::to_string(&params).map_err(|e| e.to_string())?;
         let site = site.trim_start_matches("www.").to_ascii_lowercase();
-        self.conn()
-            .execute(
-                "INSERT INTO playbooks (site, name, description, params, steps, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        {
+            // Saving under a name in use keeps the old steps as a version.
+            let c = self.conn();
+            let version = playbook_versions::next_version(&c, &site, name);
+            c.execute(
+                "INSERT INTO playbooks (site, name, description, params, steps, created, version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(site, name) DO UPDATE SET description = excluded.description, params = excluded.params,
-                     steps = excluded.steps, runs = 0, successes = 0, last_run = NULL, last_error = NULL",
-                params![site, name, description, params_json, steps_json, Local::now().timestamp()],
+                     steps = excluded.steps, version = excluded.version, runs = 0, successes = 0, last_run = NULL,
+                     last_error = NULL",
+                params![site, name, description, params_json, steps_json, Local::now().timestamp(), version],
             )
             .map_err(|e| format!("couldn't save the playbook: {e}"))?;
+            playbook_versions::add_version(&c, &site, name, version, VersionKind::Saved, None, description, &params_json, &steps_json);
+        }
         self.playbook(&site, name).ok_or_else(|| "The playbook wasn't saved.".to_string())
     }
 
     pub fn playbooks(&self, site: Option<&str>) -> Vec<Playbook> {
         let c = self.conn();
-        let sql = "SELECT id, site, name, description, params, steps, created, runs, successes, last_run, last_error
+        let sql = "SELECT id, site, name, description, params, steps, created, runs, successes, last_run, last_error, version
                    FROM playbooks WHERE (?1 IS NULL OR site = ?1) ORDER BY site, name";
         let Ok(mut stmt) = c.prepare(sql) else { return Vec::new() };
         stmt.query_map(params![site], |r| {
@@ -685,6 +695,7 @@ impl Browsing {
                 successes: r.get(8)?,
                 last_run: r.get::<_, Option<i64>>(9)?.map(when),
                 last_error: r.get(10)?,
+                version: r.get(11)?,
             })
         })
         .map(|rows| rows.filter_map(Result::ok).collect())
@@ -701,16 +712,35 @@ impl Browsing {
         self.playbooks(None).into_iter().filter(|p| p.name.eq_ignore_ascii_case(name)).collect()
     }
 
+    /// Removes a playbook, keeping what it was as its last version (so it
+    /// can be restored).
     pub fn remove_playbook(&self, id: i64) -> bool {
-        self.conn().execute("DELETE FROM playbooks WHERE id = ?1", params![id]).map(|n| n > 0).unwrap_or(false)
+        let c = self.conn();
+        let row: Option<(String, String, String, String, String)> = c
+            .query_row("SELECT site, name, description, params, steps FROM playbooks WHERE id = ?1", params![id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .ok();
+        let Some((site, name, description, params_json, steps_json)) = row else { return false };
+        let version = playbook_versions::next_version(&c, &site, &name);
+        playbook_versions::add_version(&c, &site, &name, version, VersionKind::Removed, None, &description, &params_json, &steps_json);
+        c.execute("DELETE FROM playbooks WHERE id = ?1", params![id]).map(|n| n > 0).unwrap_or(false)
     }
 
-    /// Records how a replay went: `Ok(())`, or where it fell off the map.
+    /// Records how a replay went: `Ok(())`, or where it fell off the map,
+    /// with the version that ran.
     pub fn record_playbook_run(&self, id: i64, result: Result<(), String>) {
         let ok = result.is_ok();
-        let _ = self.conn().execute(
+        let c = self.conn();
+        let at = Local::now().timestamp();
+        let _ = c.execute(
+            "INSERT INTO playbook_runs (site, name, version, ok, error, at)
+             SELECT site, name, version, ?2, ?3, ?4 FROM playbooks WHERE id = ?1",
+            params![id, ok as i64, result.as_ref().err(), at],
+        );
+        let _ = c.execute(
             "UPDATE playbooks SET runs = runs + 1, successes = successes + ?2, last_run = ?3, last_error = ?4 WHERE id = ?1",
-            params![id, ok as i64, Local::now().timestamp(), result.err()],
+            params![id, ok as i64, at, result.err()],
         );
     }
 

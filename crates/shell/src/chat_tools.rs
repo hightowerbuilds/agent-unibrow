@@ -377,7 +377,7 @@ impl Shell {
             }
             _ => match self.workspace_test_step(name, arg, cx) {
                 Some(line) => line,
-                None => match self.change_log_test_step(name, cx) {
+                None => match self.change_log_test_step(name, arg, cx) {
                     Some(line) => line,
                     None => format!("unknown step {step:?}"),
                 },

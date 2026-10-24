@@ -413,8 +413,13 @@ impl Tool for PlaybookSave {
             let pb = store.save_playbook(&site_name, name, description, &run, &literals)?;
             let missing: Vec<&str> =
                 literals.iter().filter(|(_, p)| !pb.params.contains(p)).map(|(l, _)| l.as_str()).collect();
+            let kept = if pb.version > 1 {
+                format!(", version {}; the earlier version is kept and the user can restore it", pb.version)
+            } else {
+                String::new()
+            };
             let mut out = format!(
-                "Saved playbook “{}” for {} ({} steps{}):\n",
+                "Saved playbook “{}” for {} ({} steps{}{kept}):\n",
                 pb.name,
                 pb.site,
                 pb.steps.len(),
@@ -426,7 +431,7 @@ impl Tool for PlaybookSave {
             if !missing.is_empty() {
                 out.push_str(&format!("Note: these values never appeared in the steps, so they aren't parameters: {}\n", missing.join(", ")));
             }
-            Ok(ToolOutput::text(out, format!("saved “{}” ({} steps)", pb.name, pb.steps.len())))
+            Ok(ToolOutput::text(out, format!("saved “{}” v{} ({} steps)", pb.name, pb.version, pb.steps.len())))
         })
     }
 }
@@ -610,13 +615,14 @@ impl Tool for PlaybookRun {
             let last = last.unwrap_or_default();
             Ok(ToolOutput {
                 content: format!(
-                    "Playbook “{}” finished, {} steps:\n{}\n\nThe page now:\n{}",
+                    "Playbook “{}” (version {}) finished, {} steps:\n{}\n\nThe page now:\n{}",
                     pb.name,
+                    pb.version,
                     pb.steps.len(),
                     log.join("\n"),
                     last.content
                 ),
-                summary: format!("ran “{}” ({} steps)", pb.name, pb.steps.len()),
+                summary: format!("ran “{}” v{} ({} steps)", pb.name, pb.version, pb.steps.len()),
                 evidence: last.evidence,
                 ..Default::default()
             })
@@ -651,10 +657,12 @@ impl PlaybookRun {
         let done = if log.is_empty() { "No steps ran.".to_string() } else { format!("Steps done:\n{}", log.join("\n")) };
         Ok(ToolOutput::text(
             format!(
-                "Playbook “{}” stopped: it fell off the map at {why}.\n{done}\n\nThe site may have changed. Carry on \
+                "Playbook “{}” (version {}) stopped: it fell off the map at {why}.\n{done}\n\nThe site may have changed. Carry on \
                  from here yourself (the page is below). If it keeps happening, tell the user the playbook needs \
-                 to be recorded again.\n\n{page}",
-                pb.name
+                 to be recorded again{}.\n\n{page}",
+                pb.name,
+                pb.version,
+                if pb.version > 1 { " (or that an earlier version can be restored from the site's view in Focus)" } else { "" }
             ),
             format!("“{}” stopped on {}", pb.name, site(&st.url)),
         ))

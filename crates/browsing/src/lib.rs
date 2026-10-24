@@ -16,6 +16,7 @@
 pub mod favicons;
 pub mod home_pins;
 pub mod jev_sites;
+pub mod playbook_versions;
 pub mod sitemap;
 mod tools;
 
@@ -241,6 +242,7 @@ impl Browsing {
         )
         .map_err(|e| format!("can't set up the history database: {e}"))?;
         sitemap::init(&conn).map_err(|e| format!("can't set up site maps: {e}"))?;
+        playbook_versions::init(&conn).map_err(|e| format!("can't set up playbook versions: {e}"))?;
         jev_sites::init(&conn).map_err(|e| format!("can't set up Jev sites: {e}"))?;
         favicons::init(&conn).map_err(|e| format!("can't set up site icons: {e}"))?;
         home_pins::init(&conn).map_err(|e| format!("can't set up home pins: {e}"))?;

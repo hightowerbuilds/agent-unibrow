@@ -680,7 +680,8 @@
         "9.50"
       ],
       "trace_contains": [
-        "finished, ",
+        ") finished, ",
+        "Playbook “find a part” (version ",
         "Which search result matches?"
       ],
       "never_seen": [
@@ -2063,6 +2064,33 @@
       },
       "files_absent": [
         "files/new.txt"
+      ]
+    }
+  },
+  {
+    "name": "playbook-versions",
+    "page": "shop.html",
+    "approve": "deny",
+    "focus": "localhost",
+    "task": "Search this shop for TUSQ nut and open the TUSQ result. Save that as a playbook named \"find a part\" with the search words as a parameter called query. Then search for bone nut, open the bone result, and save the playbook again under the same name \"find a part\", with bone nut as the query parameter.",
+    "env": {
+      "UNIBROW_TEST_SHELL": "pbversions:localhost|find a part;pbrestore:localhost|find a part|1;pbversions:localhost|find a part"
+    },
+    "after_turn": {
+      "wait_trace": "Shell test: done",
+      "timeout": 60
+    },
+    "expect": {
+      "tools": [
+        "playbook_save"
+      ],
+      "trace_contains": [
+        "saved “find a part” v1",
+        "saved “find a part” v2",
+        "pbversions find a part: current Some(2) [v2 Saved",
+        "; v1 Saved",
+        "pbrestore find a part: v1 is now v3",
+        "pbversions find a part: current Some(3) [v3 Restored"
       ]
     }
   },
