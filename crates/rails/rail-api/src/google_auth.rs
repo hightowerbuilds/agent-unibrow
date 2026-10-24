@@ -17,9 +17,11 @@ use tokio::sync::Mutex;
 
 const KEYRING_SERVICE: &str = "agent-unibrow";
 const KEYRING_USER: &str = "google-refresh-token";
-/// Read mail, and create/send drafts and messages. Nothing broader.
-const SCOPES: &str =
-    "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose";
+/// Read mail, and create/send drafts and messages; read and change calendar
+/// events, and list the calendars. Nothing broader.
+const SCOPES: &str = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose \
+                      https://www.googleapis.com/auth/calendar.events \
+                      https://www.googleapis.com/auth/calendar.calendarlist.readonly";
 /// How long to wait for the user to finish the consent screen.
 const CONSENT_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -193,6 +195,7 @@ impl GoogleAuth {
             .append_pair("code_challenge_method", "S256")
             .append_pair("state", &state)
             .append_pair("access_type", "offline")
+            .append_pair("include_granted_scopes", "true")
             .append_pair("prompt", "consent");
         // Always print the link: the browser may open somewhere unexpected.
         eprintln!("\nGoogle sign-in for agent-unibrow. If no browser tab opened, visit:\n{url}\n");

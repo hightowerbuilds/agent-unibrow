@@ -30,6 +30,8 @@ would, see browser_pane.rs); `relaunch` kills the instance after the
 first turn (a crash) and starts it again on the same data with a new task
 (optionally on another `page`, after `mutate`-ing served pages); `inbox`
 is a fake mailbox of `{from, subject, body, seconds_ago}` for codes;
+`calendar` is a fake Google Calendar (`{calendars, events, sent}`, see
+rail-api's calendar/file.rs), saved as calendar.json in the data folder;
 `tools_any` lists groups of tools where any one being called is enough
 (e.g. browser_type or browser_fill_form), and `reply_any` groups of words
 where any one in the reply is enough; `kill_renderer_secs` kills the
@@ -269,6 +271,12 @@ def run_case(case, port, workdir: Path, site: Path, tls_port=None):
         inbox = workdir / f"{case['name']}-inbox.json"
         inbox.write_text(json.dumps(case["inbox"]))
         env["UNIBROW_TEST_INBOX"] = str(inbox)
+    if "calendar" in case:
+        # A calendar file standing in for Google Calendar, inside the
+        # instance's data folder so `files` can check what it holds after.
+        data.mkdir(parents=True, exist_ok=True)
+        (data / "calendar.json").write_text(json.dumps(case["calendar"]))
+        env["UNIBROW_TEST_CALENDAR"] = str(data / "calendar.json")
     if "autosteer" in case:
         env["UNIBROW_AUTOSTEER"] = case["autosteer"]
     if case.get("watch_fast"):

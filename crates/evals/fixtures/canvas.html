@@ -1,0 +1,34 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Pick a color</title>
+<style>body { font-family: sans-serif; margin: 16px; } canvas { display: block; border: 1px solid #ccc; }</style>
+<h1>Pick a color</h1>
+<canvas id="c" width="820" height="520"></canvas>
+<p id="out">Picked: nothing yet</p>
+<script>
+// Three circles drawn on a canvas: nothing for the page outline to list.
+const c = document.getElementById('c'), g = c.getContext('2d');
+const shapes = [
+  {name: 'red', x: 160, y: 260, r: 90, color: '#d33'},
+  {name: 'blue', x: 410, y: 260, r: 90, color: '#36c'},
+  {name: 'green', x: 660, y: 260, r: 90, color: '#3a3'},
+];
+let picked = null;
+function draw() {
+  g.clearRect(0, 0, c.width, c.height);
+  for (const s of shapes) {
+    g.beginPath(); g.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+    g.fillStyle = s.color; g.fill();
+    if (s.name === picked) { g.lineWidth = 8; g.strokeStyle = '#000'; g.stroke(); }
+  }
+}
+c.addEventListener('click', e => {
+  const r = c.getBoundingClientRect();
+  const x = (e.clientX - r.left) * c.width / r.width, y = (e.clientY - r.top) * c.height / r.height;
+  const hit = shapes.find(s => (x - s.x) ** 2 + (y - s.y) ** 2 <= s.r ** 2);
+  picked = hit ? hit.name : null;
+  document.getElementById('out').textContent = 'Picked: ' + (picked || 'nothing');
+  draw();
+});
+draw();
+</script>

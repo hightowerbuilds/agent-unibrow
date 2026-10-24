@@ -15,13 +15,13 @@ const API: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 const BODY_CHARS: usize = 6000;
 
 pub struct Gmail {
-    auth: GoogleAuth,
+    auth: Arc<GoogleAuth>,
     http: reqwest::Client,
     me: OnceCell<String>,
 }
 
 impl Gmail {
-    pub fn new(auth: GoogleAuth) -> Self {
+    pub fn new(auth: Arc<GoogleAuth>) -> Self {
         Self { auth, http: reqwest::Client::new(), me: OnceCell::new() }
     }
 

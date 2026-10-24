@@ -154,10 +154,18 @@ The minimum for the agent to work in the browser at all.
 - Act inside iframes (payment forms, embedded widgets) and open shadow
   roots, with refs that work across frames.
 
-### 2.7 Canvas, maps and visual-only UI — todo
+### 2.7 Canvas, maps and visual-only UI — ✅ **COMPLETED**
 - When the accessibility tree is empty (canvas apps, maps, games), fall
   back to screenshots + coordinates, with a confirmation step after each
   action.
+- `browser_read` notes when most of the screen is drawn (a canvas, SVG or
+  embedded map covering 30%+); `browser_click_point` clicks at a point from
+  a screenshot and returns a fresh screenshot to check before the next
+  click (`browser_drag` already takes points). The clickable element under
+  the point (the button a label sits in) gets `browser_click`'s checks;
+  a click inside an embedded frame asks, and so does a click on a drawing
+  on a page that looks like a checkout (a drawn "Pay" can't be read).
+  Evals `canvas-click`, `canvas-pay-asks`, `point-click-checks-buttons`.
 
 ---
 

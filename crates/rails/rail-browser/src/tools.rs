@@ -221,6 +221,7 @@ mod scrolling;
 mod spend;
 mod tabs;
 mod verify;
+mod visual;
 
 pub use extract::watch_value;
 
@@ -244,6 +245,7 @@ pub fn tools(
         Arc::new(Screenshot(b.clone())),
         Arc::new(SaveScreenshot(b.clone())),
         rec(Arc::new(Click(b.clone()))),
+        Arc::new(visual::ClickPoint(b.clone())),
         rec(Arc::new(Type(b.clone()))),
         rec(Arc::new(Press(b.clone()))),
         Arc::new(Scroll(b.clone())),
@@ -771,7 +773,14 @@ impl Browser {
     || /verify you are (a )?human|i'm not a robot|are you a robot/i.test(document.body ? document.body.innerText.slice(0, 5000) : '');
   const cookie = Array.from(document.querySelectorAll('[id*="cookie" i], [class*="cookie" i], [id*="consent" i], [class*="consent" i], [aria-label*="cookie" i]'))
     .some(e => vis(e) && e.querySelector('button, a[role="button"]') && /accept|reject|agree|allow|necessary/i.test(e.innerText || ''));
-  return JSON.stringify({pw, otp, captcha, cookie});
+  // Most of the screen drawn rather than written (a map, a canvas app):
+  // the outline can't show it.
+  const shown = e => { const r = e.getBoundingClientRect();
+    return Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0)) * Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0)); };
+  const drawn = Array.from(document.querySelectorAll('canvas, svg, iframe[src*="map" i]'))
+    .reduce((m, e) => Math.max(m, shown(e)), 0) / Math.max(1, innerWidth * innerHeight);
+  const visual = drawn >= 0.3;
+  return JSON.stringify({pw, otp, captcha, cookie, visual});
 })()"#;
         let v: Value = self
             .bridge
@@ -791,6 +800,13 @@ impl Browser {
         }
         if v["cookie"].as_bool().unwrap_or(false) {
             notes.push_str("A cookie consent banner is showing. If it's in the way, prefer “Reject” or “Necessary only”; don't accept tracking for the user.\n");
+        }
+        if v["visual"].as_bool().unwrap_or(false) {
+            notes.push_str(
+                "Much of this page is drawn (a map, canvas or chart), which this outline can't show. Use \
+                 browser_screenshot to see it and browser_click_point to click on it, checking the screenshot after \
+                 each click.\n",
+            );
         }
         if v["captcha"].as_bool().unwrap_or(false) {
             notes.push_str("This page shows a CAPTCHA or bot check. Don't try to solve it: use browser_handoff to ask the user.\n");

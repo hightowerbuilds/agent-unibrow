@@ -45,8 +45,8 @@ const BASICS: &[Section] = &[
         blocks: &[
             Block::Para(
                 "The agent works in this browser, on the page you're looking at. It reads pages, clicks, types, \
-                 opens tabs, downloads files, reads and edits files on your computer, and checks your Gmail, and you \
-                 watch every step. You stay in charge: \
+                 opens tabs, downloads files, reads and edits files on your computer, and checks your Gmail and \
+                 Google Calendar, and you watch every step. You stay in charge: \
                  anything that buys, sends, posts or deletes waits for your OK.",
             ),
             Block::Para(
@@ -80,6 +80,9 @@ const BASICS: &[Section] = &[
                 "Say \"draft\" or \"don't send\" when you only want it prepared. It prefers drafts anyway.",
                 "One errand per message works best. Follow up in the same chat; it remembers the conversation.",
                 "If it's already on the right page, just say \"on this page…\".",
+                "Maps, drawings and canvas apps work too: it looks at a screenshot, clicks a point, and checks a new \
+                 screenshot after each click. A drawn Pay or Buy button can't be read, so on checkout pages those \
+                 clicks ask you first.",
             ]),
             Block::Para("Try one (click to put it in the chat box):"),
             Block::Examples(&[
@@ -104,6 +107,9 @@ const SAFETY: &[Section] = &[
                  that send information, uploading a file, and confirming risky pop-ups all ask first, with a \
                  screenshot and the values.",
                 "\"Always allow\" on a card stops asking for that site (or those email recipients).",
+                "Calendar: the agent reads your calendar and adds or moves your own events without asking. Anything \
+                 that emails other people (invitations, updates, cancellations) asks first, and so does every \
+                 delete.",
                 "Focus › Safety: \"Only act on focus sites\" makes clicking or typing anywhere else ask first (reading \
                  is still fine). \"Always ask for purchases over\" shows you any bigger purchase, with its amount, even \
                  where you said always allow.",

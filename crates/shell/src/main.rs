@@ -732,6 +732,10 @@ impl Shell {
             if let Some(path) = test_hooks::var("UNIBROW_TEST_INBOX") {
                 codes = Some(Arc::new(rail_api::codes::FileCodes(path.into())));
             }
+            // ...and a calendar file for Google Calendar.
+            if let Some(path) = test_hooks::var("UNIBROW_TEST_CALENDAR") {
+                registry.add_rail(&rail_api::ApiRail::test_calendar(path.into()));
+            }
             vec!["Gmail tools off in this test instance".to_string()]
         } else {
             let (rail, notes) = rail_api::ApiRail::from_config();

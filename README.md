@@ -96,10 +96,12 @@ requests that don't come from OpenCode's own app.
 
 ### Setup
 
-- **Gmail**: create a Google OAuth client of type *Desktop app* with the Gmail
-  API enabled and yourself as a test user, then save its JSON as
-  `~/.config/agent-unibrow/google_client.json`. The first Gmail tool call opens
-  the consent screen; the refresh token is stored in the keyring.
+- **Gmail and Google Calendar**: create a Google OAuth client of type *Desktop
+  app* with the Gmail API and the Google Calendar API enabled and yourself as
+  a test user, then save its JSON as `~/.config/agent-unibrow/google_client.json`.
+  The first Gmail or Calendar tool call opens the consent screen; the refresh
+  token is stored in the keyring. A sign-in from before calendar access was
+  added asks once more, the first time the agent uses the calendar.
 - **API key agent only**: set `ANTHROPIC_API_KEY`, or paste a key into the app
   when it asks (saved to the GNOME keyring).
 

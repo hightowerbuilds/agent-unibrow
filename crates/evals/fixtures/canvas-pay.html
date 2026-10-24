@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Checkout</title>
+<style>body { font-family: sans-serif; margin: 16px; } canvas { display: block; }</style>
+<h1>Checkout</h1>
+<p>Order total: $48.00</p>
+<canvas id="c" width="820" height="420"></canvas>
+<p id="out">Not paid</p>
+<script>
+// The Pay button is drawn, so its words can't be read from the page.
+const c = document.getElementById('c'), g = c.getContext('2d');
+g.fillStyle = '#eee'; g.fillRect(0, 0, c.width, c.height);
+g.fillStyle = '#2a7'; g.fillRect(260, 160, 300, 100);
+g.fillStyle = '#fff'; g.font = 'bold 40px sans-serif'; g.fillText('Pay now', 335, 225);
+c.addEventListener('click', e => {
+  const r = c.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
+  if (x >= 260 && x <= 560 && y >= 160 && y <= 260) document.getElementById('out').textContent = 'PAID $48.00';
+});
+</script>
