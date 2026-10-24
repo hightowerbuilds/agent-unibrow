@@ -103,15 +103,21 @@ async fn refused_paths_never_reach_the_user() {
 }
 
 #[tokio::test]
-async fn new_files_in_the_downloads_folder_dont_ask() {
+async fn new_files_in_the_workspace_files_folder_dont_ask() {
     let (data, cfg) = sandbox("free");
-    let dl = data.join("downloads");
+    let dl = data.join("workspace/Files");
     let (r, cards) = run(&cfg, "file_write", json!({"path": dl.join("summary.md").to_str().unwrap(), "content": "# Hi"}), true).await;
     assert!(r.unwrap().content.contains("don't need the user's approval"));
     assert!(cards.is_empty());
     // Replacing one does.
     let (r, cards) =
         run(&cfg, "file_write", json!({"path": dl.join("summary.md").to_str().unwrap(), "content": "# Bye", "overwrite": true}), true).await;
+    r.unwrap();
+    assert_eq!(cards.len(), 1);
+    // The workspace's other folders ask too.
+    let shots = data.join("workspace/Screenshots");
+    std::fs::create_dir_all(&shots).unwrap();
+    let (r, cards) = run(&cfg, "file_write", json!({"path": shots.join("a.txt").to_str().unwrap(), "content": "x"}), true).await;
     r.unwrap();
     assert_eq!(cards.len(), 1);
 }

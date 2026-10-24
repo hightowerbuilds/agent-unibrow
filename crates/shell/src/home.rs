@@ -355,12 +355,14 @@ fn theme_css(layout: &Layout) -> String {
     css
 }
 
-/// The app's folders the settings page can open: data (history, chats,
-/// profile), traces, downloads, config (settings, policy).
+/// The app's folders the settings page can open: the workspace (saves),
+/// data (history, chats, profile), traces, downloads, config (settings,
+/// policy).
 pub fn folder(which: &str) -> Option<std::path::PathBuf> {
     let data = rail_browser::data_dir();
     let test = std::env::var_os("UNIBROW_DATA_DIR").is_some();
     Some(match which {
+        "workspace" => rail_browser::workspace::ensure(),
         "data" => data,
         "traces" => data.join("traces"),
         "downloads" => rail_browser::downloads_dir(),
@@ -391,10 +393,10 @@ pub fn settings_state(status: &Status) -> Value {
             {"what": "Chats", "path": path(chats::Chats::default_path())},
             {"what": "Browser profile (cookies, logins, site data)", "path": path(rail_browser::profile_dir())},
             {"what": "Traces", "path": folder("traces").map(path)},
-            {"what": "Downloads", "path": path(rail_browser::downloads_dir())},
+            {"what": "Workspace (screenshots, downloads, saved pages, exported chats, the agent's files)", "path": path(rail_browser::workspace::root())},
             {"what": "Your home page files (user.css, index.html, pictures)", "path": user_folder().map(path)},
         ],
-        "folders": ["data", "traces", "downloads", "config", "home"],
+        "folders": ["workspace", "data", "traces", "downloads", "config", "home"],
         "versions": {"app": env!("CARGO_PKG_VERSION"), "chromium": cef},
         "policy": policy,
     })

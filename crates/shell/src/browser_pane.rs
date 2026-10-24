@@ -359,7 +359,7 @@ fn placement(from_agent: bool, from_active: bool, foreground: bool) -> (bool, bo
     }
 }
 
-/// A free file name in the downloads folder for a PDF of the page `title`.
+/// A free file name in `dir` for a PDF of the page `title`.
 fn pdf_path(dir: &std::path::Path, title: &str) -> std::path::PathBuf {
     let stem: String = title
         .chars()
@@ -1657,18 +1657,19 @@ impl BrowserPane {
                 let title = if chrome.title.is_empty() { site_of(&chrome.url).unwrap_or_default() } else { chrome.title };
                 let stem = pdf_path(std::path::Path::new(""), &title);
                 let stem = stem.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                self.save_shot = Some(chats::free_path(&rail_browser::downloads_dir(), &format!("Screenshot of {stem}.png")));
+                let dir = rail_browser::workspace::Folder::Screenshots.dir();
+                self.save_shot = Some(chats::free_path(&dir, &format!("Screenshot of {stem}.png")));
                 view.invalidate();
             }
             MenuCmd::SavePdf => {
                 let title = if chrome.title.is_empty() { site_of(&chrome.url).unwrap_or_default() } else { chrome.title };
-                let path = pdf_path(&rail_browser::downloads_dir(), &title);
+                let path = pdf_path(&rail_browser::workspace::Folder::Pages.dir(), &title);
                 let rx = view.save_pdf(&path.to_string_lossy());
                 cx.spawn(async move |this, cx| {
                     let ok = rx.await.unwrap_or(false);
                     let _ = this.update(cx, |pane, cx| {
                         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                        let text = if ok { format!("Saved {name} to Downloads") } else { "Couldn't save the page as a PDF".into() };
+                        let text = if ok { format!("Saved {name} to Pages") } else { "Couldn't save the page as a PDF".into() };
                         debug(|| format!("pdf {ok} {}", path.display()));
                         pane.notice = Some((text, Instant::now()));
                         cx.notify();
@@ -1698,7 +1699,7 @@ impl BrowserPane {
             let _ = this.update(cx, |pane, cx| {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 debug(|| format!("screenshot {ok} {} ({w}x{h})", path.display()));
-                pane.notice = Some((if ok { format!("Saved {name} to Downloads") } else { "Couldn't save the screenshot".into() }, Instant::now()));
+                pane.notice = Some((if ok { format!("Saved {name} to Screenshots") } else { "Couldn't save the screenshot".into() }, Instant::now()));
                 cx.notify();
             });
         })
@@ -3527,29 +3528,16 @@ fn map_button(b: MouseButton) -> Option<rail_browser::MouseButton> {
     }
 }
 
-/// Writes a `Page.captureScreenshot` result to the Pictures folder (a test
-/// instance's own folder in tests) and copies it. Returns what to tell the
+/// Writes a `Page.captureScreenshot` result to the workspace's Screenshots
+/// folder and copies it (not from a test instance). Returns what to tell the
 /// user.
 fn save_screenshot(shot: &serde_json::Value, site: &str) -> Result<String, String> {
     use base64::Engine;
+    use rail_browser::workspace;
     let data = shot["data"].as_str().ok_or("the page sent no picture")?;
     let bytes = base64::engine::general_purpose::STANDARD.decode(data).map_err(|e| e.to_string())?;
     let test = crate::test_hooks::var("UNIBROW_DATA_DIR");
-    let dir = match &test {
-        Some(d) => std::path::PathBuf::from(d).join("screenshots"),
-        None => dirs::picture_dir().or_else(dirs::home_dir).unwrap_or_else(std::env::temp_dir).join("agent-unibrow"),
-    };
-    std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't make {}: {e}", dir.display()))?;
-    let stem: String = site.chars().map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
-    let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
-    let mut path = dir.join(format!("{stem}-{stamp}.png"));
-    for n in 2.. {
-        if !path.exists() {
-            break;
-        }
-        path = dir.join(format!("{stem}-{stamp}-{n}.png"));
-    }
-    std::fs::write(&path, &bytes).map_err(|e| format!("couldn't save it: {e}"))?;
+    let path = workspace::write_new(workspace::Folder::Screenshots, &workspace::stamped(site), "png", &bytes)?;
     // Never the user's clipboard from a test instance.
     let copied = test.is_none() && copy_png(&bytes);
     let shown = match dirs::home_dir().and_then(|h| path.strip_prefix(&h).ok().map(|p| p.to_path_buf())) {

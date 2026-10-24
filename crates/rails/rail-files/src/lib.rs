@@ -4,7 +4,7 @@
 //! Reading runs on its own. Every change asks the user first, on an
 //! approval card that shows exactly what will happen (the path, the size,
 //! and a short diff of the lines that change), except creating a brand-new
-//! file or folder in the app's downloads folder, which can't overwrite or
+//! file or folder in the workspace's Files folder, which can't overwrite or
 //! lose anything. Deleting never unlinks: items go to the desktop Trash.
 //!
 //! The changing tools declare [`Effect::Stage`] and ask through the tool
@@ -95,7 +95,7 @@ struct Plan {
     card: String,
     /// Why it asks (the card's reason line).
     reason: String,
-    /// `false` for new files and folders in the downloads folder.
+    /// `false` for new files and folders in the workspace's Files folder.
     ask: bool,
     apply: Box<dyn FnOnce() -> ToolResult + Send>,
 }
@@ -113,7 +113,7 @@ fn run_plan(
         }
         let mut out = blocking(plan.apply).await?;
         if !plan.ask {
-            out.content.push_str("\n(New items in the downloads folder don't need the user's approval.)");
+            out.content.push_str("\n(New items in the workspace's Files folder don't need the user's approval.)");
         }
         Ok(out)
     })
@@ -776,8 +776,8 @@ impl Tool for WriteFile {
     fn description(&self) -> &'static str {
         "Create a text file on the user's computer, or replace one (overwrite: true). Missing folders on the way \
          are created. The user approves each write on a card showing the path and the content or a diff, except \
-         new files in the app's downloads folder (~/Downloads/agent-unibrow). To change part of an existing \
-         file, use file_edit instead. Paths: absolute or ~/…; hidden folders, the app's own data, keys and \
+         new files in the app's workspace Files folder (~/Desktop/unibrow-workspace/Files). To change part of \
+         an existing file, use file_edit instead. Paths: absolute or ~/…; hidden folders, the app's own data, keys and \
          system folders are off limits."
     }
     fn input_schema(&self) -> Value {
@@ -908,7 +908,7 @@ impl Tool for MakeDir {
     }
     fn description(&self) -> &'static str {
         "Create a folder (and any missing folders above it) on the user's computer. The user approves it, \
-         except inside the app's downloads folder."
+         except inside the app's workspace Files folder (~/Desktop/unibrow-workspace/Files)."
     }
     fn input_schema(&self) -> Value {
         json!({

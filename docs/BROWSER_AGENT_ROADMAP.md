@@ -204,7 +204,7 @@ The minimum for the agent to work in the browser at all.
 - Never browse the user's disk on its own.
 
 ### 4.4 Downloads — ✅ **COMPLETED** (auto-save, toolbar list, `browser_downloads`, `browser_read_download` incl. PDF via pdftotext)
-- `DownloadHandler`: save to `~/Downloads/agent-unibrow`, show progress in
+- `DownloadHandler`: save to `~/Desktop/unibrow-workspace/Downloads` (was `~/Downloads/agent-unibrow`), show progress in
   the UI, and report the saved path to the agent.
 - Read downloaded PDFs, CSVs and text so the agent can use their contents.
 
@@ -419,7 +419,9 @@ set path instead of starting from scratch each time.
 
 - Zoom (Ctrl+= / Ctrl+- / Ctrl+0, Ctrl+wheel, per site, toolbar badge; agent clicks stay accurate) — ✅ **COMPLETED**
 - Reader mode (toolbar Reader button, clean article view) — ✅ **COMPLETED**
-- Screenshot button (toolbar camera: saves the visible page as a PNG in ~/Pictures/agent-unibrow and copies it with wl-copy/xclip; eval `screenshot-button`) — ✅ **COMPLETED**
+- Screenshot button (toolbar camera: saves the visible page as a PNG in ~/Desktop/unibrow-workspace/Screenshots and copies it with wl-copy/xclip; eval `screenshot-button`) — ✅ **COMPLETED**
+- Workspace folder and sidebar tab (`~/Desktop/unibrow-workspace` with Screenshots, Downloads, Pages, Chats and Files; the Workspace tab lists it with thumbnails, open, rename, delete to the Trash, show in folder; Alt+6; eval `workspace-tab`) — ✅ **COMPLETED**
+- Agent saves screenshots to the workspace (`browser_save_screenshot`: the visible page, one element or a region, as PNG in Screenshots; sensitive fields masked; evals `agent-saves-screenshot`, `agent-saves-element-shot`, `agent-saved-shot-masked`) — ✅ **COMPLETED**
 - Translate page — skipped: Chromium's translate sends page text to Google. Option: the agent translates the extracted article into chat or reader view — todo
 - Spellcheck in fields — blocked: CEF 154 off-screen browsers never report misspellings (dictionary downloads, prefs set); menu wiring ready if it ever does
 - Right-click context menus rendered in-app (links, images, editing, navigation, save as PDF, view source) — ✅ **COMPLETED**

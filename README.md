@@ -43,6 +43,14 @@ The sidebar's **Explained** tab (Alt+5) is the in-app guide: what the agent can 
 to ask well, approvals and Stop, what it won't do, and shortcuts. Its example requests
 drop straight into the chat box.
 
+Everything the app saves goes to one folder, `~/Desktop/unibrow-workspace`:
+`Screenshots` (the toolbar camera), `Downloads`, `Pages` (pages saved as PDF), `Chats`
+(exported chats) and `Files` (new files the agent writes, the one place it may create
+files without asking). The sidebar's **Workspace** tab (Alt+6) browses it, with
+thumbnails, open, rename, delete (to the Trash) and show in the file manager. The agent
+can save screenshots there too ("save a screenshot of this page"), with passwords and
+card numbers masked.
+
 ## Run
 
 ```

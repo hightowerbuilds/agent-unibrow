@@ -7,6 +7,7 @@
 mod browser_pane;
 mod chat_text;
 mod chat_tools;
+mod workspace_tab;
 mod explained;
 mod home;
 mod jev_worker;
@@ -38,7 +39,7 @@ use trace::{Kind, Trace};
 
 gpui::actions!(
     shell,
-    [ToggleSidebar, ShowChat, ShowHistory, ShowFocus, ShowTrace, ShowExplained, StopAgent, NewTab, CloseTab, NextTab, PrevTab, FocusAddress, FindInPage, ZoomIn, ZoomOut, ZoomReset]
+    [ToggleSidebar, ShowChat, ShowHistory, ShowFocus, ShowTrace, ShowExplained, ShowWorkspace, StopAgent, NewTab, CloseTab, NextTab, PrevTab, FocusAddress, FindInPage, ZoomIn, ZoomOut, ZoomReset]
 );
 
 const KEYRING_SERVICE: &str = "agent-unibrow";
@@ -128,6 +129,8 @@ enum SidebarTab {
     /// History, Bookmarks and Trace, as sub-tabs ([`HistorySub`]).
     History,
     Focus,
+    /// The workspace folder's files (workspace_tab.rs).
+    Workspace,
     Explained,
 }
 
@@ -199,6 +202,8 @@ struct Shell {
     confirm_delete: Option<chats::ChatId>,
     /// Rename, search and export (chat_tools.rs).
     chat_tools: chat_tools::ChatTools,
+    /// The Workspace tab (workspace_tab.rs).
+    workspace: workspace_tab::WorkspaceTab,
     /// The active chat's messages.
     items: Vec<Item>,
     /// The agent's checklist for this chat (7.4), shown above the messages.
@@ -296,6 +301,7 @@ impl Shell {
         let fullscreen_sub = cx.subscribe(&browser, |_: &mut Self, _, _: &FullscreenChanged, cx| cx.notify());
         window.focus(&input.focus_handle(cx));
         let (chat_tools, chat_tools_subs) = chat_tools::ChatTools::new(window, cx);
+        let (workspace, workspace_subs) = workspace_tab::WorkspaceTab::new(window, cx);
 
         // Site scope (6.3) checks against the focus sites.
         let mut policy = Policy::load();
@@ -331,6 +337,7 @@ impl Shell {
             jev_context: Vec::new(),
             confirm_delete: None,
             chat_tools,
+            workspace,
             items,
             task_plan,
             streaming: None,
@@ -365,6 +372,7 @@ impl Shell {
             _events: None,
         };
         shell._subscriptions.extend(chat_tools_subs);
+        shell._subscriptions.extend(workspace_subs);
         shell.spawn_chat_test(cx);
         if let Some(p) = shell.trace.path().cloned() {
             shell.trace.push(Kind::Info, "Trace file opened", Some(p.display().to_string()));
@@ -705,7 +713,10 @@ impl Shell {
             registry.add_tool(tool);
         }
         // Files on the user's computer (a sandbox folder in test instances).
-        registry.add_rail(&rail_files::FilesRail::new(rail_files::paths::Config::from_env(rail_browser::downloads_dir())));
+        registry.add_rail(&rail_files::FilesRail::new(rail_files::paths::Config::from_env(
+            rail_browser::workspace::ensure(),
+            rail_browser::workspace::Folder::Files.dir(),
+        )));
         registry.add_tool(chats::TaskProgress::new(self.chats.clone(), self.chat_id));
         registry.add_tool(Arc::new(home::Customize));
         for n in &notes {
@@ -1421,13 +1432,14 @@ impl Shell {
             SidebarTab::History if self.history_sub == HistorySub::Visits => {
                 window.focus(&self.history_filter.focus_handle(cx))
             }
+            SidebarTab::Workspace => self.open_workspace(cx),
             _ => {}
         }
         self.scroll_to_bottom();
         cx.notify();
     }
 
-    /// The sidebar tabs (Chat, History, Focus, Explained).
+    /// The sidebar tabs (Chat, History, Focus, Workspace, Explained).
     fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let tab = |id: &'static str, label: String, selected: bool, badge: Option<String>| {
             div()
@@ -1481,6 +1493,9 @@ impl Shell {
                         )
                         .on_click(cx.listener(|this, _, window, cx| this.select_tab(SidebarTab::Focus, window, cx))),
                     )
+                    .child(tab("tab-workspace", "Workspace".into(), self.tab == SidebarTab::Workspace, None).on_click(
+                        cx.listener(|this, _, window, cx| this.select_tab(SidebarTab::Workspace, window, cx)),
+                    ))
                     .child(tab("tab-explained", "Explained".into(), self.tab == SidebarTab::Explained, None).on_click(
                         cx.listener(|this, _, window, cx| this.select_tab(SidebarTab::Explained, window, cx)),
                     )),
@@ -2393,6 +2408,7 @@ impl Shell {
             SidebarTab::Chat => self.render_chat(cx).into_any_element(),
             SidebarTab::History => self.render_history_tab(cx),
             SidebarTab::Focus => self.render_focus(cx).into_any_element(),
+            SidebarTab::Workspace => self.render_workspace(cx).into_any_element(),
             SidebarTab::Explained => {
                 let me = cx.entity().downgrade();
                 let me2 = me.clone();
@@ -3044,6 +3060,7 @@ impl Render for Shell {
                 this.show_tab(SidebarTab::History, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ShowExplained, window, cx| this.show_tab(SidebarTab::Explained, window, cx)))
+            .on_action(cx.listener(|this, _: &ShowWorkspace, window, cx| this.show_tab(SidebarTab::Workspace, window, cx)))
             .flex()
             .flex_row()
             .size_full()
@@ -3219,6 +3236,7 @@ fn main() -> std::process::ExitCode {
             gpui::KeyBinding::new("alt-3", ShowFocus, None),
             gpui::KeyBinding::new("alt-4", ShowTrace, None),
             gpui::KeyBinding::new("alt-5", ShowExplained, None),
+            gpui::KeyBinding::new("alt-6", ShowWorkspace, None),
         ]);
         let bounds = Bounds::centered(None, size(px(1400.), px(860.)), cx);
         cx.open_window(

@@ -28,7 +28,7 @@ function openFolder(which) {
   }).catch(() => {});
 }
 
-const NAMES = { data: "App data", traces: "Traces", downloads: "Downloads", config: "Settings folder", home: "Home page folder" };
+const NAMES = { workspace: "Workspace", data: "App data", traces: "Traces", downloads: "Downloads", config: "Settings folder", home: "Home page folder" };
 
 function draw(s) {
   $('#where').append(

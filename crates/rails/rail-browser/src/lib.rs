@@ -20,6 +20,7 @@ pub mod reader;
 pub mod spelling;
 pub mod tools;
 pub mod vault;
+pub mod workspace;
 
 use cef::args::Args;
 use cef::{CefString, ImplBrowser, ImplBrowserHost, ImplCommandLine, ImplFrame};
@@ -252,15 +253,10 @@ impl Idle {
     }
 }
 
-/// Where downloads go: `~/Downloads/agent-unibrow`, or inside
-/// `$UNIBROW_DATA_DIR` for test instances.
+/// Where downloads go: the workspace's Downloads folder
+/// (`~/Desktop/unibrow-workspace/Downloads`).
 pub fn downloads_dir() -> PathBuf {
-    let dir = match std::env::var_os("UNIBROW_DATA_DIR") {
-        Some(d) => PathBuf::from(d).join("downloads"),
-        None => dirs::download_dir().unwrap_or_else(|| data_dir().join("downloads")).join("agent-unibrow"),
-    };
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+    workspace::Folder::Downloads.dir()
 }
 
 /// Everything the UI shows about a page, updated by CEF callbacks.

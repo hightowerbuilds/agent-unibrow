@@ -242,6 +242,7 @@ pub fn tools(
         rec(Arc::new(Open(b.clone()))),
         Arc::new(Read(b.clone())),
         Arc::new(Screenshot(b.clone())),
+        Arc::new(SaveScreenshot(b.clone())),
         rec(Arc::new(Click(b.clone()))),
         rec(Arc::new(Type(b.clone()))),
         rec(Arc::new(Press(b.clone()))),
@@ -1029,10 +1030,11 @@ browser_tool!(Hover);
 browser_tool!(Dialog);
 browser_tool!(Find);
 browser_tool!(Downloads);
-/// Reads files from the downloads folder; needs no browser access.
+/// Reads files from the workspace (downloads, saved PDFs); needs no browser access.
 pub struct ReadDownload;
 browser_tool!(Upload);
 browser_tool!(SavePdf);
+browser_tool!(SaveScreenshot);
 browser_tool!(SignIn);
 browser_tool!(Handoff);
 pub struct History(Arc<Browser>, NavAction);
@@ -1988,7 +1990,8 @@ impl Tool for Downloads {
     }
     fn description(&self) -> &'static str {
         "List files downloaded in the app's browser: name, where it was saved, progress, and whether it finished. \
-         Downloads save automatically to the agent-unibrow downloads folder. Use browser_read_download to read one."
+         Downloads save automatically to the Downloads folder in the app's workspace \
+         (~/Desktop/unibrow-workspace). Use browser_read_download to read one."
     }
     fn input_schema(&self) -> Value {
         json!({"type": "object", "properties": {}, "additionalProperties": false})
@@ -2073,7 +2076,8 @@ impl Tool for ReadDownload {
     }
     fn description(&self) -> &'static str {
         "Read a downloaded file's text (CSV, TXT, JSON, HTML, Markdown, and PDF when pdftotext is installed), \
-         by its name or path from browser_downloads. Only files in the downloads folder can be read."
+         by its name or path from browser_downloads, or a path to a PDF saved with browser_save_pdf. Only files \
+         in the app's workspace folder (~/Desktop/unibrow-workspace) can be read."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -2098,10 +2102,11 @@ impl Tool for ReadDownload {
             let file = arg_str(&input, "file")?;
             let max = input["max_chars"].as_u64().unwrap_or(20_000).clamp(1000, 100_000) as usize;
             let dir = crate::downloads_dir().canonicalize().map_err(|e| e.to_string())?;
+            let workspace = crate::workspace::root().canonicalize().map_err(|e| e.to_string())?;
             let candidate = if file.contains('/') { std::path::PathBuf::from(file) } else { dir.join(file) };
             let path = candidate.canonicalize().map_err(|_| format!("No downloaded file “{file}”."))?;
-            if !path.starts_with(&dir) {
-                return Err("Only files in the downloads folder can be read.".into());
+            if !path.starts_with(&workspace) {
+                return Err("Only files in the app's workspace folder can be read.".into());
             }
             let text = tokio::task::spawn_blocking(move || read_download_text(&path, max))
                 .await
@@ -2219,7 +2224,7 @@ impl Tool for SavePdf {
         "browser_save_pdf"
     }
     fn description(&self) -> &'static str {
-        "Save the current page as a PDF in the downloads folder (receipts, confirmations, articles). Returns the \
+        "Save the current page as a PDF in the Pages folder of the app's workspace (receipts, confirmations, articles). Returns the \
          file's path."
     }
     fn input_schema(&self) -> Value {
@@ -2245,7 +2250,7 @@ impl Tool for SavePdf {
             });
             let clean: String =
                 base.chars().map(|c| if c.is_alphanumeric() || " -_.".contains(c) { c } else { '_' }).take(80).collect();
-            let dir = crate::downloads_dir();
+            let dir = crate::workspace::Folder::Pages.dir();
             let mut path = dir.join(format!("{}.pdf", clean.trim()));
             let mut n = 1;
             while path.exists() {

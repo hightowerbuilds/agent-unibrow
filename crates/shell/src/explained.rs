@@ -237,10 +237,26 @@ const HISTORY: &[Section] = &[
 
 const FILES: &[Section] = &[
     Section {
+        title: "Your workspace",
+        blocks: &[Block::Bullets(&[
+            "Everything the app saves goes to one folder on your Desktop, ~/Desktop/unibrow-workspace: \
+             Screenshots (the camera button), Downloads, Pages (pages saved as PDF), Chats (exported chats) and \
+             Files (files the agent made).",
+            "The Workspace tab in the sidebar browses it: click a file to open it, a folder to look inside. \
+             Rename, Delete (to the Trash) and Show in folder are on each row.",
+            "The agent can save screenshots there too: of the whole page, or just one part of it. Passwords and \
+             card numbers show as dots in them, as in every screenshot it takes.",
+        ]),
+        Block::Examples(&[
+            "Save a screenshot of this page to my workspace",
+            "Save a screenshot of just the price chart, named price-history",
+        ])],
+    },
+    Section {
         title: "Downloads and uploads",
         blocks: &[
             Block::Bullets(&[
-                "Downloads save to ~/Downloads/agent-unibrow. The ↓ button in the toolbar lists them.",
+                "Downloads save to the workspace's Downloads folder. The ↓ button in the toolbar lists them.",
                 "The agent can read downloaded text, CSV and PDF files, and save any page as a PDF.",
                 "To upload, tell it the file's full path. It asks before attaching anything.",
             ]),
@@ -253,8 +269,8 @@ const FILES: &[Section] = &[
                 "The agent can read, list and search your files, and write new ones, edit them, make folders, \
                  move or rename things, and delete.",
                 "Reading runs on its own. Every change shows you a card first, with the path and the lines that \
-                 change (or the new file's text), and waits for your OK. Only new files in ~/Downloads/agent-unibrow \
-                 skip the card.",
+                 change (or the new file's text), and waits for your OK. Only new files in the workspace's Files \
+                 folder skip the card.",
                 "Deleting moves things to the Trash, so you can restore them from your file manager.",
                 "Off limits: hidden folders (~/.ssh, ~/.config and the like), the app's own data and settings, keys \
                  and password files, and system folders outside your home.",
@@ -291,6 +307,7 @@ const KEYS: &[Section] = &[
             ("Alt+1 … Alt+3", "Chat, History, Focus"),
             ("Alt+4", "History → Trace"),
             ("Alt+5", "Explained"),
+            ("Alt+6", "Workspace (your saved files)"),
             ("Esc", "Stop the agent"),
             ("Ctrl+T / Ctrl+W", "New tab / close tab"),
             ("Ctrl+Tab", "Next tab (Shift for previous)"),

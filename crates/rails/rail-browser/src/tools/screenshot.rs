@@ -1,5 +1,7 @@
 //! `browser_screenshot`: the visible page, or one element or region of it
-//! ("screenshot this chart").
+//! ("screenshot this chart"). `browser_save_screenshot` takes the same
+//! pictures as PNG files in the workspace's Screenshots folder, for the
+//! user to keep.
 //!
 //! A region is captured at up to two image pixels per CSS pixel (sharper
 //! than the page screenshot, so small text and chart labels are legible),
@@ -9,7 +11,8 @@
 //! fields are masked as dots in every capture, as for the page screenshot
 //! (roadmap 6.4).
 
-use super::{Browser, Screenshot, check_keys, site};
+use super::{Browser, SaveScreenshot, Screenshot, check_keys, site};
+use crate::workspace::{self, Folder};
 use crate::bridge::Rect;
 use futures::future::BoxFuture;
 use router::{Effect, Tool, ToolImage, ToolOutput, ToolResult};
@@ -87,6 +90,13 @@ impl Browser {
     /// the region actually captured, and whether it had to be cut to the
     /// visible page.
     async fn region_screenshot(&self, region: Rect, pad: f64) -> Result<(ToolImage, Rect, bool), String> {
+        let (data, fit, cut) = self.region_capture(region, pad, json!({"format": "jpeg", "quality": REGION_QUALITY})).await?;
+        Ok((ToolImage { mime: "image/jpeg".into(), base64: data }, fit, cut))
+    }
+
+    /// [`Browser::region_screenshot`] in the image `format` given
+    /// (`Page.captureScreenshot`'s format and quality), as base64.
+    async fn region_capture(&self, region: Rect, pad: f64, format: Value) -> Result<(String, Rect, bool), String> {
         let st = self.state().await?;
         let (fit, cut) = fit_region(region, pad, st.width.max(1) as f64, st.height.max(1) as f64)
             .ok_or("That part of the page isn't on screen. Scroll to it (or give a ref) and try again.")?;
@@ -109,14 +119,15 @@ impl Browser {
         };
         let (vw, vh) = (st.width.max(1) as f64 * dpr, st.height.max(1) as f64 * dpr);
         let zoom = region_zoom(fit.width, fit.height, vw, vh);
-        let params = json!({
-            "format": "jpeg",
-            "quality": REGION_QUALITY,
+        let mut params = json!({
             "captureBeyondViewport": false,
             "clip": {"x": fit.x + sx, "y": fit.y + sy, "width": fit.width, "height": fit.height, "scale": zoom / dpr},
         });
+        if let (Some(p), Some(f)) = (params.as_object_mut(), format.as_object()) {
+            p.extend(f.clone());
+        }
         let data = self.capture_masked(params).await?;
-        Ok((ToolImage { mime: "image/jpeg".into(), base64: data }, fit, cut))
+        Ok((data, fit, cut))
     }
 }
 
@@ -195,6 +206,107 @@ impl Tool for Screenshot {
     }
 }
 
+/// The `clip` input as a rectangle; `None` if it's absent.
+fn clip_rect(input: &Value) -> Result<Option<Rect>, String> {
+    let Some(c) = input.get("clip").filter(|c| !c.is_null()) else { return Ok(None) };
+    let num = |k: &str| c[k].as_f64().ok_or_else(|| format!("Invalid input: `clip.{k}` must be a number"));
+    Ok(Some(Rect { x: num("x")?, y: num("y")?, width: num("width")?, height: num("height")? }))
+}
+
+/// A PNG's pixel size, from its IHDR chunk.
+fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let w = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let h = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    Some((w, h))
+}
+
+impl Tool for SaveScreenshot {
+    fn name(&self) -> &'static str {
+        "browser_save_screenshot"
+    }
+    fn description(&self) -> &'static str {
+        "Save a screenshot as a PNG file in the Screenshots folder of the user's workspace \
+         (~/Desktop/unibrow-workspace/Screenshots), for the user to keep or share. It captures what's visible \
+         in the app's browser, or one element (`ref` from browser_read) or region (`clip`, viewport CSS \
+         pixels), as browser_screenshot does. Sensitive fields (passwords, card numbers) are masked as dots, \
+         as in every screenshot. Returns the file's path, not the image: use browser_screenshot first if you \
+         need to check what's on screen."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "Optional: element ref from browser_read (e.g. e123) to save just that element."},
+                "clip": {
+                    "type": "object",
+                    "description": "Optional: a region of the visible page, in viewport CSS pixels.",
+                    "properties": {
+                        "x": {"type": "number"}, "y": {"type": "number"},
+                        "width": {"type": "number"}, "height": {"type": "number"}
+                    },
+                    "required": ["x", "y", "width", "height"],
+                    "additionalProperties": false
+                },
+                "name": {"type": "string", "description": "File name without .png (default: the site and the date and time)."}
+            },
+            "additionalProperties": false
+        })
+    }
+    fn effect(&self) -> Effect {
+        // A new file in the app's own folder; it never replaces one.
+        Effect::Read
+    }
+    fn describe_call(&self, input: &Value) -> String {
+        match (input["ref"].as_str(), input.get("clip").filter(|c| c.is_object())) {
+            (Some(r), _) => format!("Save a screenshot of {r} to the workspace"),
+            (None, Some(_)) => "Save a screenshot of part of the page to the workspace".into(),
+            _ => "Save a screenshot of the page to the workspace".into(),
+        }
+    }
+    fn call(&self, input: Value) -> BoxFuture<'static, ToolResult> {
+        use base64::Engine;
+        let b = self.0.clone();
+        Box::pin(async move {
+            check_keys(&input, &["ref", "clip", "name"])?;
+            let r = input["ref"].as_str().filter(|s| !s.trim().is_empty());
+            let clip = clip_rect(&input)?;
+            if r.is_some() && clip.is_some() {
+                return Err("Invalid input: give `ref` or `clip`, not both".into());
+            }
+            let png = json!({"format": "png"});
+            let (data, what) = if let Some(r) = r {
+                let el = b.element(r).await?;
+                let rect = b.rect(&el).await?;
+                let (data, _, cut) = b.region_capture(rect, ELEMENT_PADDING, png).await?;
+                (data, format!("[{r}] {}{}", el.label(), if cut { " (the part on screen)" } else { "" }))
+            } else if let Some(rect) = clip {
+                let (data, _, cut) = b.region_capture(rect, 0.0, png).await?;
+                (data, format!("a region{}", if cut { " (the part on screen)" } else { "" }))
+            } else {
+                let mut params = png;
+                params["captureBeyondViewport"] = json!(false);
+                (b.capture_masked(params).await?, "the visible page".to_string())
+            };
+            let bytes = base64::engine::general_purpose::STANDARD.decode(data).map_err(|e| e.to_string())?;
+            let st = b.state().await.unwrap_or_default();
+            let stem = match input["name"].as_str().map(str::trim).filter(|n| !n.is_empty()) {
+                Some(n) => n.strip_suffix(".png").or_else(|| n.strip_suffix(".PNG")).unwrap_or(n).to_string(),
+                None => workspace::stamped(&site(&st.url)),
+            };
+            let path = workspace::write_new(Folder::Screenshots, &stem, "png", &bytes)
+                .map_err(|e| format!("Couldn't save the screenshot: {e}"))?;
+            let px = png_size(&bytes).map(|(w, h)| format!(", {w}x{h} px")).unwrap_or_default();
+            Ok(ToolOutput::text(
+                format!("Saved a screenshot of {what} on {} to {}{px}.", st.url, path.display()),
+                format!("saved a screenshot of {}", site(&st.url)),
+            ))
+        })
+    }
+}
+
 fn region_output(img: ToolImage, what: &str, url: &str, fit: Rect, cut: bool) -> ToolOutput {
     use base64::Engine;
     let px = base64::engine::general_purpose::STANDARD
@@ -249,6 +361,15 @@ mod tests {
         let z = region_zoom(764., 437., 966., 770.);
         assert!(764. * z <= 966. + 1e-9 && 437. * z <= 770. + 1e-9 && z > 1.0, "{z}");
         assert_eq!(region_zoom(300., 200., 966., 770.), 2.0);
+    }
+
+    #[test]
+    fn reads_png_sizes() {
+        let mut p = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        p.extend(1280u32.to_be_bytes());
+        p.extend(720u32.to_be_bytes());
+        assert_eq!(png_size(&p), Some((1280, 720)));
+        assert_eq!(png_size(b"\xff\xd8"), None);
     }
 
     #[test]

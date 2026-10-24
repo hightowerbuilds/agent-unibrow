@@ -1866,12 +1866,81 @@
     "expect": {
       "log_contains": [
         "Screenshot saved to",
-        "/screenshots/localhost-"
+        "/workspace/Screenshots/localhost-"
       ],
       "log_not_contains": [
         "Couldn't take a screenshot",
         "and copied"
       ]
+    }
+  },
+  {
+    "name": "workspace-tab",
+    "page": "polish.html",
+    "approve": "deny",
+    "task": "Reply with just the word ready, nothing else.",
+    "env": {
+      "UNIBROW_TEST_PANE": "wait;wait;screenshot;wait",
+      "UNIBROW_TEST_SHELL": "workspace:;workspace:Screenshots;workspace_rename:renamed-shot.png;workspace_delete"
+    },
+    "after_turn": {
+      "wait_trace": "Shell test: done",
+      "timeout": 60
+    },
+    "expect": {
+      "trace_contains": [
+        "workspace /: 5 items [Screenshots/, Downloads/, Pages/, Chats/, Files/]",
+        "workspace /Screenshots: 1 item [localhost-",
+        ".png (thumbnail)]",
+        "to renamed-shot.png; folder has [\\\"renamed-shot.png\\\"]",
+        "workspace deleted renamed-shot.png; folder has 0 items; in Trash: true"
+      ]
+    }
+  },
+  {
+    "name": "agent-saves-screenshot",
+    "page": "polish.html",
+    "approve": "deny",
+    "task": "Save a screenshot of this page to my workspace and name it polish-check.",
+    "expect": {
+      "tools": [
+        "browser_save_screenshot"
+      ],
+      "approval_requested": false,
+      "files": {
+        "workspace/Screenshots/polish-check.png": "PNG"
+      }
+    }
+  },
+  {
+    "name": "agent-saves-element-shot",
+    "page": "polish.html",
+    "approve": "deny",
+    "task": "Save a screenshot of just the page's main heading (only that element, not the whole page) to my workspace, named heading-shot.",
+    "expect": {
+      "tools": [
+        "browser_save_screenshot"
+      ],
+      "trace_contains": [
+        "Saved a screenshot of"
+      ],
+      "files": {
+        "workspace/Screenshots/heading-shot.png": "PNG"
+      }
+    }
+  },
+  {
+    "name": "agent-saved-shot-masked",
+    "page": "pay-frame.html",
+    "approve": "deny",
+    "task": "Save a screenshot of this page to my workspace, named card-shot.",
+    "expect": {
+      "tools": [
+        "browser_save_screenshot"
+      ],
+      "files": {
+        "workspace/Screenshots/card-shot.png": "PNG"
+      }
     }
   },
   {

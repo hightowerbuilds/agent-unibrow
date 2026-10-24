@@ -899,7 +899,7 @@ wrap_download_handler! {
             1
         }
 
-        /// Downloads go straight to the agent-unibrow downloads folder.
+        /// Downloads go straight to the workspace's Downloads folder.
         fn on_before_download(
             &self,
             _browser: Option<&mut Browser>,

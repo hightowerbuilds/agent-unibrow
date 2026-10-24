@@ -6,15 +6,16 @@
 //! - **Search**: the box at the top of All chats matches titles and message
 //!   text (`chats::Chats::search`).
 //! - **Export**: Export in All chats writes the chat as Markdown to the
-//!   downloads folder (`~/Downloads/agent-unibrow`, or inside
-//!   `$UNIBROW_DATA_DIR` for test instances).
+//!   workspace's Chats folder (`~/Desktop/unibrow-workspace/Chats`, or
+//!   inside `$UNIBROW_DATA_DIR` for test instances).
 //!
 //! Test hook (isolated instances only): `UNIBROW_TEST_SHELL` is a list of
 //! `;`-separated steps run once the first turn is over, each logged to the
 //! trace as "Shell test: …": `rename:<title>`, `export`, `search:<text>`,
 //! `icons` (which visited sites have an icon for the History list),
 //! `interrupt_race:<text>` (Interrupt & send pressed just as a turn ends on
-//! its own) and `idle` (waits up to a minute for the agent to finish).
+//! its own), `idle` (waits up to a minute for the agent to finish) and the
+//! Workspace tab's steps (workspace_tab.rs).
 
 use crate::text_input::{Changed, Submit, TextInput};
 use crate::{Shell, StopAgent, theme};
@@ -81,9 +82,9 @@ impl Shell {
         cx.notify();
     }
 
-    /// Saves chat `id` as Markdown in the downloads folder and says where.
+    /// Saves chat `id` as Markdown in the workspace's Chats folder and says where.
     pub(crate) fn export_chat(&mut self, id: chats::ChatId, cx: &mut Context<Self>) -> Result<std::path::PathBuf, String> {
-        let r = self.chats.export_to(id, &rail_browser::downloads_dir());
+        let r = self.chats.export_to(id, &rail_browser::workspace::Folder::Chats.dir());
         let text = match &r {
             Ok(path) => {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -270,15 +271,19 @@ impl Shell {
                         cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
                     }
                 }
-                // `icons` waits (up to 15 s) for the page to be in history with its icon.
+                // `icons` waits (up to 15 s) for the page to be in history
+                // with its icon, `workspace:` for a file and its thumbnails.
                 for _ in 0..30 {
-                    let waiting = step == "icons"
-                        && this
-                            .update(cx, |s, _| {
+                    let waiting = this
+                        .update(cx, |s, cx| {
+                            if step == "icons" {
                                 let visits = s.store.history(&browsing::HistoryQuery { limit: 50, ..Default::default() });
                                 !visits.iter().any(|v| s.store.favicon(&v.site).is_some())
-                            })
-                            .unwrap_or(false);
+                            } else {
+                                s.workspace_test_waiting(&step, cx)
+                            }
+                        })
+                        .unwrap_or(false);
                     if !waiting {
                         break;
                     }
@@ -346,7 +351,10 @@ impl Shell {
                 let with: Vec<&String> = sites.iter().filter(|s| self.site_icons.has_icon(&self.store, s)).collect();
                 format!("icons: {} of {} visited sites have one {with:?}", with.len(), sites.len())
             }
-            _ => format!("unknown step {step:?}"),
+            _ => match self.workspace_test_step(name, arg, cx) {
+                Some(line) => line,
+                None => format!("unknown step {step:?}"),
+            },
         };
         eprintln!("shell test: {line}");
         self.trace.push(Kind::Info, format!("Shell test: {line}"), None);

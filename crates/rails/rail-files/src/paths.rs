@@ -26,8 +26,8 @@ pub struct Config {
     pub roots: Vec<PathBuf>,
     /// Never read, listed or changed (canonical where they exist).
     pub protected: Vec<PathBuf>,
-    /// New files and folders here don't need approval: the app's own
-    /// downloads folder, where the user expects the agent's files.
+    /// New files and folders here don't need approval: the Files folder
+    /// in the app's workspace, where the user expects the agent's files.
     pub free_dir: Option<PathBuf>,
     /// The freedesktop Trash folder deleted files go to.
     pub trash_dir: PathBuf,
@@ -61,7 +61,7 @@ fn canon_or_self(p: PathBuf) -> PathBuf {
 
 impl Config {
     /// The user's own computer: home and the usual shared folders.
-    pub fn for_user(downloads: PathBuf) -> Self {
+    pub fn for_user(free_dir: PathBuf) -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/nonexistent-home"));
         let mut roots = vec![home.clone(), "/tmp".into(), "/var/tmp".into(), "/media".into(), "/run/media".into(), "/mnt".into()];
         roots.retain(|r| r.exists());
@@ -94,12 +94,12 @@ impl Config {
         }
         let protected = protected.into_iter().map(canon_or_self).collect();
         let trash_dir = dirs::data_dir().unwrap_or_else(|| home.join(".local/share")).join("Trash");
-        let _ = std::fs::create_dir_all(&downloads);
+        let _ = std::fs::create_dir_all(&free_dir);
         Self {
             base: canon_or_self(home.clone()),
             roots,
             protected,
-            free_dir: Some(canon_or_self(downloads)),
+            free_dir: Some(canon_or_self(free_dir)),
             trash_dir,
             sandboxed: false,
             home: Some(canon_or_self(home)),
@@ -107,19 +107,18 @@ impl Config {
     }
 
     /// An isolated test instance: only `data_dir/files` (its home) and its
-    /// downloads folder, with its own Trash, so nothing reaches the user's
-    /// files.
-    pub fn sandbox(data_dir: &Path, downloads: PathBuf) -> Self {
+    /// workspace, with its own Trash, so nothing reaches the user's files.
+    /// `free_dir` is inside `workspace`.
+    pub fn sandbox(data_dir: &Path, workspace: PathBuf, free_dir: PathBuf) -> Self {
         let sandbox = data_dir.join("files");
         let _ = std::fs::create_dir_all(&sandbox);
-        let _ = std::fs::create_dir_all(&downloads);
+        let _ = std::fs::create_dir_all(&free_dir);
         let sandbox = canon_or_self(sandbox);
-        let downloads = canon_or_self(downloads);
         Self {
             base: sandbox.clone(),
-            roots: vec![sandbox, downloads.clone()],
+            roots: vec![sandbox, canon_or_self(workspace)],
             protected: Vec::new(),
-            free_dir: Some(downloads),
+            free_dir: Some(canon_or_self(free_dir)),
             trash_dir: data_dir.join("Trash"),
             sandboxed: true,
             home: None,
@@ -128,10 +127,10 @@ impl Config {
 
     /// [`Config::sandbox`] when `$UNIBROW_DATA_DIR` is set, otherwise
     /// [`Config::for_user`].
-    pub fn from_env(downloads: PathBuf) -> Self {
+    pub fn from_env(workspace: PathBuf, free_dir: PathBuf) -> Self {
         match std::env::var_os("UNIBROW_DATA_DIR") {
-            Some(d) => Self::sandbox(Path::new(&d), downloads),
-            None => Self::for_user(downloads),
+            Some(d) => Self::sandbox(Path::new(&d), workspace, free_dir),
+            None => Self::for_user(free_dir),
         }
     }
 
@@ -147,7 +146,7 @@ impl Config {
         self.roots.iter().filter(|r| p.starts_with(r)).max_by_key(|r| r.components().count())
     }
 
-    /// Whether `p` is a new entry's spot inside the downloads folder.
+    /// Whether `p` is a new entry's spot inside the free folder.
     pub fn in_free_dir(&self, p: &Path) -> bool {
         self.free_dir.as_ref().is_some_and(|d| p.starts_with(d) && p != d)
     }
@@ -301,7 +300,7 @@ pub(crate) mod tests {
 
     pub(crate) fn sandbox(tag: &str) -> (PathBuf, Config) {
         let data = scratch(tag);
-        let cfg = Config::sandbox(&data, data.join("downloads"));
+        let cfg = Config::sandbox(&data, data.join("workspace"), data.join("workspace/Files"));
         (data, cfg)
     }
 
