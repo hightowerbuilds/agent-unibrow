@@ -8,6 +8,7 @@ mod browser_pane;
 mod chat_text;
 mod chat_tools;
 mod workspace_tab;
+mod sidebar_width;
 mod explained;
 mod home;
 mod jev_worker;
@@ -142,8 +143,8 @@ enum HistorySub {
     Trace,
 }
 
-/// Width of the open sidebar and of the bumper strip that toggles it.
-const SIDEBAR_WIDTH: f32 = 420.;
+/// Width of the bumper strip that toggles the sidebar (and, dragged,
+/// resizes it: sidebar_width.rs).
 /// Widest the sidebar's column gets when popped out to fill the window.
 const POPPED_WIDTH: f32 = 960.;
 const BUMPER_WIDTH: f32 = 14.;
@@ -241,6 +242,10 @@ struct Shell {
     /// Pop out: the sidebar is a tab in the browser's tab strip instead of
     /// a column beside the page.
     popped_out: bool,
+    /// The sidebar's width beside the page (sidebar_width.rs).
+    sidebar_width: f32,
+    /// The width changed by a drag that hasn't been saved yet.
+    width_unsaved: bool,
     /// The sidebar, as its own cached view (see [`SidebarView`]).
     sidebar_view: Option<Entity<SidebarView>>,
     tab: SidebarTab,
@@ -367,6 +372,8 @@ impl Shell {
             sidebar_open: true,
             sidebar_view: None,
             popped_out: false,
+            sidebar_width: sidebar_width::load(),
+            width_unsaved: false,
             tab: SidebarTab::Chat,
             history_sub: HistorySub::Visits,
             explained_page: 0,
@@ -1574,9 +1581,12 @@ impl Shell {
             .bg(rgb(theme::PANE))
             .border_r_1()
             .border_color(rgb(theme::RULE))
-            .cursor_pointer()
+            .when(open, |d| d.cursor(gpui::CursorStyle::ResizeLeftRight))
+            .when(!open, |d| d.cursor_pointer())
             .hover(|s| s.bg(rgb(theme::RAISED)))
+            // A click opens or closes the sidebar; a drag resizes it.
             .on_click(cx.listener(|this, _, window, cx| this.toggle_sidebar(window, cx)))
+            .when(open, |d| d.on_drag(sidebar_width::Resize, |_, _, _, cx| cx.new(|_| sidebar_width::Ghost)))
             .child(
                 div()
                     .w(px(4.))
@@ -2492,7 +2502,7 @@ impl Shell {
             .relative()
             // Popped out: a centered column of readable width.
             .when(self.popped_out, |d| d.w_full().max_w(px(POPPED_WIDTH)).border_x_1().border_color(rgb(theme::RULE)))
-            .when(!self.popped_out, |d| d.w(px(SIDEBAR_WIDTH)).flex_none())
+            .when(!self.popped_out, |d| d.w(px(self.sidebar_width)).flex_none())
             .child(self.render_tabs(cx))
             .child(div().flex().flex_col().flex_1().min_h(px(0.)).child(body))
             .child(self.render_model_bar(cx))
@@ -3084,7 +3094,7 @@ impl Render for Shell {
         // Popped out, the sidebar is a tab in the browser pane instead.
         let beside = !fullscreen && !self.popped_out;
         let sidebar = (self.sidebar_open && beside).then(|| {
-            AnyView::from(view).cached(StyleRefinement::default().w(px(SIDEBAR_WIDTH)).h_full().flex_none())
+            AnyView::from(view).cached(StyleRefinement::default().w(px(self.sidebar_width)).h_full().flex_none())
         });
 
         div()
@@ -3119,6 +3129,21 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &ShowExplained, window, cx| this.show_tab(SidebarTab::Explained, window, cx)))
             .on_action(cx.listener(|this, _: &ShowWorkspace, window, cx| this.show_tab(SidebarTab::Workspace, window, cx)))
             .on_action(cx.listener(|this, _: &TogglePopOut, _, cx| this.set_popped_out(!this.popped_out, cx)))
+            // Dragging the bumper: the sidebar's edge follows the pointer.
+            .on_drag_move(cx.listener(|this, e: &gpui::DragMoveEvent<sidebar_width::Resize>, _, cx| {
+                let w = sidebar_width::clamp(f32::from(e.event.position.x) - BUMPER_WIDTH / 2.);
+                if w != this.sidebar_width {
+                    this.sidebar_width = w;
+                    this.width_unsaved = true;
+                    cx.notify();
+                }
+            }))
+            .on_drop(cx.listener(|this, _: &sidebar_width::Resize, _, cx| {
+                if std::mem::take(&mut this.width_unsaved) {
+                    sidebar_width::save(this.sidebar_width);
+                }
+                cx.notify();
+            }))
             .flex()
             .flex_row()
             .size_full()

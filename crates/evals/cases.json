@@ -1420,7 +1420,7 @@
     "page": "home",
     "secs": 21,
     "env": {
-      "UNIBROW_TEST_PANE": "wait;open:unibrow://home/settings;wait;wait;wait;wait;js:document.getElementById('where').textContent;js:document.title;clicksel:#where .buttons button:nth-child(2);wait"
+      "UNIBROW_TEST_PANE": "wait;open:unibrow://home/settings;wait;wait;wait;wait;js:document.getElementById('where').textContent;js:document.title;clicksel:#where .buttons button:nth-child(3);wait"
     },
     "expect": {
       "log_contains": [
@@ -2011,7 +2011,7 @@
     "approve": "deny",
     "task": "Reply with just the word ready, nothing else.",
     "env": {
-      "UNIBROW_TEST_SHELL": "popout;popin;popout;openurl:{base}/article.html"
+      "UNIBROW_TEST_SHELL": "popout;popin;popout;openurl:{base}/article.html;popin;sidebarwidth:2000;sidebarwidth:600;sidebarwidth:10"
     },
     "after_turn": {
       "wait_trace": "Shell test: done",
@@ -2021,7 +2021,10 @@
       "trace_contains": [
         "Shell test: popped out: true, sidebar tab shown: true",
         "Shell test: popped out: false, sidebar tab shown: false",
-        "article.html; popped out: true, sidebar tab shown: false"
+        "article.html; popped out: true, sidebar tab shown: false",
+        "sidebar width: 840, saved: 840",
+        "sidebar width: 600, saved: 600",
+        "sidebar width: 320, saved: 320"
       ]
     }
   },

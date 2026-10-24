@@ -16,7 +16,8 @@
 //! `interrupt_race:<text>` (Interrupt & send pressed just as a turn ends on
 //! its own), `idle` (waits up to a minute for the agent to finish),
 //! `popout`, `popin` and `openurl:<address>` (Pop out to a tab, back, and
-//! a sidebar link, which shows the page), and the Workspace tab's steps
+//! a sidebar link, which shows the page), `sidebarwidth:<px>` (the end of
+//! a drag of the sidebar's edge), and the Workspace tab's steps
 //! (workspace_tab.rs).
 
 use crate::text_input::{Changed, Submit, TextInput};
@@ -349,6 +350,14 @@ impl Shell {
                 self.set_popped_out(name == "popout", cx);
                 let shown = self.browser.read(cx).sidebar_tab_shown();
                 format!("popped out: {}, sidebar tab shown: {shown}", self.popped_out)
+            }
+            // sidebarwidth:<px>: as the end of a drag of the sidebar's edge.
+            "sidebarwidth" => {
+                if let Ok(w) = arg.parse::<f32>() {
+                    self.sidebar_width = crate::sidebar_width::clamp(w);
+                    crate::sidebar_width::save(self.sidebar_width);
+                }
+                format!("sidebar width: {}, saved: {}", self.sidebar_width, crate::sidebar_width::load())
             }
             "openurl" => {
                 self.open_url(arg.to_string(), cx);
